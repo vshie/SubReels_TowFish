@@ -16,20 +16,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global variables
-process = None
 rtsp_process = None
 recording = False
 start_time = None
 subtitle_thread = None
 stop_subtitle_thread = False
-current_subtitle_file_h264 = None
 current_subtitle_file_rtsp = None
 
-# Mavlink URLs
+# Mavlink URLs (local vehicle)
 ahrs2_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/AHRS2'
 vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/VFR_HUD'
 baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2'
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
+
+# Mavlink URLs (towing host vehicle at 192.168.2.22)
+towing_gps_url = 'http://192.168.2.22/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
 
 def create_subtitle_file(video_path):
     """Create a new .ass subtitle file and write the header"""
@@ -59,12 +60,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return subtitle_path
 
 def update_subtitles():
-    """Update subtitle files with current telemetry data for both video streams"""
-    global stop_subtitle_thread, current_subtitle_file_h264, current_subtitle_file_rtsp, start_time
+    """Update subtitle files with current telemetry data for RTSP video stream"""
+    global stop_subtitle_thread, current_subtitle_file_rtsp, start_time
     
     subtitle_update_rate = 2  # Updates per second
     
-    while not stop_subtitle_thread and recording and (current_subtitle_file_h264 or current_subtitle_file_rtsp):
+    while not stop_subtitle_thread and recording and current_subtitle_file_rtsp:
         try:
             # Get current timestamp relative to recording start
             if start_time:
@@ -72,20 +73,22 @@ def update_subtitles():
                 start_timestamp = format_timestamp(elapsed)
                 end_timestamp = format_timestamp(elapsed + 1/subtitle_update_rate)
                 
-                # Fetch telemetry data
+                # Fetch telemetry data (all functions fail gracefully)
                 depth = get_depth_data()
                 vfr_data = get_vfr_hud_data()
                 baro_data = get_baro_data()
                 light_percentage = get_light_output()
+                gps_lat, gps_lon = get_towing_gps_position()
+                
+                # Format GPS position
+                gps_str = "N/A"
+                if gps_lat is not None and gps_lon is not None:
+                    gps_str = f"{gps_lat:.6f},{gps_lon:.6f}"
                 
                 # Format subtitle text - using alignment tag \an1 for bottom left
-                subtitle_text = f"Dialogue: 0,{start_timestamp},{end_timestamp},Telemetry,,0,0,0,,{{\\an1}}Depth: {depth:.1f}m | Climb: {vfr_data:.2f}m/s | Temp: {baro_data:.1f}°C | Lights: {light_percentage}% | Time: {datetime.now().strftime('%H:%M:%S')}"
+                subtitle_text = f"Dialogue: 0,{start_timestamp},{end_timestamp},Telemetry,,0,0,0,,{{\\an1}}Depth: {depth:.1f}m | Climb: {vfr_data:.2f}m/s | Temp: {baro_data:.1f}°C | Lights: {light_percentage}% | GPS: {gps_str} | Time: {datetime.now().strftime('%H:%M:%S')}"
                 
-                # Append to both subtitle files if they exist
-                if current_subtitle_file_h264:
-                    with open(current_subtitle_file_h264, 'a') as f:
-                        f.write(subtitle_text + '\n')
-                
+                # Append to subtitle file if it exists
                 if current_subtitle_file_rtsp:
                     with open(current_subtitle_file_rtsp, 'a') as f:
                         f.write(subtitle_text + '\n')
@@ -104,9 +107,9 @@ def format_timestamp(seconds):
     return f"{hours}:{minutes:02d}:{int(seconds):02d}.{centiseconds:02d}"
 
 def get_depth_data():
-    """Get depth data from AHRS2 message (altitude is negative underwater)"""
+    """Get depth data from AHRS2 message (altitude is negative underwater). Returns 0.0 on failure."""
     try:
-        response = requests.get(ahrs2_url)
+        response = requests.get(ahrs2_url, timeout=1)
         if response.status_code == 200:
             # In ArduSub, altitude is negative for depth underwater
             altitude = response.json()['message'].get('altitude', 0.0)
@@ -114,32 +117,33 @@ def get_depth_data():
             depth = -altitude if altitude < 0 else 0.0
             return depth
     except Exception as e:
-        logger.error(f"Error fetching depth data: {str(e)}")
+        logger.debug(f"Error fetching depth data: {str(e)}")
     return 0.0
 
 def get_vfr_hud_data():
-    """Get climb rate from VFR_HUD message"""
+    """Get climb rate from VFR_HUD message. Returns 0.0 on failure."""
     try:
-        response = requests.get(vfr_hud_url)
+        response = requests.get(vfr_hud_url, timeout=1)
         if response.status_code == 200:
             climb = response.json()['message'].get('climb', 0.0)
             return climb
     except Exception as e:
-        logger.error(f"Error fetching VFR_HUD data: {str(e)}")
+        logger.debug(f"Error fetching VFR_HUD data: {str(e)}")
     return 0.0
 
 def get_baro_data():
-    """Get temperature from SCALED_PRESSURE2 message"""
+    """Get temperature from SCALED_PRESSURE2 message. Returns 0.0 on failure."""
     try:
-        response = requests.get(baro_url)
+        response = requests.get(baro_url, timeout=1)
         if response.status_code == 200:
             temperature = response.json()['message'].get('temperature', 0.0) / 100.0  # Convert to degrees C
             return temperature
     except Exception as e:
-        logger.error(f"Error fetching baro data: {str(e)}")
+        logger.debug(f"Error fetching baro data: {str(e)}")
     return 0.0
 
 def get_light_output():
+    """Get light output percentage from RC channels. Returns 0 on failure."""
     try:
         response = requests.get(rc_channels_url, timeout=1)
         data = response.json()
@@ -158,8 +162,27 @@ def get_light_output():
             return percentage
         return 0  # Default to 0% if not available
     except Exception as e:
-        logger.error(f"Error getting light output: {str(e)}")
+        logger.debug(f"Error getting light output: {str(e)}")
         return 0
+
+def get_towing_gps_position():
+    """Get GPS position from towing host vehicle. Returns (lat, lon) or (None, None) on failure."""
+    try:
+        response = requests.get(towing_gps_url, timeout=1)
+        if response.status_code == 200:
+            message = response.json().get('message', {})
+            lat = message.get('lat', None)
+            lon = message.get('lon', None)
+            
+            # GLOBAL_POSITION_INT uses degrees * 1e7, convert to decimal degrees
+            if lat is not None and lon is not None:
+                lat_decimal = lat / 1e7
+                lon_decimal = lon / 1e7
+                return (lat_decimal, lon_decimal)
+        return (None, None)
+    except Exception as e:
+        logger.debug(f"Error fetching towing GPS position: {str(e)}")
+        return (None, None)
 
 @app.route('/')
 def index():
@@ -181,7 +204,7 @@ def register_service():
 
 @app.route('/start', methods=['GET'])
 def start():
-    global process, rtsp_process, recording, start_time, subtitle_thread, stop_subtitle_thread, current_subtitle_file_h264, current_subtitle_file_rtsp
+    global rtsp_process, recording, start_time, subtitle_thread, stop_subtitle_thread, current_subtitle_file_rtsp
     try:
         if recording:
             return jsonify({"success": False, "message": "Already recording"}), 400
@@ -193,13 +216,10 @@ def start():
         time.sleep(1)
             
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename_h264 = f"video_h264_{timestamp}.mp4"
         filename_rtsp = f"video_rtsp_{timestamp}.mp4"
-        filepath_h264 = os.path.join("/app/videorecordings", filename_h264)
         filepath_rtsp = os.path.join("/app/videorecordings", filename_rtsp)
         
-        # Create subtitle files for both video streams
-        current_subtitle_file_h264 = create_subtitle_file(filepath_h264)
+        # Create subtitle file for RTSP video stream
         current_subtitle_file_rtsp = create_subtitle_file(filepath_rtsp)
         
         # Set recording state and start time BEFORE starting video processes
@@ -212,47 +232,16 @@ def start():
         subtitle_thread.daemon = True
         subtitle_thread.start()
         
-        # Log which subtitle files are being generated
-        subtitle_files = []
-        if current_subtitle_file_h264:
-            subtitle_files.append(f"H264: {current_subtitle_file_h264}")
+        # Log which subtitle file is being generated
         if current_subtitle_file_rtsp:
-            subtitle_files.append(f"RTSP: {current_subtitle_file_rtsp}")
-        logger.info(f"Started telemetry subtitle generation: {'; '.join(subtitle_files)}")
+            logger.info(f"Started telemetry subtitle generation: RTSP: {current_subtitle_file_rtsp}")
         
-        # Pipeline for H264 stream from /dev/video2
-        h264_pipeline = ("v4l2src device=/dev/video2 ! "
-            "video/x-h264,width=1920,height=1080,framerate=30/1 ! "
-            f"h264parse ! mp4mux ! filesink location={filepath_h264}")
-
-        h264_command = ["gst-launch-1.0", "-e"] + shlex.split(h264_pipeline)
-
         # Pipeline for RTSP H265 stream
         rtsp_pipeline = ("rtspsrc location=rtsp://admin:blue@192.168.2.10:554/stream_0 ! "
             "rtph265depay ! h265parse ! mp4mux ! "
             f"filesink location={filepath_rtsp}")
 
         rtsp_command = ["gst-launch-1.0", "-e"] + shlex.split(rtsp_pipeline)
-
-        # Start H264 recording process
-        h264_started = False
-        try:
-            process = subprocess.Popen(h264_command,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE)
-            
-            logger.info(f"Starting H264 recording with command: {' '.join(h264_command)}")
-            
-            if process.poll() is not None:
-                stdout, stderr = process.communicate()
-                logger.error(f"H264 process failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}")
-                process = None
-            else:
-                h264_started = True
-                logger.info("H264 recording started successfully")
-        except Exception as e:
-            logger.error(f"Failed to start H264 recording: {str(e)}")
-            process = None
         
         # Start RTSP recording process
         rtsp_started = False
@@ -274,43 +263,33 @@ def start():
             logger.error(f"Failed to start RTSP recording: {str(e)}")
             rtsp_process = None
         
-        # Check if at least one stream started successfully
-        if not h264_started and not rtsp_started:
-            logger.error("Both video streams failed to start")
-            return jsonify({"success": False, "message": "Both video streams failed to start"}), 500
+        # Check if RTSP stream started successfully
+        if not rtsp_started:
+            logger.error("RTSP video stream failed to start")
+            recording = False
+            start_time = None
+            current_subtitle_file_rtsp = None
+            return jsonify({"success": False, "message": "RTSP video stream failed to start"}), 500
         
-        # Log which streams are active
-        active_streams = []
-        if h264_started:
-            active_streams.append("H264")
-        if rtsp_started:
-            active_streams.append("RTSP")
-        logger.info(f"Recording started successfully with streams: {', '.join(active_streams)}")
+        logger.info("Recording started successfully with RTSP stream")
         
         return jsonify({"success": True})
     except Exception as e:
         logger.error(f"Error in start endpoint: {str(e)}")
         recording = False
         start_time = None
-        if process:
-            try:
-                process.kill()
-            except:
-                pass
         if rtsp_process:
             try:
                 rtsp_process.kill()
             except:
                 pass
-        process = None
         rtsp_process = None
-        current_subtitle_file_h264 = None
         current_subtitle_file_rtsp = None
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/stop', methods=['GET'])
 def stop():
-    global process, rtsp_process, recording, start_time, subtitle_thread, stop_subtitle_thread, current_subtitle_file_h264, current_subtitle_file_rtsp
+    global rtsp_process, recording, start_time, subtitle_thread, stop_subtitle_thread, current_subtitle_file_rtsp
     try:
         if not recording:
             return jsonify({"success": True})
@@ -319,23 +298,6 @@ def stop():
         stop_subtitle_thread = True
         if subtitle_thread:
             subtitle_thread.join(timeout=2)
-        
-        # Stop H264 recording process
-        if process:
-            logger.info("Stopping H264 recording process gracefully...")
-            
-            # Send SIGINT (Ctrl+C) to GStreamer for EOS
-            process.send_signal(signal.SIGINT)
-            
-            # Wait for the process to handle EOS
-            try:
-                process.wait(timeout=7)
-                logger.info("H264 recording process stopped successfully")
-            except subprocess.TimeoutExpired:
-                logger.warning("H264 process did not exit gracefully, force killing")
-                process.kill()
-                process.wait()
-                logger.info("H264 recording process force killed")
         
         # Stop RTSP recording process
         if rtsp_process:
@@ -356,46 +318,29 @@ def stop():
         
         recording = False
         start_time = None
-        process = None
         rtsp_process = None
-        current_subtitle_file_h264 = None
         current_subtitle_file_rtsp = None
         
-        logger.info("Both recording processes stopped successfully")
+        logger.info("Recording process stopped successfully")
         return jsonify({"success": True})
     except Exception as e:
         logger.error(f"Error in stop endpoint: {str(e)}")
         recording = False
         start_time = None
-        if process:
-            try:
-                process.kill()
-            except:
-                pass
         if rtsp_process:
             try:
                 rtsp_process.kill()
             except:
                 pass
-        process = None
         rtsp_process = None
-        current_subtitle_file_h264 = None
         current_subtitle_file_rtsp = None
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    global process, rtsp_process, recording, start_time
+    global rtsp_process, recording, start_time
     try:
-        # Check if processes have died and clean up individually
-        if process and process.poll() is not None:
-            logger.warning("H264 recording process has died")
-            try:
-                process.kill()
-            except:
-                pass
-            process = None
-            
+        # Check if RTSP process has died and clean up
         if rtsp_process and rtsp_process.poll() is not None:
             logger.warning("RTSP recording process has died")
             try:
@@ -404,17 +349,16 @@ def get_status():
                 pass
             rtsp_process = None
         
-        # Only stop recording if both processes are dead or None
-        if (not process or process.poll() is not None) and (not rtsp_process or rtsp_process.poll() is not None):
+        # Stop recording if RTSP process is dead or None
+        if not rtsp_process or rtsp_process.poll() is not None:
             if recording:
-                logger.info("All recording processes have stopped")
+                logger.info("Recording process has stopped")
                 recording = False
                 start_time = None
             
         return jsonify({
             "recording": recording,
             "start_time": start_time.isoformat() if start_time else None,
-            "h264_process_alive": process and process.poll() is None if process else False,
             "rtsp_process_alive": rtsp_process and rtsp_process.poll() is None if rtsp_process else False
         })
     except Exception as e:
@@ -453,17 +397,28 @@ def get_telemetry():
         vfr_data = get_vfr_hud_data()
         baro_data = get_baro_data()
         light_percentage = get_light_output()
+        gps_lat, gps_lon = get_towing_gps_position()
         
-        logger.info(f"Sending telemetry: depth={depth}, climb={vfr_data}, temp={baro_data}, lights={light_percentage}%")
+        logger.info(f"Sending telemetry: depth={depth}, climb={vfr_data}, temp={baro_data}, lights={light_percentage}%, GPS=({gps_lat}, {gps_lon})")
         
-        return jsonify({
+        response_data = {
             "success": True,
             "depth": round(depth, 1),
             "climb": round(vfr_data, 2),
             "temperature": round(baro_data, 1),
             "lights": light_percentage,
             "timestamp": datetime.now().strftime('%H:%M:%S')
-        })
+        }
+        
+        # Add GPS data if available
+        if gps_lat is not None and gps_lon is not None:
+            response_data["gps_lat"] = round(gps_lat, 6)
+            response_data["gps_lon"] = round(gps_lon, 6)
+        else:
+            response_data["gps_lat"] = None
+            response_data["gps_lon"] = None
+        
+        return jsonify(response_data)
     except Exception as e:
         logger.error(f"Error in telemetry endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500

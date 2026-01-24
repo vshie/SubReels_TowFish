@@ -43,11 +43,13 @@ An ArduPilot Lua script that controls automated dive missions for a hovering AUV
 
 1. **Enable ArduPilot Lua scripting:**
    - Set parameter `SCR_ENABLE` to `1` (true)
-   - Restart the autopilot for changes to take effect
+   - **Restart the autopilot** - this is required for the scripts directory to appear
+   - The scripts directory will be created at: `configs/ardupilot/firmware/scripts`
 
 2. **Upload the script:**
-   - Copy `HAUV.lua` to the ArduPilot scripts directory
+   - Copy `HAUV.lua` to the ArduPilot scripts directory: `configs/ardupilot/firmware/scripts/`
    - The script will automatically execute on autopilot startup
+   - **Note:** The scripts directory only appears after setting `SCR_ENABLE=1` and restarting the autopilot
 
 3. **Hardware connections:**
    - Connect external switch to GPIO pin 27 (PWM0/RGB port on Navigator)
