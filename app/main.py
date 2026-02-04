@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, send_file
+import asyncio
 import os
 import subprocess
 from datetime import datetime
@@ -9,6 +10,8 @@ import shlex
 import requests
 import threading
 import math
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 app = Flask(__name__)
 
@@ -27,6 +30,11 @@ current_video_file_rtsp = None
 
 # RTSP endpoint for H.265 video stream
 RTSP_H265_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+
+# WebSocket server for Cockpit data lake variables
+DATA_LAKE_WS_HOST = "0.0.0.0"
+DATA_LAKE_WS_PORT = 8765
+DATA_LAKE_RECORDING_VAR = "video-recorder-recording"
 
 # Mavlink URLs (local vehicle)
 ahrs2_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/AHRS2'
@@ -377,6 +385,33 @@ def update_srt_file():
             logger.error(f"Error updating SRT file: {str(e)}")
             time.sleep(1)
 
+async def data_lake_handler(websocket):
+    """Stream recording state to Cockpit data lake clients."""
+    logger.info(f"Data lake client connected: {websocket.remote_address}")
+    try:
+        while True:
+            value = "true" if recording else "false"
+            await websocket.send(f"{DATA_LAKE_RECORDING_VAR}={value}")
+            await asyncio.sleep(0.5)
+    except ConnectionClosed:
+        logger.info(f"Data lake client disconnected: {websocket.remote_address}")
+
+async def data_lake_main():
+    """Start the data lake WebSocket server and run forever."""
+    async with websockets.serve(data_lake_handler, DATA_LAKE_WS_HOST, DATA_LAKE_WS_PORT):
+        logger.info(f"Data lake WebSocket server started on ws://{DATA_LAKE_WS_HOST}:{DATA_LAKE_WS_PORT}")
+        await asyncio.Future()
+
+def start_data_lake_server():
+    """Run the data lake WebSocket server in a background thread."""
+    def run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(data_lake_main())
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
 @app.route('/')
 def index():
     return app.send_static_file('index.html')
@@ -589,7 +624,8 @@ def get_status():
         return jsonify({
             "recording": recording,
             "start_time": start_time.isoformat() if start_time else None,
-            "rtsp_process_alive": rtsp_process and rtsp_process.poll() is None if rtsp_process else False
+            "rtsp_process_alive": rtsp_process and rtsp_process.poll() is None if rtsp_process else False,
+            "rtsp_h265_endpoint": RTSP_H265_ENDPOINT
         })
     except Exception as e:
         logger.error(f"Error in status endpoint: {str(e)}")
@@ -668,4 +704,5 @@ def get_telemetry():
         return jsonify({"success": False, "message": str(e)}), 500
 
 if __name__ == '__main__':
+    start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)

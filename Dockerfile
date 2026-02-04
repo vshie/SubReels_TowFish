@@ -31,7 +31,7 @@ WORKDIR /app
 COPY app/ .
 
 # Install Python dependencies
-RUN pip3 install flask requests
+RUN pip3 install flask requests websockets
 
 # Create directory for video recordings
 RUN mkdir -p /app/videorecordings
@@ -40,8 +40,8 @@ RUN mkdir -p /app/videorecordings
 ENV PYTHONUNBUFFERED=1
 ENV FLASK_APP=main.py
 
-# Expose port
-EXPOSE 5423
+# Expose ports
+EXPOSE 5423 8765
 
 LABEL version="0.9"
 
@@ -49,7 +49,8 @@ ARG IMAGE_NAME
 LABEL permissions='\
 {\
   "ExposedPorts": {\
-    "5423/tcp": {}\
+    "5423/tcp": {},\
+    "8765/tcp": {}\
   },\
   "HostConfig": {\
     "Binds": [\
@@ -59,6 +60,11 @@ LABEL permissions='\
     "ExtraHosts": ["host.docker.internal:host-gateway"],\
     "PortBindings": {\
       "5423/tcp": [\
+        {\
+          "HostPort": ""\
+        }\
+      ],\
+      "8765/tcp": [\
         {\
           "HostPort": ""\
         }\

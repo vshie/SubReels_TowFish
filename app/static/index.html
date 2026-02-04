@@ -279,6 +279,10 @@ async function checkRecordingStatus() {
         const response = await axios.get('/status');
         const isRecording = response.data.recording;
         const currentUIState = document.getElementById("recordingStatus").textContent === "Recording";
+        const endpoint = response.data.rtsp_h265_endpoint;
+        if (endpoint) {
+            document.getElementById("cameraEndpoint").textContent = endpoint;
+        }
         
         // If status has changed, update UI to match
         if (isRecording && !currentUIState) {
@@ -340,22 +344,7 @@ async function fetchVideos() {
     }
 }
 
-async function fetchConfig() {
-    try {
-        const response = await axios.get('/config');
-        if (response.data?.rtsp_h265_endpoint) {
-            document.getElementById("cameraEndpoint").textContent = response.data.rtsp_h265_endpoint;
-        } else {
-            document.getElementById("cameraEndpoint").textContent = "Unavailable";
-        }
-    } catch (error) {
-        console.error("Error fetching config:", error);
-        document.getElementById("cameraEndpoint").textContent = "Unavailable";
-    }
-}
-
 // Initial setup
-fetchConfig();
 fetchVideos();
 fetchTelemetry();
 checkRecordingStatus();  // Check initial status
