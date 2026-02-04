@@ -31,8 +31,8 @@ vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/compo
 baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2'
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
 
-# Mavlink URLs (BlueBoat at 192.168.2.12)
-blueboat_gps_url = 'http://192.168.2.12/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
+# Mavlink URLs (BlueBoat at 192.168.2.22)
+blueboat_gps_url = 'http://192.168.2.22/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
