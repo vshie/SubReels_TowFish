@@ -356,12 +356,12 @@ def update_srt_file():
                     
                     srt_subtitle_counter += 1
                     
-                    # Format SRT entry for WebODM
-                    # Format: lat: 37.123456, lon: -122.123456, alt: -5.2 (negative = underwater depth)
+                    # Format SRT entry for WebODM (ODM SRT parser expects latitude/longitude/altitude keys)
+                    # Format: latitude: 37.123456 longitude: -122.123456 altitude: -5.2
                     srt_entry = (
                         f"{srt_subtitle_counter}\n"
                         f"{start_timestamp} --> {end_timestamp}\n"
-                        f"lat: {offset_lat:.6f}, lon: {offset_lon:.6f}, alt: {towfish_alt:.1f}\n"
+                        f"latitude: {offset_lat:.6f} longitude: {offset_lon:.6f} altitude: {towfish_alt:.1f}\n"
                         f"\n"
                     )
                     
