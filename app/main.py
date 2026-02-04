@@ -25,6 +25,9 @@ stop_srt_thread = False
 current_srt_file_rtsp = None
 current_video_file_rtsp = None
 
+# RTSP endpoint for H.265 video stream
+RTSP_H265_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+
 # Mavlink URLs (local vehicle)
 ahrs2_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/AHRS2'
 vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/VFR_HUD'
@@ -392,6 +395,12 @@ def register_service():
     }
     '''
 
+@app.route('/config')
+def config():
+    return jsonify({
+        "rtsp_h265_endpoint": RTSP_H265_ENDPOINT
+    })
+
 @app.route('/start', methods=['GET'])
 def start():
     global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
@@ -417,7 +426,7 @@ def start():
         srt_subtitle_counter = 0  # Reset counter for new recording
         
         # Pipeline for RTSP H265 stream
-        rtsp_pipeline = ("rtspsrc location=rtsp://admin:blue@192.168.2.10:554/stream_0 ! "
+        rtsp_pipeline = (f"rtspsrc location={RTSP_H265_ENDPOINT} ! "
             "rtph265depay ! h265parse ! mp4mux ! "
             f"filesink location={filepath_rtsp}")
 
