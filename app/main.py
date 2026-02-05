@@ -11,6 +11,8 @@ import requests
 import threading
 import math
 import websockets
+import csv
+import re
 from websockets.exceptions import ConnectionClosed
 
 app = Flask(__name__)
@@ -27,6 +29,11 @@ srt_thread = None
 stop_srt_thread = False
 current_srt_file_rtsp = None
 current_video_file_rtsp = None
+
+# ISP logging variables
+isp_log_thread = None
+stop_isp_log_thread = False
+current_isp_log_file = None
 
 # RTSP endpoint for H.265 video stream
 RTSP_H265_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
@@ -47,6 +54,9 @@ blueboat_gps_url = 'http://192.168.2.22/mavlink2rest/mavlink/vehicles/1/componen
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
+
+# Camera ISP info endpoint
+camera_isp_url = 'http://192.168.2.10/action/getISPInfo'
 
 def get_depth_data():
     """Get depth data from AHRS2 message (altitude is negative underwater). Returns 0.0 on failure."""
@@ -210,6 +220,83 @@ def get_towing_gps_position():
     # Calculate offset position (4 meters behind towfish heading)
     offset_lat, offset_lon = calculate_offset_position(lat, lon, heading, 4.0)
     return (offset_lat, offset_lon)
+
+def get_isp_info():
+    """Get camera ISP info from the camera endpoint.
+    Returns dict with ISO, AGain, DGain, ISPDGain, ExpTime, Exposure, device_mac or None on failure."""
+    try:
+        response = requests.get(camera_isp_url, timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            device_mac = data.get('device_mac', '')
+            isp_info_str = data.get('isp_info', '')
+            
+            # Parse the isp_info string: "ISP Info: ISO:100 AGain:1024 DGain:1024 ISPDGain:1028 ExpTime:2711 Exposure:2721 HistError:0\t"
+            result = {
+                'device_mac': device_mac,
+                'ISO': None,
+                'AGain': None,
+                'DGain': None,
+                'ISPDGain': None,
+                'ExpTime': None,
+                'Exposure': None
+            }
+            
+            # Extract values using regex
+            patterns = {
+                'ISO': r'ISO:(\d+)',
+                'AGain': r'AGain:(\d+)',
+                'DGain': r'DGain:(\d+)',
+                'ISPDGain': r'ISPDGain:(\d+)',
+                'ExpTime': r'ExpTime:(\d+)',
+                'Exposure': r'Exposure:(\d+)'
+            }
+            
+            for key, pattern in patterns.items():
+                match = re.search(pattern, isp_info_str)
+                if match:
+                    result[key] = int(match.group(1))
+            
+            return result
+    except Exception as e:
+        logger.debug(f"Error fetching ISP info: {str(e)}")
+    return None
+
+def create_isp_log_file(video_path):
+    """Create a new CSV file for ISP logging with headers."""
+    csv_path = video_path.replace('.mp4', '_isp.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['timestamp', 'device_mac', 'ISO', 'AGain', 'DGain', 'ISPDGain', 'ExpTime', 'Exposure'])
+    return csv_path
+
+def update_isp_log():
+    """Update ISP log file with camera exposure data, once per second."""
+    global stop_isp_log_thread, current_isp_log_file
+    
+    while not stop_isp_log_thread and recording and current_isp_log_file:
+        try:
+            isp_data = get_isp_info()
+            if isp_data:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # Millisecond precision
+                
+                with open(current_isp_log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        timestamp,
+                        isp_data['device_mac'],
+                        isp_data['ISO'],
+                        isp_data['AGain'],
+                        isp_data['DGain'],
+                        isp_data['ISPDGain'],
+                        isp_data['ExpTime'],
+                        isp_data['Exposure']
+                    ])
+            
+            time.sleep(1)  # Log once per second
+        except Exception as e:
+            logger.error(f"Error updating ISP log: {str(e)}")
+            time.sleep(1)
 
 def create_srt_file(video_path):
     """Create a new .srt file for WebODM position data"""
@@ -439,6 +526,7 @@ def config():
 @app.route('/start', methods=['GET'])
 def start():
     global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
+    global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     try:
         if recording:
             return jsonify({"success": False, "message": "Already recording"}), 400
@@ -459,6 +547,9 @@ def start():
         # Create SRT file for WebODM position data
         current_srt_file_rtsp = create_srt_file(filepath_rtsp)
         srt_subtitle_counter = 0  # Reset counter for new recording
+        
+        # Create ISP log file for camera exposure data
+        current_isp_log_file = create_isp_log_file(filepath_rtsp)
         
         # Pipeline for RTSP H265 stream
         rtsp_pipeline = (f"rtspsrc location={RTSP_H265_ENDPOINT} ! "
@@ -499,6 +590,7 @@ def start():
             start_time = None
             current_srt_file_rtsp = None
             current_video_file_rtsp = None
+            current_isp_log_file = None
             return jsonify({"success": False, "message": "RTSP video stream failed to start"}), 500
         
         # NOW set recording state and start_time AFTER video is confirmed recording
@@ -512,8 +604,15 @@ def start():
         srt_thread.daemon = True
         srt_thread.start()
         
-        # Log SRT file generation
+        # Start ISP log thread - logs camera exposure data once per second
+        stop_isp_log_thread = False
+        isp_log_thread = threading.Thread(target=update_isp_log)
+        isp_log_thread.daemon = True
+        isp_log_thread.start()
+        
+        # Log file generation
         logger.info(f"Started SRT position file generation (synced to video): {current_srt_file_rtsp}")
+        logger.info(f"Started ISP log file generation: {current_isp_log_file}")
         logger.info("Recording started successfully with RTSP stream")
         
         return jsonify({"success": True})
@@ -529,11 +628,13 @@ def start():
         rtsp_process = None
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
+        current_isp_log_file = None
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/stop', methods=['GET'])
 def stop():
     global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp
+    global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     try:
         if not recording:
             return jsonify({"success": True})
@@ -541,11 +642,17 @@ def stop():
         # Save file paths before clearing globals
         video_path = current_video_file_rtsp
         srt_path = current_srt_file_rtsp
+        isp_log_path = current_isp_log_file
         
         # Stop SRT thread
         stop_srt_thread = True
         if srt_thread:
             srt_thread.join(timeout=2)
+        
+        # Stop ISP log thread
+        stop_isp_log_thread = True
+        if isp_log_thread:
+            isp_log_thread.join(timeout=2)
         
         # Stop RTSP recording process
         if rtsp_process:
@@ -569,6 +676,11 @@ def stop():
         rtsp_process = None
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
+        current_isp_log_file = None
+        
+        # Log ISP file completion
+        if isp_log_path and os.path.exists(isp_log_path):
+            logger.info(f"ISP log file saved: {isp_log_path}")
         
         # Post-processing: Adjust SRT timing to match actual video duration
         if video_path and srt_path and os.path.exists(video_path) and os.path.exists(srt_path):
@@ -599,6 +711,7 @@ def stop():
         rtsp_process = None
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
+        current_isp_log_file = None
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/status', methods=['GET'])
