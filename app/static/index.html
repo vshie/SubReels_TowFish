@@ -98,6 +98,14 @@
             margin-right: 10px;
         }
         
+        .file-manager-wrapper {
+            width: 100vw;
+            position: relative;
+            left: 50%;
+            margin-left: -50vw;
+            box-sizing: border-box;
+        }
+        
         input[type="number"] {
             padding: 5px;
             border-radius: 4px;
@@ -192,7 +200,9 @@
     <ul id="videoList"></ul>
 
     <!-- Iframe to embed the BlueOS file browser -->
-    <iframe src="" style="width: 100%; height: 600px; border: none;"></iframe>
+    <div class="file-manager-wrapper">
+        <iframe src="" style="width: 100%; height: 600px; border: none;"></iframe>
+    </div>
 
 <script>
 let recordingTimer;

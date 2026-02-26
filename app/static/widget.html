@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Recorder Widget</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1e1e1e;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 8px;
+        }
+
+        .widget {
+            width: 100%;
+            max-width: 320px;
+            background: #2a2a2a;
+            border-radius: 10px;
+            padding: 16px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+
+        .rec-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #555;
+            flex-shrink: 0;
+            transition: background 0.3s;
+        }
+
+        .rec-dot.active {
+            background: #e53935;
+            animation: pulse 1.2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .title {
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+        }
+
+        .duration {
+            margin-left: auto;
+            font-family: "SF Mono", "Fira Code", monospace;
+            font-size: 13px;
+            color: #999;
+        }
+
+        .duration.active { color: #ef9a9a; }
+
+        .btn {
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, opacity 0.2s;
+            letter-spacing: 0.4px;
+        }
+
+        .btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        .btn-start {
+            background: #43a047;
+            color: #fff;
+        }
+        .btn-start:hover:not(:disabled) { background: #388e3c; }
+
+        .btn-stop {
+            background: #e53935;
+            color: #fff;
+        }
+        .btn-stop:hover:not(:disabled) { background: #c62828; }
+
+        .file-info {
+            margin-top: 12px;
+            padding: 10px;
+            background: #222;
+            border-radius: 6px;
+            font-size: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            min-height: 38px;
+        }
+
+        .file-name {
+            color: #aaa;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+
+        .file-size {
+            font-family: "SF Mono", "Fira Code", monospace;
+            font-weight: 600;
+            color: #90caf9;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .error-msg {
+            margin-top: 8px;
+            padding: 6px 8px;
+            background: #4a1c1c;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #ef9a9a;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="widget">
+        <div class="header">
+            <div class="rec-dot" id="recDot"></div>
+            <span class="title">Video Recorder</span>
+            <span class="duration" id="duration">00:00:00</span>
+        </div>
+
+        <button class="btn btn-start" id="actionBtn" onclick="toggleRecording()">
+            Start Recording
+        </button>
+
+        <div class="file-info">
+            <span class="file-name" id="fileName">No files yet</span>
+            <span class="file-size" id="fileSize"></span>
+        </div>
+
+        <div class="error-msg" id="errorMsg"></div>
+    </div>
+
+<script>
+const actionBtn   = document.getElementById('actionBtn');
+const recDot      = document.getElementById('recDot');
+const durationEl  = document.getElementById('duration');
+const fileNameEl  = document.getElementById('fileName');
+const fileSizeEl  = document.getElementById('fileSize');
+const errorMsg    = document.getElementById('errorMsg');
+
+let isRecording = false;
+let startTime   = null;
+let durationTimer = null;
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+}
+
+function formatDuration(ms) {
+    const s  = Math.floor(ms / 1000) % 60;
+    const m  = Math.floor(ms / 60000) % 60;
+    const h  = Math.floor(ms / 3600000);
+    return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+}
+
+function showError(msg) {
+    errorMsg.textContent = msg;
+    errorMsg.style.display = 'block';
+    setTimeout(() => { errorMsg.style.display = 'none'; }, 5000);
+}
+
+function setUI(recording, serverStartTime) {
+    isRecording = recording;
+
+    if (recording) {
+        actionBtn.textContent = 'Stop Recording';
+        actionBtn.className   = 'btn btn-stop';
+        recDot.classList.add('active');
+        durationEl.classList.add('active');
+
+        if (serverStartTime) {
+            startTime = new Date(serverStartTime);
+        } else if (!startTime) {
+            startTime = new Date();
+        }
+        if (!durationTimer) {
+            durationTimer = setInterval(() => {
+                durationEl.textContent = formatDuration(Date.now() - startTime.getTime());
+            }, 500);
+        }
+    } else {
+        actionBtn.textContent = 'Start Recording';
+        actionBtn.className   = 'btn btn-start';
+        recDot.classList.remove('active');
+        durationEl.classList.remove('active');
+        clearInterval(durationTimer);
+        durationTimer = null;
+        startTime = null;
+        durationEl.textContent = '00:00:00';
+    }
+
+    actionBtn.disabled = false;
+}
+
+async function toggleRecording() {
+    actionBtn.disabled = true;
+    errorMsg.style.display = 'none';
+
+    const endpoint = isRecording ? '/stop' : '/start';
+    try {
+        const res  = await fetch(endpoint);
+        const data = await res.json();
+        if (!data.success) {
+            showError(data.message || 'Request failed');
+            actionBtn.disabled = false;
+            return;
+        }
+        setUI(!isRecording, null);
+    } catch (e) {
+        showError('Connection error');
+        actionBtn.disabled = false;
+    }
+}
+
+async function pollStatus() {
+    try {
+        const res  = await fetch('/status');
+        const data = await res.json();
+        if (data.recording !== isRecording) {
+            setUI(data.recording, data.start_time);
+        }
+    } catch (_) {}
+}
+
+async function pollFileSize() {
+    try {
+        const res  = await fetch('/filesize');
+        const data = await res.json();
+        if (data.success && data.filename) {
+            fileNameEl.textContent = data.filename;
+            fileSizeEl.textContent = formatBytes(data.size_bytes);
+        } else {
+            fileNameEl.textContent = 'No files yet';
+            fileSizeEl.textContent = '';
+        }
+    } catch (_) {}
+}
+
+pollStatus();
+pollFileSize();
+
+setInterval(pollStatus,   2000);
+setInterval(pollFileSize,  1000);
+</script>
+</body>
+</html>

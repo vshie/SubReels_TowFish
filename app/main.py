@@ -769,6 +769,48 @@ def download(filename):
         logger.error(f"Error in download endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
 
+@app.route('/filesize', methods=['GET'])
+def get_filesize():
+    """Return the size of the actively-recording .mp4 (or most recent one)."""
+    try:
+        video_dir = "/app/videorecordings"
+        path = None
+        filename = None
+
+        if recording and current_video_file_rtsp and os.path.exists(current_video_file_rtsp):
+            path = current_video_file_rtsp
+            filename = os.path.basename(path)
+        else:
+            if os.path.exists(video_dir):
+                mp4s = [f for f in os.listdir(video_dir) if f.endswith('.mp4')]
+                mp4s.sort(reverse=True)
+                if mp4s:
+                    filename = mp4s[0]
+                    path = os.path.join(video_dir, filename)
+
+        if path and os.path.exists(path):
+            size_bytes = os.path.getsize(path)
+            return jsonify({
+                "success": True,
+                "filename": filename,
+                "size_bytes": size_bytes,
+                "recording": recording
+            })
+
+        return jsonify({
+            "success": True,
+            "filename": None,
+            "size_bytes": 0,
+            "recording": recording
+        })
+    except Exception as e:
+        logger.error(f"Error in filesize endpoint: {str(e)}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/widget')
+def widget():
+    return app.send_static_file('widget.html')
+
 @app.route('/telemetry', methods=['GET'])
 def get_telemetry():
     try:
