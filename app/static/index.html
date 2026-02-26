@@ -98,6 +98,50 @@
             margin-right: 10px;
         }
         
+        .config-section {
+            margin: 15px 0;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background-color: #f9f9f9;
+        }
+
+        .config-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .config-row label {
+            font-size: 0.9em;
+            color: #444;
+            white-space: nowrap;
+        }
+
+        .config-row input[type="text"] {
+            padding: 5px 8px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+            font-family: monospace;
+            font-size: 0.95em;
+            width: 160px;
+        }
+
+        .config-row button {
+            padding: 5px 12px;
+            font-size: 0.85em;
+        }
+
+        .config-saved {
+            font-size: 0.85em;
+            color: #43a047;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .config-saved.visible { opacity: 1; }
+
         .file-manager-wrapper {
             width: 100vw;
             position: relative;
@@ -157,6 +201,14 @@
     <h1>Video Recorder</h1>
     <div style="margin-bottom: 15px; color: #666;">
         <p>Using RTSP H.265 endpoint: <strong id="cameraEndpoint">Loading...</strong></p>
+    </div>
+    <div class="config-section">
+        <div class="config-row">
+            <label for="towVehicleIp">Tow Vehicle IP:</label>
+            <input type="text" id="towVehicleIp" placeholder="192.168.2.22">
+            <button onclick="saveTowVehicleIp()">Save</button>
+            <span class="config-saved" id="configSaved">Saved</span>
+        </div>
     </div>
     <div class="status-container">
         <p>Status: <span id="recordingStatus">Stopped</span><span id="recordingTime" style="display: none;"></span></p>
@@ -354,7 +406,36 @@ async function fetchVideos() {
     }
 }
 
+async function loadConfig() {
+    try {
+        const response = await axios.get('/config');
+        if (response.data.tow_vehicle_ip) {
+            document.getElementById("towVehicleIp").value = response.data.tow_vehicle_ip;
+        }
+    } catch (error) {
+        console.error("Error loading config:", error);
+    }
+}
+
+async function saveTowVehicleIp() {
+    const ip = document.getElementById("towVehicleIp").value.trim();
+    if (!ip) return;
+    try {
+        const response = await axios.post('/config', { tow_vehicle_ip: ip });
+        if (response.data.success) {
+            const badge = document.getElementById("configSaved");
+            badge.classList.add("visible");
+            setTimeout(() => badge.classList.remove("visible"), 2000);
+        }
+    } catch (error) {
+        console.error("Error saving tow vehicle IP:", error);
+        document.getElementById("errorMessage").textContent = "Failed to save tow vehicle IP";
+        document.getElementById("errorMessage").style.display = "block";
+    }
+}
+
 // Initial setup
+loadConfig();
 fetchVideos();
 fetchTelemetry();
 checkRecordingStatus();  // Check initial status

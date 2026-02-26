@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request, send_file
 import asyncio
+import json
 import os
 import subprocess
 from datetime import datetime
@@ -49,8 +50,36 @@ vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/compo
 baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2'
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
 
-# Mavlink URLs (BlueBoat at 192.168.2.22)
-blueboat_gps_url = 'http://192.168.2.22/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
+# Tow vehicle (e.g. BlueBoat) configuration — persisted to disk
+CONFIG_FILE = "/app/videorecordings/videorecorder_config.json"
+DEFAULT_TOW_VEHICLE_IP = "192.168.2.22"
+
+def load_config():
+    """Load persisted configuration from disk, returning defaults on failure."""
+    defaults = {"tow_vehicle_ip": DEFAULT_TOW_VEHICLE_IP}
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                saved = json.load(f)
+            defaults.update(saved)
+    except Exception as e:
+        logger.warning(f"Could not load config file: {e}")
+    return defaults
+
+def save_config(cfg):
+    """Persist configuration dict to disk."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save config file: {e}")
+
+def _blueboat_gps_url():
+    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
+
+_cfg = load_config()
+tow_vehicle_ip = _cfg["tow_vehicle_ip"]
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
@@ -118,9 +147,9 @@ def get_light_output():
         return 0
 
 def get_blueboat_gps_position():
-    """Get GPS position from BlueBoat. Returns (lat, lon, alt) or (None, None, None) on failure."""
+    """Get GPS position from tow vehicle. Returns (lat, lon, alt) or (None, None, None) on failure."""
     try:
-        response = requests.get(blueboat_gps_url, timeout=1)
+        response = requests.get(_blueboat_gps_url(), timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             lat = message.get('lat', None)
@@ -517,10 +546,23 @@ def register_service():
     }
     '''
 
-@app.route('/config')
+@app.route('/config', methods=['GET', 'POST'])
 def config():
+    global tow_vehicle_ip
+
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        new_ip = data.get('tow_vehicle_ip', '').strip()
+        if not new_ip:
+            return jsonify({"success": False, "message": "tow_vehicle_ip is required"}), 400
+        tow_vehicle_ip = new_ip
+        save_config({"tow_vehicle_ip": tow_vehicle_ip})
+        logger.info(f"Tow vehicle IP updated to {tow_vehicle_ip}")
+        return jsonify({"success": True, "tow_vehicle_ip": tow_vehicle_ip})
+
     return jsonify({
-        "rtsp_h265_endpoint": RTSP_H265_ENDPOINT
+        "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
+        "tow_vehicle_ip": tow_vehicle_ip
     })
 
 @app.route('/start', methods=['GET'])
