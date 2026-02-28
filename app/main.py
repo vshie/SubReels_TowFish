@@ -36,6 +36,20 @@ isp_log_thread = None
 stop_isp_log_thread = False
 current_isp_log_file = None
 
+# GStreamer stderr monitoring
+gst_stderr_thread = None
+stop_gst_stderr_thread = False
+gst_error_count = 0
+gst_warning_count = 0
+
+# Recording health watchdog
+watchdog_thread = None
+stop_watchdog_thread = False
+file_stall_count = 0
+
+# Recording event log
+current_events_file = None
+
 # RTSP endpoint for H.265 video stream
 RTSP_H265_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
 
@@ -528,6 +542,119 @@ def start_data_lake_server():
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
+# ---------------------------------------------------------------------------
+# Recording diagnostics: event log, GStreamer stderr, Pi4 stats, watchdog
+# ---------------------------------------------------------------------------
+
+def create_events_file(video_path):
+    """Create a new NDJSON file for recording events."""
+    events_path = video_path.replace('.mp4', '_events.ndjson')
+    with open(events_path, 'w') as f:
+        pass
+    return events_path
+
+def log_event(event_type, detail=""):
+    """Write a timestamped event to the recording events log."""
+    if not current_events_file:
+        return
+    try:
+        event = {
+            "ts": time.time(),
+            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+            "event": event_type,
+            "detail": str(detail)
+        }
+        with open(current_events_file, 'a') as f:
+            f.write(json.dumps(event) + '\n')
+    except Exception as e:
+        logger.debug(f"Error writing event log: {e}")
+
+def gstreamer_stderr_monitor(process):
+    """Read GStreamer stderr line-by-line and classify as error/warning/debug."""
+    global gst_error_count, gst_warning_count
+    for line in iter(process.stderr.readline, b''):
+        if stop_gst_stderr_thread:
+            break
+        decoded = line.decode('utf-8', errors='replace').strip()
+        if not decoded:
+            continue
+        upper = decoded.upper()
+        if 'ERROR' in upper:
+            gst_error_count += 1
+            logger.error(f"GST_ERROR: {decoded}")
+            log_event("gst_error", decoded)
+        elif 'WARNING' in upper:
+            gst_warning_count += 1
+            logger.warning(f"GST_WARN: {decoded}")
+            log_event("gst_warning", decoded)
+        else:
+            logger.debug(f"GST: {decoded}")
+
+def _read_disk_free_mb():
+    """Read free disk space on /app/videorecordings in MB."""
+    try:
+        stat = os.statvfs("/app/videorecordings")
+        return round((stat.f_bavail * stat.f_frsize) / (1024 * 1024), 1)
+    except Exception:
+        return None
+
+def recording_health_watchdog():
+    """Periodically check recording pipeline health and log structured diagnostics."""
+    global file_stall_count
+    last_file_size = 0
+    file_stall_count = 0
+
+    while not stop_watchdog_thread and recording:
+        try:
+            diagnostics = {}
+
+            if current_video_file_rtsp and os.path.exists(current_video_file_rtsp):
+                current_size = os.path.getsize(current_video_file_rtsp)
+                growth = current_size - last_file_size
+                diagnostics["file_size_bytes"] = current_size
+                diagnostics["growth_bytes"] = growth
+                if last_file_size > 0 and growth == 0:
+                    file_stall_count += 1
+                    diagnostics["stall_count"] = file_stall_count
+                    log_event("file_stall",
+                              f"No growth for {file_stall_count} intervals ({current_size} bytes)")
+                else:
+                    file_stall_count = 0
+                last_file_size = current_size
+
+            if rtsp_process:
+                alive = rtsp_process.poll() is None
+                diagnostics["gst_pid"] = rtsp_process.pid
+                diagnostics["gst_alive"] = alive
+                if not alive:
+                    log_event("process_died",
+                              f"GStreamer exited with code {rtsp_process.returncode}")
+
+            disk_free = _read_disk_free_mb()
+            if disk_free is not None:
+                diagnostics["disk_free_mb"] = disk_free
+
+            try:
+                resp = requests.get(camera_isp_url, timeout=2)
+                diagnostics["camera_reachable"] = resp.status_code == 200
+            except Exception:
+                diagnostics["camera_reachable"] = False
+                log_event("camera_unreachable", "HTTP check to 192.168.2.10 failed")
+
+            diagnostics["gst_errors"] = gst_error_count
+            diagnostics["gst_warnings"] = gst_warning_count
+
+            logger.info(f"HEALTH: {json.dumps(diagnostics)}")
+
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Error in health watchdog: {e}")
+            time.sleep(5)
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
+
 @app.route('/')
 def index():
     return app.send_static_file('index.html')
@@ -569,6 +696,9 @@ def config():
 def start():
     global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
+    global gst_stderr_thread, stop_gst_stderr_thread, gst_error_count, gst_warning_count
+    global watchdog_thread, stop_watchdog_thread, file_stall_count
+    global current_events_file
     try:
         if recording:
             return jsonify({"success": False, "message": "Already recording"}), 400
@@ -593,9 +723,19 @@ def start():
         # Create ISP log file for camera exposure data
         current_isp_log_file = create_isp_log_file(filepath_rtsp)
         
-        # Pipeline for RTSP H265 stream
-        rtsp_pipeline = (f"rtspsrc location={RTSP_H265_ENDPOINT} ! "
-            "rtph265depay ! h265parse ! mp4mux ! "
+        # Create recording diagnostics event log
+        current_events_file = create_events_file(filepath_rtsp)
+        
+        # Pipeline for RTSP H265 stream (larger jitter buffer absorbs
+        # scheduling delays, fragment-duration writes moov early so a
+        # crash only loses the last fragment)
+        rtsp_pipeline = (
+            f"rtspsrc location={RTSP_H265_ENDPOINT} "
+            "latency=500 "
+            "retry=5 "
+            "timeout=5000000 "
+            "! rtph265depay ! h265parse ! "
+            "mp4mux fragment-duration=5000 ! "
             f"filesink location={filepath_rtsp}")
 
         rtsp_command = ["gst-launch-1.0", "-e"] + shlex.split(rtsp_pipeline)
@@ -652,9 +792,27 @@ def start():
         isp_log_thread.daemon = True
         isp_log_thread.start()
         
+        # Start GStreamer stderr monitoring thread
+        stop_gst_stderr_thread = False
+        gst_error_count = 0
+        gst_warning_count = 0
+        gst_stderr_thread = threading.Thread(target=gstreamer_stderr_monitor, args=(rtsp_process,))
+        gst_stderr_thread.daemon = True
+        gst_stderr_thread.start()
+        
+        # Start recording health watchdog thread
+        stop_watchdog_thread = False
+        file_stall_count = 0
+        watchdog_thread = threading.Thread(target=recording_health_watchdog)
+        watchdog_thread.daemon = True
+        watchdog_thread.start()
+        
+        log_event("recording_started", f"RTSP recording started: {filepath_rtsp}")
+        
         # Log file generation
         logger.info(f"Started SRT position file generation (synced to video): {current_srt_file_rtsp}")
         logger.info(f"Started ISP log file generation: {current_isp_log_file}")
+        logger.info(f"Started recording diagnostics: events={current_events_file}")
         logger.info("Recording started successfully with RTSP stream")
         
         return jsonify({"success": True})
@@ -671,20 +829,27 @@ def start():
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
         current_isp_log_file = None
+        current_events_file = None
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/stop', methods=['GET'])
 def stop():
     global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
+    global gst_stderr_thread, stop_gst_stderr_thread
+    global watchdog_thread, stop_watchdog_thread
+    global current_events_file
     try:
         if not recording:
             return jsonify({"success": True})
+        
+        log_event("recording_stopping", "Stop requested")
         
         # Save file paths before clearing globals
         video_path = current_video_file_rtsp
         srt_path = current_srt_file_rtsp
         isp_log_path = current_isp_log_file
+        events_path = current_events_file
         
         # Stop SRT thread
         stop_srt_thread = True
@@ -695,6 +860,16 @@ def stop():
         stop_isp_log_thread = True
         if isp_log_thread:
             isp_log_thread.join(timeout=2)
+        
+        # Stop GStreamer stderr monitoring thread
+        stop_gst_stderr_thread = True
+        if gst_stderr_thread:
+            gst_stderr_thread.join(timeout=2)
+        
+        # Stop recording health watchdog thread
+        stop_watchdog_thread = True
+        if watchdog_thread:
+            watchdog_thread.join(timeout=2)
         
         # Stop RTSP recording process
         if rtsp_process:
@@ -707,8 +882,10 @@ def stop():
             try:
                 rtsp_process.wait(timeout=7)
                 logger.info("RTSP recording process stopped successfully")
+                log_event("recording_stopped", "Graceful shutdown")
             except subprocess.TimeoutExpired:
                 logger.warning("RTSP process did not exit gracefully, force killing")
+                log_event("stop_timeout", "SIGINT did not stop GStreamer within 7s, force killing")
                 rtsp_process.kill()
                 rtsp_process.wait()
                 logger.info("RTSP recording process force killed")
@@ -719,10 +896,13 @@ def stop():
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
         current_isp_log_file = None
+        current_events_file = None
         
-        # Log ISP file completion
+        # Log sidecar file completion
         if isp_log_path and os.path.exists(isp_log_path):
             logger.info(f"ISP log file saved: {isp_log_path}")
+        if events_path and os.path.exists(events_path):
+            logger.info(f"Events log saved: {events_path}")
         
         # Post-processing: Adjust SRT timing to match actual video duration
         if video_path and srt_path and os.path.exists(video_path) and os.path.exists(srt_path):
@@ -754,6 +934,7 @@ def stop():
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
         current_isp_log_file = None
+        current_events_file = None
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/status', methods=['GET'])
@@ -763,6 +944,7 @@ def get_status():
         # Check if RTSP process has died and clean up
         if rtsp_process and rtsp_process.poll() is not None:
             logger.warning("RTSP recording process has died")
+            log_event("process_died", f"Detected dead GStreamer process in /status")
             try:
                 rtsp_process.kill()
             except:
@@ -775,12 +957,37 @@ def get_status():
                 logger.info("Recording process has stopped")
                 recording = False
                 start_time = None
-            
+
+        # Determine health grade
+        rtsp_alive = bool(rtsp_process and rtsp_process.poll() is None)
+        if not recording:
+            health = "idle"
+        elif not rtsp_alive or gst_error_count > 0:
+            health = "failed"
+        elif gst_warning_count > 0 or file_stall_count > 0:
+            health = "degraded"
+        else:
+            health = "healthy"
+
+        # File size of current recording
+        file_size_mb = 0.0
+        if current_video_file_rtsp and os.path.exists(current_video_file_rtsp):
+            file_size_mb = round(os.path.getsize(current_video_file_rtsp) / (1024 * 1024), 1)
+
+        disk_free = _read_disk_free_mb()
+
         return jsonify({
             "recording": recording,
             "start_time": start_time.isoformat() if start_time else None,
-            "rtsp_process_alive": rtsp_process and rtsp_process.poll() is None if rtsp_process else False,
-            "rtsp_h265_endpoint": RTSP_H265_ENDPOINT
+            "duration_seconds": round((datetime.now() - start_time).total_seconds(), 1) if start_time else 0,
+            "rtsp_process_alive": rtsp_alive,
+            "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
+            "file_size_mb": file_size_mb,
+            "disk_free_mb": disk_free,
+            "gst_errors": gst_error_count,
+            "gst_warnings": gst_warning_count,
+            "file_stalls": file_stall_count,
+            "health": health
         })
     except Exception as e:
         logger.error(f"Error in status endpoint: {str(e)}")
