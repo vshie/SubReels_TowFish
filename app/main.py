@@ -64,13 +64,18 @@ vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/compo
 baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2'
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
 
-# Tow vehicle (e.g. BlueBoat) configuration — persisted to disk
+# Persisted configuration — survives restarts
 CONFIG_FILE = "/app/videorecordings/videorecorder_config.json"
 DEFAULT_TOW_VEHICLE_IP = "192.168.2.22"
+DEFAULT_CONTAINER_FORMAT = "mp4"
+VALID_CONTAINER_FORMATS = ("mp4", "mpegts")
 
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
-    defaults = {"tow_vehicle_ip": DEFAULT_TOW_VEHICLE_IP}
+    defaults = {
+        "tow_vehicle_ip": DEFAULT_TOW_VEHICLE_IP,
+        "container_format": DEFAULT_CONTAINER_FORMAT,
+    }
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -78,6 +83,8 @@ def load_config():
             defaults.update(saved)
     except Exception as e:
         logger.warning(f"Could not load config file: {e}")
+    if defaults["container_format"] not in VALID_CONTAINER_FORMATS:
+        defaults["container_format"] = DEFAULT_CONTAINER_FORMAT
     return defaults
 
 def save_config(cfg):
@@ -94,6 +101,7 @@ def _blueboat_gps_url():
 
 _cfg = load_config()
 tow_vehicle_ip = _cfg["tow_vehicle_ip"]
+container_format = _cfg["container_format"]
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
@@ -307,7 +315,8 @@ def get_isp_info():
 
 def create_isp_log_file(video_path):
     """Create a new CSV file for ISP logging with headers."""
-    csv_path = video_path.replace('.mp4', '_isp.csv')
+    base, _ = os.path.splitext(video_path)
+    csv_path = base + '_isp.csv'
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['timestamp', 'device_mac', 'ISO', 'AGain', 'DGain', 'ISPDGain', 'ExpTime', 'Exposure'])
@@ -343,7 +352,8 @@ def update_isp_log():
 
 def create_srt_file(video_path):
     """Create a new .srt file for WebODM position data"""
-    srt_path = video_path.replace('.mp4', '.srt')
+    base, _ = os.path.splitext(video_path)
+    srt_path = base + '.srt'
     # Create empty file
     with open(srt_path, 'w') as f:
         pass
@@ -548,7 +558,8 @@ def start_data_lake_server():
 
 def create_events_file(video_path):
     """Create a new NDJSON file for recording events."""
-    events_path = video_path.replace('.mp4', '_events.ndjson')
+    base, _ = os.path.splitext(video_path)
+    events_path = base + '_events.ndjson'
     with open(events_path, 'w') as f:
         pass
     return events_path
@@ -675,21 +686,42 @@ def register_service():
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
-    global tow_vehicle_ip
+    global tow_vehicle_ip, container_format
 
     if request.method == 'POST':
+        if recording:
+            return jsonify({"success": False, "message": "Cannot change config while recording"}), 400
+
         data = request.get_json(silent=True) or {}
+        changed = False
+
         new_ip = data.get('tow_vehicle_ip', '').strip()
-        if not new_ip:
-            return jsonify({"success": False, "message": "tow_vehicle_ip is required"}), 400
-        tow_vehicle_ip = new_ip
-        save_config({"tow_vehicle_ip": tow_vehicle_ip})
-        logger.info(f"Tow vehicle IP updated to {tow_vehicle_ip}")
-        return jsonify({"success": True, "tow_vehicle_ip": tow_vehicle_ip})
+        if new_ip:
+            tow_vehicle_ip = new_ip
+            changed = True
+
+        new_fmt = data.get('container_format', '').strip().lower()
+        if new_fmt:
+            if new_fmt not in VALID_CONTAINER_FORMATS:
+                return jsonify({"success": False,
+                                "message": f"container_format must be one of {VALID_CONTAINER_FORMATS}"}), 400
+            container_format = new_fmt
+            changed = True
+
+        if not changed:
+            return jsonify({"success": False, "message": "No valid fields provided"}), 400
+
+        save_config({"tow_vehicle_ip": tow_vehicle_ip,
+                      "container_format": container_format})
+        logger.info(f"Config updated: tow_vehicle_ip={tow_vehicle_ip}, container_format={container_format}")
+        return jsonify({"success": True,
+                        "tow_vehicle_ip": tow_vehicle_ip,
+                        "container_format": container_format})
 
     return jsonify({
         "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
-        "tow_vehicle_ip": tow_vehicle_ip
+        "tow_vehicle_ip": tow_vehicle_ip,
+        "container_format": container_format
     })
 
 @app.route('/start', methods=['GET'])
@@ -710,7 +742,15 @@ def start():
         time.sleep(1)
             
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename_rtsp = f"video_rtsp_{timestamp}.mp4"
+
+        if container_format == "mpegts":
+            ext = ".ts"
+            mux_element = "mpegtsmux"
+        else:
+            ext = ".mp4"
+            mux_element = "mp4mux fragment-duration=5000"
+
+        filename_rtsp = f"video_rtsp_{timestamp}{ext}"
         filepath_rtsp = os.path.join("/app/videorecordings", filename_rtsp)
         
         # Save video filepath for post-processing
@@ -726,16 +766,13 @@ def start():
         # Create recording diagnostics event log
         current_events_file = create_events_file(filepath_rtsp)
         
-        # Pipeline for RTSP H265 stream (larger jitter buffer absorbs
-        # scheduling delays, fragment-duration writes moov early so a
-        # crash only loses the last fragment)
         rtsp_pipeline = (
             f"rtspsrc location={RTSP_H265_ENDPOINT} "
             "latency=500 "
             "retry=5 "
             "timeout=5000000 "
             "! rtph265depay ! h265parse ! "
-            "mp4mux fragment-duration=5000 ! "
+            f"{mux_element} ! "
             f"filesink location={filepath_rtsp}")
 
         rtsp_command = ["gst-launch-1.0", "-e"] + shlex.split(rtsp_pipeline)
@@ -987,7 +1024,8 @@ def get_status():
             "gst_errors": gst_error_count,
             "gst_warnings": gst_warning_count,
             "file_stalls": file_stall_count,
-            "health": health
+            "health": health,
+            "container_format": container_format
         })
     except Exception as e:
         logger.error(f"Error in status endpoint: {str(e)}")
@@ -1000,7 +1038,7 @@ def list_videos():
         if not os.path.exists(video_dir):
             os.makedirs(video_dir)
             
-        videos = [f for f in os.listdir(video_dir) if f.endswith('.mp4')]
+        videos = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.ts'))]
         videos.sort(reverse=True)  # Most recent first
         return jsonify({"videos": videos})
     except Exception as e:
@@ -1020,7 +1058,7 @@ def download(filename):
 
 @app.route('/filesize', methods=['GET'])
 def get_filesize():
-    """Return the size of the actively-recording .mp4 (or most recent one)."""
+    """Return the size of the actively-recording video (or most recent one)."""
     try:
         video_dir = "/app/videorecordings"
         path = None
@@ -1031,7 +1069,7 @@ def get_filesize():
             filename = os.path.basename(path)
         else:
             if os.path.exists(video_dir):
-                mp4s = [f for f in os.listdir(video_dir) if f.endswith('.mp4')]
+                mp4s = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.ts'))]
                 mp4s.sort(reverse=True)
                 if mp4s:
                     filename = mp4s[0]
