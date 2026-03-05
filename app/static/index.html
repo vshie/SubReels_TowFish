@@ -366,9 +366,8 @@ async function checkRecordingStatus() {
         // If status has changed, update UI to match
         if (isRecording && !currentUIState) {
             console.log("Detected recording started externally");
-            // Set startTime based on server's start_time if available
-            if (response.data.start_time) {
-                startTime = new Date(response.data.start_time);
+            if (response.data.duration_seconds > 0) {
+                startTime = new Date(Date.now() - response.data.duration_seconds * 1000);
             } else {
                 startTime = new Date();
             }

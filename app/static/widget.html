@@ -189,7 +189,7 @@ function showError(msg) {
     setTimeout(() => { errorMsg.style.display = 'none'; }, 5000);
 }
 
-function setUI(recording, serverStartTime) {
+function setUI(recording, serverDurationSec) {
     isRecording = recording;
 
     if (recording) {
@@ -198,8 +198,8 @@ function setUI(recording, serverStartTime) {
         recDot.classList.add('active');
         durationEl.classList.add('active');
 
-        if (serverStartTime) {
-            startTime = new Date(serverStartTime);
+        if (serverDurationSec !== undefined && serverDurationSec > 0) {
+            startTime = new Date(Date.now() - serverDurationSec * 1000);
         } else if (!startTime) {
             startTime = new Date();
         }
@@ -247,7 +247,9 @@ async function pollStatus() {
         const res  = await fetch('/status');
         const data = await res.json();
         if (data.recording !== isRecording) {
-            setUI(data.recording, data.start_time);
+            setUI(data.recording, data.duration_seconds);
+        } else if (data.recording && data.duration_seconds > 0) {
+            startTime = new Date(Date.now() - data.duration_seconds * 1000);
         }
     } catch (_) {}
 }
