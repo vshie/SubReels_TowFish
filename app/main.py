@@ -17,6 +17,7 @@ import re
 from websockets.exceptions import ConnectionClosed
 
 app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

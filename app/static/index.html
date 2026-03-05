@@ -362,7 +362,13 @@ async function checkRecordingStatus() {
         if (endpoint) {
             document.getElementById("cameraEndpoint").textContent = endpoint;
         }
-        
+
+        // Keep container format dropdown in sync with server
+        const fmtSelect = document.getElementById("containerFormat");
+        if (response.data.container_format && fmtSelect !== document.activeElement) {
+            fmtSelect.value = response.data.container_format;
+        }
+
         // If status has changed, update UI to match
         if (isRecording && !currentUIState) {
             console.log("Detected recording started externally");
