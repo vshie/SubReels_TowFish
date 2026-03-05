@@ -218,7 +218,7 @@
         </div>
         <div class="config-row" style="margin-top: 8px;">
             <label for="containerFormat">Container Format:</label>
-            <select id="containerFormat" onchange="saveContainerFormat()">
+            <select id="containerFormat" autocomplete="off" onchange="saveContainerFormat()">
                 <option value="mp4">MP4 (fragmented)</option>
                 <option value="mpegts">MPEG-TS (power-cut safe)</option>
             </select>
@@ -424,7 +424,7 @@ async function fetchVideos() {
 
 async function loadConfig() {
     try {
-        const response = await axios.get('/config');
+        const response = await axios.get('/config', { params: { _: Date.now() } });
         if (response.data.tow_vehicle_ip) {
             document.getElementById("towVehicleIp").value = response.data.tow_vehicle_ip;
         }

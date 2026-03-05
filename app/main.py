@@ -718,11 +718,13 @@ def config():
                         "tow_vehicle_ip": tow_vehicle_ip,
                         "container_format": container_format})
 
-    return jsonify({
+    resp = jsonify({
         "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
         "tow_vehicle_ip": tow_vehicle_ip,
         "container_format": container_format
     })
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 @app.route('/start', methods=['GET'])
 def start():
@@ -1013,7 +1015,7 @@ def get_status():
 
         disk_free = _read_disk_free_mb()
 
-        return jsonify({
+        resp = jsonify({
             "recording": recording,
             "start_time": start_time.isoformat() if start_time else None,
             "duration_seconds": round((datetime.now() - start_time).total_seconds(), 1) if start_time else 0,
@@ -1027,6 +1029,8 @@ def get_status():
             "health": health,
             "container_format": container_format
         })
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
     except Exception as e:
         logger.error(f"Error in status endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
