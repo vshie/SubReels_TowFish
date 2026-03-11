@@ -67,15 +67,18 @@ rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/c
 
 # Persisted configuration — survives restarts
 CONFIG_FILE = "/app/videorecordings/videorecorder_config.json"
-DEFAULT_TOW_VEHICLE_IP = "192.168.2.22"
+DEFAULT_TOW_VEHICLE_IP = "192.168.2.12"
 DEFAULT_CONTAINER_FORMAT = "mp4"
 VALID_CONTAINER_FORMATS = ("mp4", "mpegts")
+DEFAULT_STREAM_PROTOCOL = "udp"
+VALID_STREAM_PROTOCOLS = ("udp", "tcp")
 
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
         "tow_vehicle_ip": DEFAULT_TOW_VEHICLE_IP,
         "container_format": DEFAULT_CONTAINER_FORMAT,
+        "stream_protocol": DEFAULT_STREAM_PROTOCOL,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -86,6 +89,8 @@ def load_config():
         logger.warning(f"Could not load config file: {e}")
     if defaults["container_format"] not in VALID_CONTAINER_FORMATS:
         defaults["container_format"] = DEFAULT_CONTAINER_FORMAT
+    if defaults["stream_protocol"] not in VALID_STREAM_PROTOCOLS:
+        defaults["stream_protocol"] = DEFAULT_STREAM_PROTOCOL
     return defaults
 
 def save_config(cfg):
@@ -103,6 +108,7 @@ def _blueboat_gps_url():
 _cfg = load_config()
 tow_vehicle_ip = _cfg["tow_vehicle_ip"]
 container_format = _cfg["container_format"]
+stream_protocol = _cfg["stream_protocol"]
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
@@ -687,7 +693,7 @@ def register_service():
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
-    global tow_vehicle_ip, container_format
+    global tow_vehicle_ip, container_format, stream_protocol
 
     if request.method == 'POST':
         if recording:
@@ -709,20 +715,31 @@ def config():
             container_format = new_fmt
             changed = True
 
+        new_proto = data.get('stream_protocol', '').strip().lower()
+        if new_proto:
+            if new_proto not in VALID_STREAM_PROTOCOLS:
+                return jsonify({"success": False,
+                                "message": f"stream_protocol must be one of {VALID_STREAM_PROTOCOLS}"}), 400
+            stream_protocol = new_proto
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
         save_config({"tow_vehicle_ip": tow_vehicle_ip,
-                      "container_format": container_format})
-        logger.info(f"Config updated: tow_vehicle_ip={tow_vehicle_ip}, container_format={container_format}")
+                      "container_format": container_format,
+                      "stream_protocol": stream_protocol})
+        logger.info(f"Config updated: tow_vehicle_ip={tow_vehicle_ip}, container_format={container_format}, stream_protocol={stream_protocol}")
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
-                        "container_format": container_format})
+                        "container_format": container_format,
+                        "stream_protocol": stream_protocol})
 
     resp = jsonify({
         "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
         "tow_vehicle_ip": tow_vehicle_ip,
-        "container_format": container_format
+        "container_format": container_format,
+        "stream_protocol": stream_protocol
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -769,8 +786,10 @@ def start():
         # Create recording diagnostics event log
         current_events_file = create_events_file(filepath_rtsp)
         
+        protocol_prop = f"protocols={stream_protocol} " if stream_protocol == "tcp" else ""
         rtsp_pipeline = (
             f"rtspsrc location={RTSP_H265_ENDPOINT} "
+            f"{protocol_prop}"
             "latency=500 "
             "retry=5 "
             "timeout=5000000 "
@@ -1028,7 +1047,8 @@ def get_status():
             "gst_warnings": gst_warning_count,
             "file_stalls": file_stall_count,
             "health": health,
-            "container_format": container_format
+            "container_format": container_format,
+            "stream_protocol": stream_protocol
         })
         resp.headers['Cache-Control'] = 'no-store'
         return resp

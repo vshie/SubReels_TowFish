@@ -212,9 +212,17 @@
     <div class="config-section">
         <div class="config-row">
             <label for="towVehicleIp">Tow Vehicle IP:</label>
-            <input type="text" id="towVehicleIp" placeholder="192.168.2.22">
+            <input type="text" id="towVehicleIp" placeholder="192.168.2.12">
             <button onclick="saveTowVehicleIp()">Save</button>
             <span class="config-saved" id="configSaved">Saved</span>
+        </div>
+        <div class="config-row" style="margin-top: 8px;">
+            <label for="streamProtocol">Stream Transport:</label>
+            <select id="streamProtocol" autocomplete="off" onchange="saveStreamProtocol()">
+                <option value="udp">UDP (default)</option>
+                <option value="tcp">TCP (RTP over RTSP)</option>
+            </select>
+            <span class="config-saved" id="protocolSaved">Saved</span>
         </div>
         <div class="config-row" style="margin-top: 8px;">
             <label for="containerFormat">Container Format:</label>
@@ -315,6 +323,7 @@ function updateUIToRecording() {
     document.getElementById("startButton").disabled = true;
     document.getElementById("stopButton").disabled = false;
     document.getElementById("containerFormat").disabled = true;
+    document.getElementById("streamProtocol").disabled = true;
     
     startTime = new Date();
     document.getElementById("recordingTime").style.display = "inline";
@@ -333,6 +342,7 @@ function updateUIToStopped() {
     document.getElementById("startButton").disabled = false;
     document.getElementById("stopButton").disabled = true;
     document.getElementById("containerFormat").disabled = false;
+    document.getElementById("streamProtocol").disabled = false;
     
     clearInterval(recordingTimer);
     document.getElementById("recordingTime").style.display = "none";
@@ -363,10 +373,14 @@ async function checkRecordingStatus() {
             document.getElementById("cameraEndpoint").textContent = endpoint;
         }
 
-        // Keep container format dropdown in sync with server
+        // Keep dropdowns in sync with server
         const fmtSelect = document.getElementById("containerFormat");
         if (response.data.container_format && fmtSelect !== document.activeElement) {
             fmtSelect.value = response.data.container_format;
+        }
+        const protoSelect = document.getElementById("streamProtocol");
+        if (response.data.stream_protocol && protoSelect !== document.activeElement) {
+            protoSelect.value = response.data.stream_protocol;
         }
 
         // If status has changed, update UI to match
@@ -437,6 +451,9 @@ async function loadConfig() {
         if (response.data.container_format) {
             document.getElementById("containerFormat").value = response.data.container_format;
         }
+        if (response.data.stream_protocol) {
+            document.getElementById("streamProtocol").value = response.data.stream_protocol;
+        }
     } catch (error) {
         console.error("Error loading config:", error);
     }
@@ -456,6 +473,27 @@ async function saveTowVehicleIp() {
         console.error("Error saving tow vehicle IP:", error);
         document.getElementById("errorMessage").textContent = "Failed to save tow vehicle IP";
         document.getElementById("errorMessage").style.display = "block";
+    }
+}
+
+async function saveStreamProtocol() {
+    const proto = document.getElementById("streamProtocol").value;
+    try {
+        const response = await axios.post('/config', { stream_protocol: proto });
+        if (response.data.success) {
+            const badge = document.getElementById("protocolSaved");
+            badge.classList.add("visible");
+            setTimeout(() => badge.classList.remove("visible"), 2000);
+        } else {
+            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save protocol";
+            document.getElementById("errorMessage").style.display = "block";
+            loadConfig();
+        }
+    } catch (error) {
+        const msg = error.response?.data?.message || "Failed to save stream protocol";
+        document.getElementById("errorMessage").textContent = msg;
+        document.getElementById("errorMessage").style.display = "block";
+        loadConfig();
     }
 }
 
