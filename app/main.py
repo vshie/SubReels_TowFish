@@ -51,6 +51,12 @@ file_stall_count = 0
 # Recording event log
 current_events_file = None
 
+# ASS telemetry subtitle variables
+ass_thread = None
+stop_ass_thread = False
+current_ass_file = None
+ass_subtitle_counter = 0
+
 # RTSP endpoint for H.265 video stream
 RTSP_H265_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
 
@@ -104,6 +110,12 @@ def save_config(cfg):
 
 def _blueboat_gps_url():
     return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
+
+def _blueboat_attitude_url():
+    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
+
+def _blueboat_vfr_hud_url():
+    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/VFR_HUD'
 
 _cfg = load_config()
 tow_vehicle_ip = _cfg["tow_vehicle_ip"]
@@ -217,6 +229,58 @@ def get_towfish_heading():
     except Exception as e:
         logger.debug(f"Error fetching towfish heading: {str(e)}")
         return None
+
+def get_towfish_attitude():
+    """Get yaw and roll from towfish ATTITUDE message. Returns dict with degrees."""
+    try:
+        response = requests.get(towfish_attitude_url, timeout=1)
+        if response.status_code == 200:
+            message = response.json().get('message', {})
+            result = {}
+            yaw = message.get('yaw')
+            if yaw is not None:
+                yaw_deg = math.degrees(yaw) % 360
+                if yaw_deg < 0:
+                    yaw_deg += 360
+                result['yaw'] = yaw_deg
+            roll = message.get('roll')
+            if roll is not None:
+                result['roll'] = math.degrees(roll)
+            return result
+    except Exception as e:
+        logger.debug(f"Error fetching towfish attitude: {str(e)}")
+    return {}
+
+def get_blueboat_attitude():
+    """Get yaw and pitch from tow vehicle ATTITUDE message. Returns dict with degrees."""
+    try:
+        response = requests.get(_blueboat_attitude_url(), timeout=1)
+        if response.status_code == 200:
+            message = response.json().get('message', {})
+            result = {}
+            yaw = message.get('yaw')
+            if yaw is not None:
+                yaw_deg = math.degrees(yaw) % 360
+                if yaw_deg < 0:
+                    yaw_deg += 360
+                result['yaw'] = yaw_deg
+            pitch = message.get('pitch')
+            if pitch is not None:
+                result['pitch'] = math.degrees(pitch)
+            return result
+    except Exception as e:
+        logger.debug(f"Error fetching BlueBoat attitude: {str(e)}")
+    return {}
+
+def get_blueboat_speed():
+    """Get groundspeed from tow vehicle VFR_HUD message. Returns speed in m/s or None."""
+    try:
+        response = requests.get(_blueboat_vfr_hud_url(), timeout=1)
+        if response.status_code == 200:
+            return response.json()['message'].get('groundspeed')
+    except Exception as e:
+        logger.debug(f"Error fetching BlueBoat speed: {str(e)}")
+    return None
 
 def calculate_offset_position(lat, lon, heading_deg, offset_meters):
     """
@@ -485,6 +549,141 @@ def get_towfish_altitude():
         logger.debug(f"Error fetching towfish altitude: {str(e)}")
     return 0.0
 
+def create_ass_file(video_path):
+    """Create a new .ass (Advanced SubStation Alpha) subtitle file for full telemetry overlay."""
+    base, _ = os.path.splitext(video_path)
+    ass_path = base + '.ass'
+    with open(ass_path, 'w') as f:
+        f.write("[Script Info]\n")
+        f.write("Title: Telemetry Data\n")
+        f.write("ScriptType: v4.00+\n")
+        f.write("WrapStyle: 0\n")
+        f.write("ScaledBorderAndShadow: yes\n")
+        f.write("PlayResX: 1920\n")
+        f.write("PlayResY: 1080\n")
+        f.write("\n")
+        f.write("[V4+ Styles]\n")
+        f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding\n")
+        f.write("Style: Telem,Consolas,16,&H00FFFFFF,&H000000FF,&H00000000,"
+                "&H80000000,-1,0,0,0,100,100,0,0,3,0,0,7,10,10,10,1\n")
+        f.write("\n")
+        f.write("[Events]\n")
+        f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    return ass_path
+
+def format_ass_timestamp(seconds):
+    """Format seconds into ASS timestamp format (H:MM:SS.cc)"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centiseconds = int((seconds - int(seconds)) * 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+
+def parse_ass_timestamp(ts):
+    """Parse ASS timestamp (H:MM:SS.cc) to seconds."""
+    parts = ts.strip().split(':')
+    hours = int(parts[0])
+    minutes = int(parts[1])
+    sec_parts = parts[2].split('.')
+    seconds = int(sec_parts[0])
+    centiseconds = int(sec_parts[1]) if len(sec_parts) > 1 else 0
+    return hours * 3600 + minutes * 60 + seconds + centiseconds / 100.0
+
+def update_ass_file():
+    """Update ASS file with comprehensive labeled telemetry at 5 Hz."""
+    global stop_ass_thread, current_ass_file, ass_subtitle_counter
+
+    ass_update_rate = 5
+
+    while not stop_ass_thread and recording and current_ass_file:
+        try:
+            if start_time:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                start_ts = format_ass_timestamp(elapsed)
+                end_ts = format_ass_timestamp(elapsed + 1 / ass_update_rate)
+
+                tf_att = get_towfish_attitude()
+                tf_depth = get_depth_data()
+                tf_climb = get_vfr_hud_data()
+                tf_temp = get_baro_data()
+
+                bb_lat, bb_lon, _ = get_blueboat_gps_position()
+                bb_att = get_blueboat_attitude()
+                bb_spd = get_blueboat_speed()
+
+                tf_yaw = f"Yaw:{tf_att['yaw']:.1f}" if 'yaw' in tf_att else "Yaw:--"
+                tf_roll = f"Roll:{tf_att['roll']:.1f}" if 'roll' in tf_att else "Roll:--"
+                tf_parts = f"TF {tf_yaw} {tf_roll} Dep:{tf_depth:.1f} Clm:{tf_climb:.2f} Tmp:{tf_temp:.1f}"
+
+                bb_gps = f"{bb_lat:.6f},{bb_lon:.6f}" if bb_lat is not None else "--,--"
+                bb_yaw = f"Yaw:{bb_att['yaw']:.1f}" if 'yaw' in bb_att else "Yaw:--"
+                bb_pitch = f"Pitch:{bb_att['pitch']:.1f}" if 'pitch' in bb_att else "Pitch:--"
+                bb_speed = f"Spd:{bb_spd:.1f}" if bb_spd is not None else "Spd:--"
+                bb_parts = f"BB {bb_gps} {bb_yaw} {bb_pitch} {bb_speed}"
+
+                text = f"{tf_parts} | {bb_parts}"
+
+                ass_subtitle_counter += 1
+                line = f"Dialogue: 0,{start_ts},{end_ts},Telem,,0,0,0,,{text}\n"
+
+                with open(current_ass_file, 'a') as f:
+                    f.write(line)
+
+            time.sleep(1 / ass_update_rate)
+        except Exception as e:
+            logger.error(f"Error updating ASS file: {str(e)}")
+            time.sleep(1)
+
+def adjust_ass_timing(ass_path, video_duration):
+    """Adjust ASS dialogue timestamps to match actual video duration."""
+    try:
+        with open(ass_path, 'r') as f:
+            lines = f.readlines()
+
+        header_lines = []
+        dialogue_lines = []
+        max_time = 0
+
+        for line in lines:
+            if line.startswith('Dialogue:'):
+                dialogue_lines.append(line)
+                parts = line.split(',', 9)
+                if len(parts) >= 3:
+                    end_sec = parse_ass_timestamp(parts[2])
+                    max_time = max(max_time, end_sec)
+            else:
+                header_lines.append(line)
+
+        if not dialogue_lines or max_time == 0:
+            logger.warning("No valid ASS dialogue entries found")
+            return False
+
+        scale = video_duration / max_time
+        if abs(scale - 1.0) < 0.01:
+            logger.info("ASS timing already within 1% of video duration")
+            return True
+
+        with open(ass_path, 'w') as f:
+            for line in header_lines:
+                f.write(line)
+            for line in dialogue_lines:
+                parts = line.split(',', 9)
+                if len(parts) >= 3:
+                    start_sec = parse_ass_timestamp(parts[1]) * scale
+                    end_sec = parse_ass_timestamp(parts[2]) * scale
+                    parts[1] = format_ass_timestamp(start_sec)
+                    parts[2] = format_ass_timestamp(end_sec)
+                f.write(','.join(parts))
+
+        logger.info(f"ASS timing adjusted (scaled by {scale:.4f})")
+        return True
+    except Exception as e:
+        logger.error(f"Error adjusting ASS timing: {str(e)}")
+        return False
+
 def update_srt_file():
     """Update SRT file with position data for WebODM processing, synced to video recording"""
     global stop_srt_thread, current_srt_file_rtsp, start_time, srt_subtitle_counter
@@ -751,6 +950,7 @@ def start():
     global gst_stderr_thread, stop_gst_stderr_thread, gst_error_count, gst_warning_count
     global watchdog_thread, stop_watchdog_thread, file_stall_count
     global current_events_file
+    global ass_thread, stop_ass_thread, current_ass_file, ass_subtitle_counter
     try:
         if recording:
             return jsonify({"success": False, "message": "Already recording"}), 400
@@ -782,6 +982,10 @@ def start():
         
         # Create ISP log file for camera exposure data
         current_isp_log_file = create_isp_log_file(filepath_rtsp)
+        
+        # Create ASS telemetry subtitle file
+        current_ass_file = create_ass_file(filepath_rtsp)
+        ass_subtitle_counter = 0
         
         # Create recording diagnostics event log
         current_events_file = create_events_file(filepath_rtsp)
@@ -832,6 +1036,7 @@ def start():
             current_srt_file_rtsp = None
             current_video_file_rtsp = None
             current_isp_log_file = None
+            current_ass_file = None
             return jsonify({"success": False, "message": "RTSP video stream failed to start"}), 500
         
         # NOW set recording state and start_time AFTER video is confirmed recording
@@ -850,6 +1055,12 @@ def start():
         isp_log_thread = threading.Thread(target=update_isp_log)
         isp_log_thread.daemon = True
         isp_log_thread.start()
+        
+        # Start ASS telemetry subtitle thread - full telemetry at 5 Hz
+        stop_ass_thread = False
+        ass_thread = threading.Thread(target=update_ass_file)
+        ass_thread.daemon = True
+        ass_thread.start()
         
         # Start GStreamer stderr monitoring thread
         stop_gst_stderr_thread = False
@@ -870,6 +1081,7 @@ def start():
         
         # Log file generation
         logger.info(f"Started SRT position file generation (synced to video): {current_srt_file_rtsp}")
+        logger.info(f"Started ASS telemetry file generation: {current_ass_file}")
         logger.info(f"Started ISP log file generation: {current_isp_log_file}")
         logger.info(f"Started recording diagnostics: events={current_events_file}")
         logger.info("Recording started successfully with RTSP stream")
@@ -888,6 +1100,7 @@ def start():
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
         current_isp_log_file = None
+        current_ass_file = None
         current_events_file = None
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -898,6 +1111,7 @@ def stop():
     global gst_stderr_thread, stop_gst_stderr_thread
     global watchdog_thread, stop_watchdog_thread
     global current_events_file
+    global ass_thread, stop_ass_thread, current_ass_file
     try:
         if not recording:
             return jsonify({"success": True})
@@ -907,6 +1121,7 @@ def stop():
         # Save file paths before clearing globals
         video_path = current_video_file_rtsp
         srt_path = current_srt_file_rtsp
+        ass_path = current_ass_file
         isp_log_path = current_isp_log_file
         events_path = current_events_file
         
@@ -919,6 +1134,11 @@ def stop():
         stop_isp_log_thread = True
         if isp_log_thread:
             isp_log_thread.join(timeout=2)
+        
+        # Stop ASS telemetry thread
+        stop_ass_thread = True
+        if ass_thread:
+            ass_thread.join(timeout=2)
         
         # Stop GStreamer stderr monitoring thread
         stop_gst_stderr_thread = True
@@ -955,11 +1175,14 @@ def stop():
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
         current_isp_log_file = None
+        current_ass_file = None
         current_events_file = None
         
         # Log sidecar file completion
         if isp_log_path and os.path.exists(isp_log_path):
             logger.info(f"ISP log file saved: {isp_log_path}")
+        if ass_path and os.path.exists(ass_path):
+            logger.info(f"ASS telemetry file saved: {ass_path}")
         if events_path and os.path.exists(events_path):
             logger.info(f"Events log saved: {events_path}")
         
@@ -975,8 +1198,10 @@ def stop():
             if video_duration:
                 logger.info(f"Video duration: {video_duration:.2f} seconds")
                 adjust_srt_timing(srt_path, video_duration)
+                if ass_path and os.path.exists(ass_path):
+                    adjust_ass_timing(ass_path, video_duration)
             else:
-                logger.warning("Could not determine video duration, SRT timing not adjusted")
+                logger.warning("Could not determine video duration, subtitle timing not adjusted")
         
         logger.info("Recording process stopped successfully")
         return jsonify({"success": True})
@@ -993,6 +1218,7 @@ def stop():
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
         current_isp_log_file = None
+        current_ass_file = None
         current_events_file = None
         return jsonify({"success": False, "message": str(e)}), 500
 
