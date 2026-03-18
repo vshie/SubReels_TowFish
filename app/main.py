@@ -992,14 +992,15 @@ def start():
         
         protocol_prop = f"protocols={stream_protocol} " if stream_protocol == "tcp" else ""
         rtsp_pipeline = (
-            f"rtspsrc location={RTSP_H265_ENDPOINT} "
+            f"rtspsrc location={RTSP_H265_ENDPOINT} is-live=true "
             f"{protocol_prop}"
-            "latency=500 "
-            "retry=5 "
-            "timeout=5000000 "
-            "! rtph265depay ! h265parse ! "
-            f"{mux_element} ! "
-            f"filesink location={filepath_rtsp}")
+            "latency=5000 retry=5 timeout=5000000 "
+            "! rtph265depay wait-for-keyframe=true "
+            "! h265parse config-interval=-1 "
+            "! queue max-size-time=30000000000 max-size-bytes=0 max-size-buffers=0 leaky=downstream silent=true "
+            f"! {mux_element} "
+            f"! filesink location={filepath_rtsp} sync=false"
+        )
 
         rtsp_command = ["gst-launch-1.0", "-e"] + shlex.split(rtsp_pipeline)
         
