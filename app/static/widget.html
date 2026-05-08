@@ -27,6 +27,38 @@
             box-shadow: 0 2px 12px rgba(0,0,0,0.4);
         }
 
+        .mode-switch {
+            display: flex;
+            background: #1c1c1c;
+            border-radius: 6px;
+            padding: 3px;
+            margin-bottom: 12px;
+        }
+
+        .mode-switch button {
+            flex: 1;
+            background: transparent;
+            color: #aaa;
+            border: none;
+            padding: 6px 0;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.4px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        .mode-switch button.active {
+            background: #3a3a3a;
+            color: #fff;
+        }
+
+        .mode-switch button:disabled {
+            cursor: not-allowed;
+            opacity: 0.55;
+        }
+
         .header {
             display: flex;
             align-items: center;
@@ -43,8 +75,13 @@
             transition: background 0.3s;
         }
 
-        .rec-dot.active {
+        .rec-dot.active.video {
             background: #e53935;
+            animation: pulse 1.2s infinite;
+        }
+
+        .rec-dot.active.timelapse {
+            background: #fb8c00;
             animation: pulse 1.2s infinite;
         }
 
@@ -67,6 +104,7 @@
         }
 
         .duration.active { color: #ef9a9a; }
+        .duration.active.timelapse { color: #ffcc80; }
 
         .btn {
             width: 100%;
@@ -97,6 +135,9 @@
         }
         .btn-stop:hover:not(:disabled) { background: #c62828; }
 
+        .btn-stop.timelapse { background: #fb8c00; }
+        .btn-stop.timelapse:hover:not(:disabled) { background: #ef6c00; }
+
         .file-info {
             margin-top: 12px;
             padding: 10px;
@@ -126,6 +167,19 @@
             flex-shrink: 0;
         }
 
+        .file-size.timelapse { color: #ffcc80; }
+
+        .stats-row {
+            margin-top: 6px;
+            font-size: 11px;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .stats-row span.warn { color: #ef9a9a; }
+
         .error-msg {
             margin-top: 8px;
             padding: 6px 8px;
@@ -139,13 +193,18 @@
 </head>
 <body>
     <div class="widget">
+        <div class="mode-switch" id="modeSwitch">
+            <button id="modeVideoBtn" class="active" onclick="setMode('video')">VIDEO</button>
+            <button id="modeTimelapseBtn" onclick="setMode('timelapse')">TIMELAPSE 2 Hz</button>
+        </div>
+
         <div class="header">
             <div class="rec-dot" id="recDot"></div>
-            <span class="title">Video Recorder</span>
+            <span class="title" id="modeTitle">Video Recorder</span>
             <span class="duration" id="duration">00:00:00</span>
         </div>
 
-        <button class="btn btn-start" id="actionBtn" onclick="toggleRecording()">
+        <button class="btn btn-start" id="actionBtn" onclick="toggleActive()">
             Start Recording
         </button>
 
@@ -154,20 +213,37 @@
             <span class="file-size" id="fileSize"></span>
         </div>
 
+        <div class="stats-row" id="statsRow"></div>
+
         <div class="error-msg" id="errorMsg"></div>
     </div>
 
 <script>
-const actionBtn   = document.getElementById('actionBtn');
-const recDot      = document.getElementById('recDot');
-const durationEl  = document.getElementById('duration');
-const fileNameEl  = document.getElementById('fileName');
-const fileSizeEl  = document.getElementById('fileSize');
-const errorMsg    = document.getElementById('errorMsg');
+const actionBtn       = document.getElementById('actionBtn');
+const recDot          = document.getElementById('recDot');
+const durationEl      = document.getElementById('duration');
+const fileNameEl      = document.getElementById('fileName');
+const fileSizeEl      = document.getElementById('fileSize');
+const errorMsg        = document.getElementById('errorMsg');
+const modeVideoBtn    = document.getElementById('modeVideoBtn');
+const modeTimelapseBtn= document.getElementById('modeTimelapseBtn');
+const modeTitle       = document.getElementById('modeTitle');
+const statsRow        = document.getElementById('statsRow');
 
-let isRecording = false;
-let startTime   = null;
-let durationTimer = null;
+// Local mode selection (what the user has *picked*); the active mode
+// reported by the server is in serverMode and overrides UI when active.
+let selectedMode = 'video';
+let serverMode   = 'idle';
+let startTime    = null;
+let durationTimer= null;
+
+function isActive() {
+    return serverMode === 'video' || serverMode === 'timelapse';
+}
+
+function activeMode() {
+    return isActive() ? serverMode : selectedMode;
+}
 
 function formatBytes(bytes) {
     if (bytes === 0) return '0 B';
@@ -189,44 +265,73 @@ function showError(msg) {
     setTimeout(() => { errorMsg.style.display = 'none'; }, 5000);
 }
 
-function setUI(recording, serverDurationSec) {
-    isRecording = recording;
+function setMode(m) {
+    if (isActive()) return; // can't switch while running
+    selectedMode = m;
+    modeVideoBtn.classList.toggle('active',     m === 'video');
+    modeTimelapseBtn.classList.toggle('active', m === 'timelapse');
+    renderUI();
+}
 
-    if (recording) {
-        actionBtn.textContent = 'Stop Recording';
-        actionBtn.className   = 'btn btn-stop';
-        recDot.classList.add('active');
-        durationEl.classList.add('active');
+function renderUI() {
+    const m = activeMode();
+    const active = isActive();
 
-        if (serverDurationSec !== undefined && serverDurationSec > 0) {
-            startTime = new Date(Date.now() - serverDurationSec * 1000);
-        } else if (!startTime) {
-            startTime = new Date();
-        }
-        if (!durationTimer) {
-            durationTimer = setInterval(() => {
-                durationEl.textContent = formatDuration(Date.now() - startTime.getTime());
-            }, 500);
-        }
+    if (m === 'video') {
+        modeTitle.textContent = 'Video Recorder';
+        actionBtn.textContent = active ? 'Stop Recording' : 'Start Recording';
     } else {
-        actionBtn.textContent = 'Start Recording';
-        actionBtn.className   = 'btn btn-start';
-        recDot.classList.remove('active');
-        durationEl.classList.remove('active');
-        clearInterval(durationTimer);
-        durationTimer = null;
-        startTime = null;
-        durationEl.textContent = '00:00:00';
+        modeTitle.textContent = 'Timelapse Snapshots';
+        actionBtn.textContent = active ? 'Stop Timelapse' : 'Start Timelapse';
     }
 
+    actionBtn.className = 'btn ' + (active ? 'btn-stop' : 'btn-start');
+    if (active && m === 'timelapse') actionBtn.classList.add('timelapse');
+
+    recDot.className = 'rec-dot';
+    durationEl.className = 'duration';
+    if (active) {
+        recDot.classList.add('active', m);
+        durationEl.classList.add('active');
+        if (m === 'timelapse') durationEl.classList.add('timelapse');
+    }
+
+    modeVideoBtn.disabled = active;
+    modeTimelapseBtn.disabled = active;
     actionBtn.disabled = false;
 }
 
-async function toggleRecording() {
+function startDurationTimer(serverDurationSec) {
+    if (serverDurationSec !== undefined && serverDurationSec > 0) {
+        startTime = new Date(Date.now() - serverDurationSec * 1000);
+    } else if (!startTime) {
+        startTime = new Date();
+    }
+    if (!durationTimer) {
+        durationTimer = setInterval(() => {
+            durationEl.textContent = formatDuration(Date.now() - startTime.getTime());
+        }, 500);
+    }
+}
+
+function stopDurationTimer() {
+    clearInterval(durationTimer);
+    durationTimer = null;
+    startTime = null;
+    durationEl.textContent = '00:00:00';
+}
+
+async function toggleActive() {
     actionBtn.disabled = true;
     errorMsg.style.display = 'none';
 
-    const endpoint = isRecording ? '/stop' : '/start';
+    let endpoint;
+    if (isActive()) {
+        endpoint = serverMode === 'timelapse' ? '/timelapse/stop' : '/stop';
+    } else {
+        endpoint = selectedMode === 'timelapse' ? '/timelapse/start' : '/start';
+    }
+
     try {
         const res  = await fetch(endpoint);
         const data = await res.json();
@@ -235,7 +340,15 @@ async function toggleRecording() {
             actionBtn.disabled = false;
             return;
         }
-        setUI(!isRecording, null);
+        // Optimistic UI update; pollStatus will reconcile.
+        if (endpoint.endsWith('/start') || endpoint === '/timelapse/start') {
+            serverMode = selectedMode;
+            startDurationTimer();
+        } else {
+            serverMode = 'idle';
+            stopDurationTimer();
+        }
+        renderUI();
     } catch (e) {
         showError('Connection error');
         actionBtn.disabled = false;
@@ -246,11 +359,45 @@ async function pollStatus() {
     try {
         const res  = await fetch('/status');
         const data = await res.json();
-        if (data.recording !== isRecording) {
-            setUI(data.recording, data.duration_seconds);
-        } else if (data.recording && data.duration_seconds > 0) {
-            startTime = new Date(Date.now() - data.duration_seconds * 1000);
+        const newMode = data.mode || (data.recording ? 'video' : 'idle');
+        const wasActive = isActive();
+        serverMode = newMode;
+
+        if (isActive()) {
+            // Sync the selected mode to whatever the server is doing so
+            // the UI doesn't flip mid-recording on external start.
+            if (selectedMode !== serverMode) {
+                selectedMode = serverMode;
+                modeVideoBtn.classList.toggle('active',     serverMode === 'video');
+                modeTimelapseBtn.classList.toggle('active', serverMode === 'timelapse');
+            }
+            startDurationTimer(data.duration_seconds);
+        } else if (wasActive) {
+            stopDurationTimer();
         }
+
+        // Stats line
+        if (serverMode === 'video') {
+            const restarts = data.restarts || 0;
+            const errs = data.gst_errors || 0;
+            const stalls = data.file_stalls || 0;
+            const parts = [];
+            if (restarts > 0) parts.push(`<span class="warn">restarts: ${restarts}</span>`);
+            if (errs > 0)     parts.push(`<span class="warn">errs: ${errs}</span>`);
+            if (stalls > 0)   parts.push(`<span class="warn">stalls: ${stalls}</span>`);
+            parts.push(`free: ${data.disk_free_mb || 0} MB`);
+            statsRow.innerHTML = parts.join(' &middot; ');
+        } else if (serverMode === 'timelapse') {
+            const tl = data.timelapse || {};
+            const parts = [`snaps: ${tl.snap_count || 0}`];
+            if (tl.miss_count > 0) parts.push(`<span class="warn">misses: ${tl.miss_count}</span>`);
+            parts.push(`free: ${data.disk_free_mb || 0} MB`);
+            statsRow.innerHTML = parts.join(' &middot; ');
+        } else {
+            statsRow.innerHTML = '';
+        }
+
+        renderUI();
     } catch (_) {}
 }
 
@@ -259,15 +406,22 @@ async function pollFileSize() {
         const res  = await fetch('/filesize');
         const data = await res.json();
         if (data.success && data.filename) {
-            fileNameEl.textContent = data.filename;
+            let label = data.filename;
+            if (data.mode === 'timelapse' && data.snap_count !== undefined) {
+                label = `${data.filename} (${data.snap_count})`;
+            }
+            fileNameEl.textContent = label;
             fileSizeEl.textContent = formatBytes(data.size_bytes);
+            fileSizeEl.classList.toggle('timelapse', data.mode === 'timelapse');
         } else {
             fileNameEl.textContent = 'No files yet';
             fileSizeEl.textContent = '';
+            fileSizeEl.classList.remove('timelapse');
         }
     } catch (_) {}
 }
 
+renderUI();
 pollStatus();
 pollFileSize();
 

@@ -24,6 +24,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends --no-install-su
     psmisc \
     && rm -rf /var/lib/apt/lists/*
 
+# Python GObject Introspection bindings so the recorder can drive
+# GStreamer in-process via gi.repository.Gst (replaces gst-launch-1.0
+# subprocess; needed for splitmuxsink format-location callbacks +
+# bus-monitored auto-restart on RTSP drops).
+RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
+    python3-gi \
+    python3-gi-cairo \
+    gir1.2-gstreamer-1.0 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create app directory
 WORKDIR /app
 

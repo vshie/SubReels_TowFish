@@ -2,12 +2,11 @@ from flask import Flask, jsonify, request, send_file
 import asyncio
 import json
 import os
+import glob
 import subprocess
 from datetime import datetime
 import logging
-import signal
 import time
-import shlex
 import requests
 import threading
 import math
@@ -16,6 +15,10 @@ import csv
 import re
 from websockets.exceptions import ConnectionClosed
 
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst  # noqa: E402  (after require_version)
+
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
@@ -23,35 +26,54 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global variables
-rtsp_process = None
+# ---------------------------------------------------------------------------
+# Mode state -- the recorder runs in exactly one mode at a time:
+#   "idle"       : nothing happening
+#   "video"      : RTSP H.265 RecordingSession is active
+#   "timelapse"  : 2 Hz HTTP-snap TimelapseSession is active
+# Mode transitions go through _mode_lock so the Flask routes can never
+# leave the recorder in a half-started state across both modes.
+# ---------------------------------------------------------------------------
+MODE_IDLE = "idle"
+MODE_VIDEO = "video"
+MODE_TIMELAPSE = "timelapse"
+
+_mode_lock = threading.Lock()
+mode = MODE_IDLE
+
+def _set_mode(new_mode):
+    """Module-level setter so the recording sessions can flip global ``mode``.
+
+    Always called while holding ``_mode_lock`` so the Flask routes never
+    observe a transient half-state during start/stop transitions.
+    """
+    global mode
+    mode = new_mode
+
+# Active RTSP session (RecordingSession instance) -- non-None iff mode == "video".
+_session = None
+# Active timelapse session (TimelapseSession instance) -- non-None iff mode == "timelapse".
+_timelapse = None
+
+# ``recording`` and ``start_time`` are kept as module-level mirrors of
+# the active session's state so the data-lake WebSocket and existing
+# sidecar threads (SRT/ASS/ISP) keep working unchanged.
 recording = False
 start_time = None
+
+# Sidecar lifecycle (one set per RecordingSession; spans every part the
+# watchdog produces). All threads stop when stop_*_thread is set.
 srt_thread = None
 stop_srt_thread = False
 current_srt_file_rtsp = None
-current_video_file_rtsp = None
+current_video_file_rtsp = None  # path of the FIRST part; used for filesize/list
 
-# ISP logging variables
 isp_log_thread = None
 stop_isp_log_thread = False
 current_isp_log_file = None
 
-# GStreamer stderr monitoring
-gst_stderr_thread = None
-stop_gst_stderr_thread = False
-gst_error_count = 0
-gst_warning_count = 0
-
-# Recording health watchdog
-watchdog_thread = None
-stop_watchdog_thread = False
-file_stall_count = 0
-
-# Recording event log
 current_events_file = None
 
-# ASS telemetry subtitle variables
 ass_thread = None
 stop_ass_thread = False
 current_ass_file = None
@@ -78,6 +100,7 @@ DEFAULT_CONTAINER_FORMAT = "mp4"
 VALID_CONTAINER_FORMATS = ("mp4", "mpegts")
 DEFAULT_STREAM_PROTOCOL = "udp"
 VALID_STREAM_PROTOCOLS = ("udp", "tcp")
+DEFAULT_SNAPSHOT_URL = "http://192.168.2.10/cgi-bin/onesnap.cgi"
 
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
@@ -85,6 +108,7 @@ def load_config():
         "tow_vehicle_ip": DEFAULT_TOW_VEHICLE_IP,
         "container_format": DEFAULT_CONTAINER_FORMAT,
         "stream_protocol": DEFAULT_STREAM_PROTOCOL,
+        "snapshot_url": DEFAULT_SNAPSHOT_URL,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -97,6 +121,8 @@ def load_config():
         defaults["container_format"] = DEFAULT_CONTAINER_FORMAT
     if defaults["stream_protocol"] not in VALID_STREAM_PROTOCOLS:
         defaults["stream_protocol"] = DEFAULT_STREAM_PROTOCOL
+    if not isinstance(defaults["snapshot_url"], str) or not defaults["snapshot_url"].strip():
+        defaults["snapshot_url"] = DEFAULT_SNAPSHOT_URL
     return defaults
 
 def save_config(cfg):
@@ -121,6 +147,7 @@ _cfg = load_config()
 tow_vehicle_ip = _cfg["tow_vehicle_ip"]
 container_format = _cfg["container_format"]
 stream_protocol = _cfg["stream_protocol"]
+snapshot_url = _cfg["snapshot_url"]
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
@@ -458,6 +485,48 @@ def get_video_duration(video_path):
         logger.error(f"Error getting video duration: {str(e)}")
     return None
 
+def list_session_parts(first_part_path):
+    """Return every on-disk part file produced by the session that started
+    with ``first_part_path``.
+
+    With ``splitmuxsink`` the recorder writes one or more sibling files
+    named ``<basename>_part<NN>_<NNNNN>.<ext>`` whenever the watchdog
+    rebuilds the pipeline (RTSP drop, file stall, etc). This helper
+    returns them in on-disk order so callers can sum durations or list
+    sidecar artifacts for the whole logical recording.
+    """
+    if not first_part_path:
+        return []
+    base, ext = os.path.splitext(first_part_path)
+    # Strip the trailing _partNN_NNNNN suffix that splitmuxsink appends.
+    m = re.match(r"^(.*)_part\d{2,}_\d+$", base)
+    prefix = m.group(1) if m else base
+    pattern = f"{prefix}_part*_*{ext}"
+    parts = sorted(glob.glob(pattern))
+    if parts:
+        return parts
+    if os.path.exists(first_part_path):
+        return [first_part_path]
+    return []
+
+def sum_session_video_duration(first_part_path):
+    """Sum the ffprobe duration of every part written by this session.
+
+    Used to scale SRT/ASS timestamps when the watchdog rebuilt the
+    pipeline mid-recording: the sidecar files are wall-clock timed
+    across the whole session, but each .ts part has its own PTS
+    timeline (splitmuxsink resets per-segment), so we have to add the
+    individual durations.
+    """
+    total = 0.0
+    saw_any = False
+    for p in list_session_parts(first_part_path):
+        d = get_video_duration(p)
+        if d is not None and d > 0:
+            total += d
+            saw_any = True
+    return total if saw_any else None
+
 def parse_srt_timestamp(timestamp_str):
     """Parse SRT timestamp (HH:MM:SS,mmm) to seconds"""
     parts = timestamp_str.replace(',', '.').split(':')
@@ -786,27 +855,6 @@ def log_event(event_type, detail=""):
     except Exception as e:
         logger.debug(f"Error writing event log: {e}")
 
-def gstreamer_stderr_monitor(process):
-    """Read GStreamer stderr line-by-line and classify as error/warning/debug."""
-    global gst_error_count, gst_warning_count
-    for line in iter(process.stderr.readline, b''):
-        if stop_gst_stderr_thread:
-            break
-        decoded = line.decode('utf-8', errors='replace').strip()
-        if not decoded:
-            continue
-        upper = decoded.upper()
-        if 'ERROR' in upper:
-            gst_error_count += 1
-            logger.error(f"GST_ERROR: {decoded}")
-            log_event("gst_error", decoded)
-        elif 'WARNING' in upper:
-            gst_warning_count += 1
-            logger.warning(f"GST_WARN: {decoded}")
-            log_event("gst_warning", decoded)
-        else:
-            logger.debug(f"GST: {decoded}")
-
 def _read_disk_free_mb():
     """Read free disk space on /app/videorecordings in MB."""
     try:
@@ -815,58 +863,494 @@ def _read_disk_free_mb():
     except Exception:
         return None
 
-def recording_health_watchdog():
-    """Periodically check recording pipeline health and log structured diagnostics."""
-    global file_stall_count
-    last_file_size = 0
-    file_stall_count = 0
+# ---------------------------------------------------------------------------
+# In-process GStreamer recording with auto-restart watchdog.
+#
+# Replaces the legacy ``subprocess.Popen(["gst-launch-1.0", ...])`` path.
+# Key motivations (informed by today's tow-fish dive + the doris
+# tony-video-h265 reference):
+#
+# * RTSP drops at 50 Mbit/s HEVC silently kill the recorder. The watchdog
+#   here detects ERROR/EOS on the GStreamer bus *and* file-stall and
+#   restarts the pipeline automatically; per-restart files are written
+#   via ``splitmuxsink`` so we never lose the previously-recorded data.
+# * The 1-hour MPEG-TS PTS offset that breaks VLC playback comes from
+#   ``mpegtsmux`` reusing rtspsrc's first PTS. ``splitmuxsink`` opens a
+#   fresh muxer per fragment (PTS resets to zero) so every part plays
+#   straight away.
+# * ``wait-for-keyframe=true`` + ``alignment=au`` + ``config-interval=-1``
+#   guarantee every part starts at a decodable VPS+SPS+PPS+IDR.
+# * ``async-finalize=false`` per the doris h265 docstring: their tests
+#   showed ``async-finalize=true`` could silently freeze splitmuxsink
+#   mid-rotation while the bus continued to report the pipeline healthy.
+# ---------------------------------------------------------------------------
 
-    while not stop_watchdog_thread and recording:
+_RESTART_BACKOFF_S = 1.0
+_MIN_GOOD_RUNTIME_S = 3.0
+_MAX_BACKOFF_S = 5.0
+_STOP_EOS_TIMEOUT_S = 5.0
+
+# How many consecutive 5-second polls with no file growth count as a
+# stall (and thus a hung pipeline that needs respawning).
+_STALL_POLLS_BEFORE_RESTART = 3
+
+_gst_init_lock = threading.Lock()
+_gst_initialized = False
+
+def _ensure_gst_init():
+    global _gst_initialized
+    with _gst_init_lock:
+        if not _gst_initialized:
+            Gst.init(None)
+            _gst_initialized = True
+            logger.info("GStreamer initialized (version %s)", Gst.version_string())
+
+def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsink"):
+    """Build the gst-parse_launch description for one RTSP H.265 session.
+
+    Output is always written via splitmuxsink so we get fresh PTS per
+    segment (VLC can play it) and the watchdog can roll a new file on
+    each pipeline rebuild.
+    """
+    if container_fmt == "mpegts":
+        muxer_factory = "mpegtsmux"
+    else:
+        muxer_factory = "mp4mux"
+    proto = proto if proto in VALID_STREAM_PROTOCOLS else DEFAULT_STREAM_PROTOCOL
+    return (
+        f"rtspsrc location={rtsp_url} is-live=true latency=5000 "
+        f"protocols={proto} retry=5 timeout=5000000 do-retransmission=false "
+        f"! rtph265depay wait-for-keyframe=true "
+        f"! h265parse config-interval=-1 "
+        f"! video/x-h265,stream-format=byte-stream,alignment=au "
+        f"! splitmuxsink name={mux_name} max-size-time=0 "
+        f"muxer-factory={muxer_factory} send-keyframe-requests=true "
+        f"async-finalize=false"
+    )
+
+class RecordingSession:
+    """One logical recording (one /start ... /stop call).
+
+    Owns a background thread that keeps a GStreamer pipeline alive,
+    rebuilding it on RTSP drops or file stalls. Each rebuild produces
+    a new on-disk part via ``splitmuxsink`` so we never lose what was
+    already written.
+    """
+
+    def __init__(self, rtsp_url, out_dir, base_filename, ext,
+                 container_fmt, proto):
+        self._rtsp_url = rtsp_url
+        self._out_dir = out_dir
+        self._base_filename = base_filename  # "video_rtsp_<TS>"
+        self._ext = ext  # ".ts" or ".mp4"
+        self._container_fmt = container_fmt
+        self._proto = proto
+
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+        self._pipeline = None
+        self._muxsink = None
+        self._current_part = 0
+        self.restart_count = 0
+        self.last_pattern = None
+        self.last_exit = None
+        # First on-disk part (used by /filesize, sidecar timing, etc.)
+        self.first_part_path = None
+        # Diagnostic counters surfaced via /status
+        self.gst_errors = 0
+        self.gst_warnings = 0
+        self.file_stalls = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def start(self):
+        if self._thread is not None:
+            raise RuntimeError("RecordingSession already started")
+        _ensure_gst_init()
+        self._thread = threading.Thread(
+            target=self._watchdog, name="rec-watchdog", daemon=True,
+        )
+        self._thread.start()
+
+    def is_alive(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self, timeout_s=12.0):
+        """Request stop; wait for the pipeline thread to finalise."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout_s)
+            if self._thread.is_alive():
+                logger.warning("RecordingSession watchdog did not exit in %.1fs", timeout_s)
+
+    # ------------------------------------------------------------------
+    # splitmuxsink format-location callback
+    # ------------------------------------------------------------------
+    def _on_format_location(self, _splitmux, fragment_id):
+        """Compose the on-disk path for the next .ts/.mp4 fragment."""
+        path = os.path.join(
+            self._out_dir,
+            f"{self._base_filename}_part{self._current_part:02d}_"
+            f"{int(fragment_id):05d}{self._ext}",
+        )
+        self.last_pattern = path
+        if self.first_part_path is None:
+            self.first_part_path = path
+        log_event("part_opened", path)
+        return path
+
+    # ------------------------------------------------------------------
+    # Pipeline build / run
+    # ------------------------------------------------------------------
+    def _build_pipeline(self):
+        desc = _build_pipeline_description(
+            self._rtsp_url, self._container_fmt, self._proto,
+        )
+        logger.info("RECORD building pipeline part=%d: %s",
+                    self._current_part, desc)
+        pipeline = Gst.parse_launch(desc)
+        if not isinstance(pipeline, Gst.Pipeline):
+            raise RuntimeError("Gst.parse_launch returned non-pipeline")
+        muxsink = pipeline.get_by_name("muxsink")
+        if muxsink is None:
+            raise RuntimeError("splitmuxsink 'muxsink' not found in pipeline")
+        muxsink.connect("format-location", self._on_format_location)
+        with self._lock:
+            self._pipeline = pipeline
+            self._muxsink = muxsink
+        return pipeline
+
+    def _run_one(self):
+        """Run one pipeline instance until stop / ERROR / EOS / stall.
+
+        Returns ``(exit_reason, runtime_s)``.
+        """
+        t0 = time.monotonic()
         try:
-            diagnostics = {}
+            pipeline = self._build_pipeline()
+        except Exception as e:
+            logger.exception("RECORD pipeline build failed")
+            log_event("pipeline_build_failed", str(e))
+            return "build_failed", time.monotonic() - t0
 
-            if current_video_file_rtsp and os.path.exists(current_video_file_rtsp):
-                current_size = os.path.getsize(current_video_file_rtsp)
-                growth = current_size - last_file_size
-                diagnostics["file_size_bytes"] = current_size
-                diagnostics["growth_bytes"] = growth
-                if last_file_size > 0 and growth == 0:
-                    file_stall_count += 1
-                    diagnostics["stall_count"] = file_stall_count
-                    log_event("file_stall",
-                              f"No growth for {file_stall_count} intervals ({current_size} bytes)")
-                else:
-                    file_stall_count = 0
-                last_file_size = current_size
+        bus = pipeline.get_bus()
+        ret = pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.warning("RECORD set_state(PLAYING) returned FAILURE")
+            log_event("set_state_failure", f"part={self._current_part}")
+            self._teardown_pipeline()
+            return "set_state_failure", time.monotonic() - t0
 
-            if rtsp_process:
-                alive = rtsp_process.poll() is None
-                diagnostics["gst_pid"] = rtsp_process.pid
-                diagnostics["gst_alive"] = alive
-                if not alive:
-                    log_event("process_died",
-                              f"GStreamer exited with code {rtsp_process.returncode}")
+        exit_reason = "unknown"
+        last_size_check_t = time.monotonic()
+        last_size = 0
+        stall_polls = 0
+        try:
+            while not self._stop_event.is_set():
+                msg = bus.timed_pop_filtered(
+                    0, Gst.MessageType.ERROR | Gst.MessageType.EOS
+                    | Gst.MessageType.WARNING,
+                )
+                if msg is not None:
+                    if msg.type == Gst.MessageType.ERROR:
+                        err, dbg = msg.parse_error()
+                        self.gst_errors += 1
+                        logger.warning("gst[part=%d] error: %s (%s)",
+                                       self._current_part, err.message, dbg)
+                        log_event("gst_error", f"{err.message} | {dbg}")
+                        exit_reason = f"error:{err.message}"
+                        break
+                    if msg.type == Gst.MessageType.EOS:
+                        logger.info("gst[part=%d] unexpected EOS", self._current_part)
+                        log_event("unexpected_eos", f"part={self._current_part}")
+                        exit_reason = "unexpected_eos"
+                        break
+                    if msg.type == Gst.MessageType.WARNING:
+                        warn, dbg = msg.parse_warning()
+                        self.gst_warnings += 1
+                        logger.warning("gst[part=%d] warning: %s (%s)",
+                                       self._current_part, warn.message, dbg)
+                        log_event("gst_warning", f"{warn.message} | {dbg}")
 
-            disk_free = _read_disk_free_mb()
-            if disk_free is not None:
-                diagnostics["disk_free_mb"] = disk_free
+                # File-stall poll (every 5 s).
+                now = time.monotonic()
+                if now - last_size_check_t >= 5.0:
+                    last_size_check_t = now
+                    cur_path = self.last_pattern
+                    if cur_path and os.path.exists(cur_path):
+                        cur_size = os.path.getsize(cur_path)
+                        if last_size > 0 and cur_size == last_size:
+                            stall_polls += 1
+                            self.file_stalls += 1
+                            log_event("file_stall",
+                                      f"part={self._current_part} no growth for "
+                                      f"{stall_polls} polls ({cur_size} bytes)")
+                            if stall_polls >= _STALL_POLLS_BEFORE_RESTART:
+                                logger.warning(
+                                    "RECORD part=%d stall threshold hit; restarting",
+                                    self._current_part,
+                                )
+                                exit_reason = "file_stall"
+                                break
+                        else:
+                            stall_polls = 0
+                        last_size = cur_size
+
+                time.sleep(0.1)
+
+            # Clean stop requested by /stop.
+            if self._stop_event.is_set() and exit_reason == "unknown":
+                logger.info("RECORD part=%d stopping (user); sending EOS",
+                            self._current_part)
+                exit_reason = self._send_eos_with_timeout(pipeline, bus)
+        finally:
+            self._teardown_pipeline()
+
+        return exit_reason, time.monotonic() - t0
+
+    def _send_eos_with_timeout(self, pipeline, bus):
+        """Send EOS in a worker thread and wait, falling back to NULL.
+
+        On a live HEVC ``rtspsrc protocols=udp`` pipeline the
+        ``send_event(EOS)`` call has been observed to block for many
+        minutes, starving the rest of the process. Run it in a thread
+        and bound it with a wall-clock timeout so we always reach the
+        ``set_state(NULL)`` in :meth:`_teardown_pipeline`.
+        """
+        done = threading.Event()
+
+        def _send():
+            try:
+                pipeline.send_event(Gst.Event.new_eos())
+            except Exception:
+                logger.exception("RECORD send_event(EOS) raised")
+            finally:
+                done.set()
+
+        threading.Thread(target=_send, daemon=True).start()
+        if not done.wait(timeout=_STOP_EOS_TIMEOUT_S):
+            logger.warning(
+                "RECORD part=%d send_event(EOS) blocked > %.1fs; forcing NULL",
+                self._current_part, _STOP_EOS_TIMEOUT_S,
+            )
+            return "stopped_forced_send"
+
+        deadline = time.monotonic() + _STOP_EOS_TIMEOUT_S
+        while time.monotonic() < deadline:
+            msg = bus.timed_pop_filtered(
+                0, Gst.MessageType.ERROR | Gst.MessageType.EOS,
+            )
+            if msg is not None and msg.type in (
+                Gst.MessageType.EOS, Gst.MessageType.ERROR,
+            ):
+                return "stopped_clean"
+            time.sleep(0.05)
+        logger.warning("RECORD part=%d EOS not observed within %.1fs",
+                       self._current_part, _STOP_EOS_TIMEOUT_S)
+        return "stopped_forced"
+
+    def _teardown_pipeline(self):
+        """NULL-state the pipeline in a worker thread with a timeout.
+
+        ``set_state(NULL)`` can block on a misbehaving rtspsrc; bound
+        it so the watchdog can always make forward progress.
+        """
+        with self._lock:
+            pipeline = self._pipeline
+            self._pipeline = None
+            self._muxsink = None
+        if pipeline is None:
+            return
+        done = threading.Event()
+
+        def _null():
+            try:
+                pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                logger.exception("RECORD set_state(NULL) raised")
+            finally:
+                done.set()
+
+        threading.Thread(target=_null, daemon=True).start()
+        if not done.wait(timeout=10.0):
+            logger.error(
+                "RECORD set_state(NULL) blocked > 10s; abandoning pipeline reference",
+            )
+
+    # ------------------------------------------------------------------
+    # Watchdog loop
+    # ------------------------------------------------------------------
+    def _watchdog(self):
+        backoff = _RESTART_BACKOFF_S
+        while not self._stop_event.is_set():
+            try:
+                exit_reason, runtime_s = self._run_one()
+            except Exception as e:
+                logger.exception("RECORD pipeline run raised")
+                exit_reason, runtime_s = f"exception:{e}", 0.0
+            self.last_exit = {
+                "part": self._current_part,
+                "reason": exit_reason,
+                "runtime_s": round(runtime_s, 2),
+                "pattern": self.last_pattern,
+            }
+            if self._stop_event.is_set():
+                logger.info(
+                    "RECORD pipeline part=%d exited reason=%s runtime=%.1fs (user stop)",
+                    self._current_part, exit_reason, runtime_s,
+                )
+                log_event("recording_stopped",
+                          f"part={self._current_part} reason={exit_reason}")
+                break
+            logger.warning(
+                "RECORD pipeline part=%d exited reason=%s runtime=%.1fs - restarting",
+                self._current_part, exit_reason, runtime_s,
+            )
+            log_event("watchdog_restart",
+                      f"part={self._current_part} reason={exit_reason} "
+                      f"runtime_s={runtime_s:.1f}")
+            self.restart_count += 1
+            if runtime_s >= _MIN_GOOD_RUNTIME_S:
+                backoff = _RESTART_BACKOFF_S
+            else:
+                backoff = min(_MAX_BACKOFF_S, backoff * 1.5)
+            if self._stop_event.wait(timeout=backoff):
+                break
+            self._current_part += 1
+        logger.info("RECORD watchdog exiting; total parts=%d, restarts=%d",
+                    self._current_part + 1, self.restart_count)
+
+# ---------------------------------------------------------------------------
+# Timelapse mode: 2 Hz HTTP snapshot loop.
+#
+# Uses the camera's built-in snapshot CGI (default
+# http://192.168.2.10/cgi-bin/onesnap.cgi -- same path the doris
+# tony-video branch hits) so we don't have to share the camera's
+# single RTSP session with the recorder. Mode is mutually exclusive
+# with video; the operator picks one mode at /start time.
+# ---------------------------------------------------------------------------
+
+_TIMELAPSE_PERIOD_S = 0.5  # 2 Hz
+_TIMELAPSE_HTTP_TIMEOUT_S = 1.5
+
+class TimelapseSession:
+    """Background thread that GETs JPEGs from the camera's snap CGI."""
+
+    def __init__(self, snap_url, out_dir):
+        self._snap_url = snap_url
+        self._out_dir = out_dir
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._csv_path = os.path.join(out_dir, "telemetry.csv")
+        self.start_time = None
+        self.snap_count = 0
+        self.miss_count = 0
+        self.last_snap_size_bytes = 0
+        self.last_snap_path = None
+        self.last_snap_at = None
+
+    def start(self):
+        if self._thread is not None:
+            raise RuntimeError("TimelapseSession already started")
+        os.makedirs(self._out_dir, exist_ok=True)
+        # Telemetry CSV header so each .jpg can be geotagged later.
+        try:
+            with open(self._csv_path, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'timestamp', 'seq', 'jpg', 'size_bytes',
+                    'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
+                    'depth_m', 'temperature_c',
+                ])
+        except Exception:
+            logger.exception("TIMELAPSE failed to write CSV header")
+        self.start_time = datetime.now()
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="timelapse-loop", daemon=True,
+        )
+        self._thread.start()
+
+    def is_alive(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self, timeout_s=5.0):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout_s)
+
+    def _fetch_jpeg(self):
+        try:
+            resp = requests.get(self._snap_url, timeout=_TIMELAPSE_HTTP_TIMEOUT_S)
+        except Exception as e:
+            return None, f"http_error: {e}"
+        if resp.status_code != 200:
+            return None, f"http_status_{resp.status_code}"
+        ctype = resp.headers.get("content-type", "")
+        if not ctype.startswith("image"):
+            return None, f"unexpected_content_type: {ctype!r}"
+        body = resp.content
+        if not body or not body.startswith(b"\xff\xd8"):
+            return None, "not_jpeg_magic"
+        return body, "ok"
+
+    def _loop(self):
+        next_fire = time.monotonic()
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            if now < next_fire:
+                if self._stop_event.wait(timeout=next_fire - now):
+                    break
+            next_fire = max(next_fire + _TIMELAPSE_PERIOD_S, time.monotonic())
+
+            jpeg, reason = self._fetch_jpeg()
+            ts = datetime.now()
+            if jpeg is None:
+                self.miss_count += 1
+                logger.warning("TIMELAPSE snap miss (%s)", reason)
+                continue
+
+            self.snap_count += 1
+            seq = self.snap_count
+            filename = f"{seq:05d}.jpg"
+            path = os.path.join(self._out_dir, filename)
+            try:
+                with open(path, 'wb') as f:
+                    f.write(jpeg)
+            except Exception:
+                logger.exception("TIMELAPSE write failed: %s", path)
+                self.miss_count += 1
+                continue
+            self.last_snap_path = path
+            self.last_snap_size_bytes = len(jpeg)
+            self.last_snap_at = ts
 
             try:
-                resp = requests.get(camera_isp_url, timeout=2)
-                diagnostics["camera_reachable"] = resp.status_code == 200
+                lat, lon, alt = get_blueboat_gps_position()
+                heading = get_towfish_heading()
+                if lat is not None and lon is not None and heading is not None:
+                    lat, lon = calculate_offset_position(lat, lon, heading, 4.0)
+                depth = get_depth_data()
+                temp = get_baro_data()
+                with open(self._csv_path, 'a', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow([
+                        ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                        seq, filename, len(jpeg),
+                        f"{lat:.6f}" if lat is not None else "",
+                        f"{lon:.6f}" if lon is not None else "",
+                        f"{alt:.2f}" if alt is not None else "",
+                        f"{heading:.1f}" if heading is not None else "",
+                        f"{depth:.2f}" if depth is not None else "",
+                        f"{temp:.2f}" if temp is not None else "",
+                    ])
             except Exception:
-                diagnostics["camera_reachable"] = False
-                log_event("camera_unreachable", "HTTP check to 192.168.2.10 failed")
-
-            diagnostics["gst_errors"] = gst_error_count
-            diagnostics["gst_warnings"] = gst_warning_count
-
-            logger.info(f"HEALTH: {json.dumps(diagnostics)}")
-
-            time.sleep(5)
-        except Exception as e:
-            logger.error(f"Error in health watchdog: {e}")
-            time.sleep(5)
+                logger.exception("TIMELAPSE telemetry write failed")
+        logger.info("TIMELAPSE loop exiting (snaps=%d, misses=%d)",
+                    self.snap_count, self.miss_count)
 
 # ---------------------------------------------------------------------------
 # Flask routes
@@ -892,11 +1376,12 @@ def register_service():
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
-    global tow_vehicle_ip, container_format, stream_protocol
+    global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
 
     if request.method == 'POST':
-        if recording:
-            return jsonify({"success": False, "message": "Cannot change config while recording"}), 400
+        if mode != MODE_IDLE:
+            return jsonify({"success": False,
+                            "message": f"Cannot change config while {mode} active"}), 400
 
         data = request.get_json(silent=True) or {}
         changed = False
@@ -922,360 +1407,330 @@ def config():
             stream_protocol = new_proto
             changed = True
 
+        new_snap = data.get('snapshot_url')
+        if new_snap is not None:
+            new_snap = str(new_snap).strip()
+            if not new_snap.startswith(('http://', 'https://')):
+                return jsonify({"success": False,
+                                "message": "snapshot_url must start with http:// or https://"}), 400
+            snapshot_url = new_snap
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
         save_config({"tow_vehicle_ip": tow_vehicle_ip,
                       "container_format": container_format,
-                      "stream_protocol": stream_protocol})
-        logger.info(f"Config updated: tow_vehicle_ip={tow_vehicle_ip}, container_format={container_format}, stream_protocol={stream_protocol}")
+                      "stream_protocol": stream_protocol,
+                      "snapshot_url": snapshot_url})
+        logger.info(
+            "Config updated: tow_vehicle_ip=%s, container_format=%s, "
+            "stream_protocol=%s, snapshot_url=%s",
+            tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
+        )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
                         "container_format": container_format,
-                        "stream_protocol": stream_protocol})
+                        "stream_protocol": stream_protocol,
+                        "snapshot_url": snapshot_url})
 
     resp = jsonify({
         "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
         "tow_vehicle_ip": tow_vehicle_ip,
         "container_format": container_format,
-        "stream_protocol": stream_protocol
+        "stream_protocol": stream_protocol,
+        "snapshot_url": snapshot_url,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 
 @app.route('/start', methods=['GET'])
 def start():
-    global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
+    """Start an H.265 recording session.
+
+    Mutually exclusive with timelapse mode (HTTP 409 if a timelapse
+    is already running). The actual GStreamer pipeline lives in a
+    background ``RecordingSession`` watchdog thread that auto-restarts
+    on RTSP drops or file stalls; this handler only sets up sidecars
+    and kicks the watchdog off.
+    """
+    global recording, start_time
+    global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
-    global gst_stderr_thread, stop_gst_stderr_thread, gst_error_count, gst_warning_count
-    global watchdog_thread, stop_watchdog_thread, file_stall_count
     global current_events_file
     global ass_thread, stop_ass_thread, current_ass_file, ass_subtitle_counter
-    try:
-        if recording:
+    global _session
+
+    with _mode_lock:
+        if mode == MODE_VIDEO:
             return jsonify({"success": False, "message": "Already recording"}), 400
-            
-        # Ensure the video directory exists
-        os.makedirs("/app/videorecordings", exist_ok=True)
-            
-        # Add a small delay to allow cameras to initialize
-        time.sleep(1)
-            
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        if container_format == "mpegts":
-            ext = ".ts"
-            mux_element = "mpegtsmux"
-        else:
-            ext = ".mp4"
-            mux_element = "mp4mux fragment-duration=5000"
-
-        filename_rtsp = f"video_rtsp_{timestamp}{ext}"
-        filepath_rtsp = os.path.join("/app/videorecordings", filename_rtsp)
-        
-        # Save video filepath for post-processing
-        current_video_file_rtsp = filepath_rtsp
-        
-        # Create SRT file for WebODM position data
-        current_srt_file_rtsp = create_srt_file(filepath_rtsp)
-        srt_subtitle_counter = 0  # Reset counter for new recording
-        
-        # Create ISP log file for camera exposure data
-        current_isp_log_file = create_isp_log_file(filepath_rtsp)
-        
-        # Create ASS telemetry subtitle file
-        current_ass_file = create_ass_file(filepath_rtsp)
-        ass_subtitle_counter = 0
-        
-        # Create recording diagnostics event log
-        current_events_file = create_events_file(filepath_rtsp)
-        
-        protocol_prop = f"protocols={stream_protocol} " if stream_protocol == "tcp" else ""
-        rtsp_pipeline = (
-            f"rtspsrc location={RTSP_H265_ENDPOINT} is-live=true "
-            f"{protocol_prop}"
-            "latency=5000 retry=5 timeout=5000000 "
-            "! rtph265depay wait-for-keyframe=true "
-            "! h265parse config-interval=-1 "
-            "! queue max-size-time=30000000000 max-size-bytes=0 max-size-buffers=0 leaky=downstream silent=true "
-            f"! {mux_element} "
-            f"! filesink location={filepath_rtsp} sync=false"
-        )
-
-        rtsp_command = ["gst-launch-1.0", "-e"] + shlex.split(rtsp_pipeline)
-        
-        # Start RTSP recording process FIRST
-        rtsp_started = False
+        if mode == MODE_TIMELAPSE:
+            return jsonify({"success": False,
+                            "message": "Timelapse is active; stop it first"}), 409
         try:
-            rtsp_process = subprocess.Popen(rtsp_command,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE)
-            
-            logger.info(f"Starting RTSP recording with command: {' '.join(rtsp_command)}")
-            
-            if rtsp_process.poll() is not None:
-                stdout, stderr = rtsp_process.communicate()
-                logger.error(f"RTSP process failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}")
-                rtsp_process = None
-            else:
-                rtsp_started = True
-                logger.info("RTSP recording process started")
-                
-                # Wait for GStreamer to connect and start receiving frames
-                # This ensures video is actually recording before we start SRT timing
-                time.sleep(2)
-                logger.info("RTSP stream stabilized, starting SRT synchronization")
+            os.makedirs("/app/videorecordings", exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext = ".ts" if container_format == "mpegts" else ".mp4"
+
+            base_filename = f"video_rtsp_{timestamp}"
+            # Sidecars are named off the *first* part path so the existing
+            # post-processing helpers (adjust_srt_timing, etc.) keep their
+            # historical pair-by-name relationship.
+            anchor_path = os.path.join("/app/videorecordings",
+                                       f"{base_filename}_part00_00000{ext}")
+            current_video_file_rtsp = anchor_path
+
+            current_srt_file_rtsp = create_srt_file(anchor_path)
+            srt_subtitle_counter = 0
+            current_isp_log_file = create_isp_log_file(anchor_path)
+            current_ass_file = create_ass_file(anchor_path)
+            ass_subtitle_counter = 0
+            current_events_file = create_events_file(anchor_path)
+
+            log_event("recording_starting",
+                      f"container={container_format} proto={stream_protocol}")
+
+            session = RecordingSession(
+                rtsp_url=RTSP_H265_ENDPOINT,
+                out_dir="/app/videorecordings",
+                base_filename=base_filename,
+                ext=ext,
+                container_fmt=container_format,
+                proto=stream_protocol,
+            )
+            try:
+                session.start()
+            except Exception as e:
+                logger.exception("Failed to start RecordingSession")
+                _set_mode(MODE_IDLE)
+                _session = None
+                current_srt_file_rtsp = None
+                current_video_file_rtsp = None
+                current_isp_log_file = None
+                current_ass_file = None
+                current_events_file = None
+                return jsonify({"success": False, "message": str(e)}), 500
+
+            _session = session
+            _set_mode(MODE_VIDEO)
+            recording = True
+            start_time = datetime.now()
+
+            stop_srt_thread = False
+            srt_thread = threading.Thread(target=update_srt_file, daemon=True)
+            srt_thread.start()
+
+            stop_isp_log_thread = False
+            isp_log_thread = threading.Thread(target=update_isp_log, daemon=True)
+            isp_log_thread.start()
+
+            stop_ass_thread = False
+            ass_thread = threading.Thread(target=update_ass_file, daemon=True)
+            ass_thread.start()
+
+            log_event("recording_started", f"anchor={anchor_path}")
+            logger.info("Recording started: anchor=%s", anchor_path)
+            return jsonify({"success": True})
         except Exception as e:
-            logger.error(f"Failed to start RTSP recording: {str(e)}")
-            rtsp_process = None
-        
-        # Check if RTSP stream started successfully
-        if not rtsp_started:
-            logger.error("RTSP video stream failed to start")
+            logger.exception("Error in /start")
+            _set_mode(MODE_IDLE)
+            _session = None
             recording = False
             start_time = None
             current_srt_file_rtsp = None
             current_video_file_rtsp = None
             current_isp_log_file = None
             current_ass_file = None
-            return jsonify({"success": False, "message": "RTSP video stream failed to start"}), 500
-        
-        # NOW set recording state and start_time AFTER video is confirmed recording
-        # This ensures SRT timestamps are synchronized with actual video content
-        recording = True
-        start_time = datetime.now()
-        
-        # Start SRT file update thread - timestamps now match video timing
-        stop_srt_thread = False
-        srt_thread = threading.Thread(target=update_srt_file)
-        srt_thread.daemon = True
-        srt_thread.start()
-        
-        # Start ISP log thread - logs camera exposure data once per second
-        stop_isp_log_thread = False
-        isp_log_thread = threading.Thread(target=update_isp_log)
-        isp_log_thread.daemon = True
-        isp_log_thread.start()
-        
-        # Start ASS telemetry subtitle thread - full telemetry at 5 Hz
-        stop_ass_thread = False
-        ass_thread = threading.Thread(target=update_ass_file)
-        ass_thread.daemon = True
-        ass_thread.start()
-        
-        # Start GStreamer stderr monitoring thread
-        stop_gst_stderr_thread = False
-        gst_error_count = 0
-        gst_warning_count = 0
-        gst_stderr_thread = threading.Thread(target=gstreamer_stderr_monitor, args=(rtsp_process,))
-        gst_stderr_thread.daemon = True
-        gst_stderr_thread.start()
-        
-        # Start recording health watchdog thread
-        stop_watchdog_thread = False
-        file_stall_count = 0
-        watchdog_thread = threading.Thread(target=recording_health_watchdog)
-        watchdog_thread.daemon = True
-        watchdog_thread.start()
-        
-        log_event("recording_started", f"RTSP recording started: {filepath_rtsp}")
-        
-        # Log file generation
-        logger.info(f"Started SRT position file generation (synced to video): {current_srt_file_rtsp}")
-        logger.info(f"Started ASS telemetry file generation: {current_ass_file}")
-        logger.info(f"Started ISP log file generation: {current_isp_log_file}")
-        logger.info(f"Started recording diagnostics: events={current_events_file}")
-        logger.info("Recording started successfully with RTSP stream")
-        
-        return jsonify({"success": True})
-    except Exception as e:
-        logger.error(f"Error in start endpoint: {str(e)}")
-        recording = False
-        start_time = None
-        if rtsp_process:
-            try:
-                rtsp_process.kill()
-            except:
-                pass
-        rtsp_process = None
-        current_srt_file_rtsp = None
-        current_video_file_rtsp = None
-        current_isp_log_file = None
-        current_ass_file = None
-        current_events_file = None
-        return jsonify({"success": False, "message": str(e)}), 500
+            current_events_file = None
+            return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/stop', methods=['GET'])
 def stop():
-    global rtsp_process, recording, start_time, srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp
+    """Stop the active RecordingSession and finalise sidecars.
+
+    Sidecar timing is adjusted across the *sum of all part durations*
+    so SRT/ASS scaling stays accurate even when the watchdog rebuilt
+    the pipeline (RTSP drop) one or more times during the session.
+    """
+    global recording, start_time
+    global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
-    global gst_stderr_thread, stop_gst_stderr_thread
-    global watchdog_thread, stop_watchdog_thread
     global current_events_file
     global ass_thread, stop_ass_thread, current_ass_file
-    try:
-        if not recording:
+    global _session
+
+    with _mode_lock:
+        if mode != MODE_VIDEO:
+            return jsonify({"success": True, "message": "Not recording"})
+        try:
+            log_event("recording_stopping", "Stop requested")
+
+            video_anchor = current_video_file_rtsp
+            srt_path = current_srt_file_rtsp
+            ass_path = current_ass_file
+            isp_log_path = current_isp_log_file
+            events_path = current_events_file
+
+            stop_srt_thread = True
+            if srt_thread:
+                srt_thread.join(timeout=2)
+            stop_isp_log_thread = True
+            if isp_log_thread:
+                isp_log_thread.join(timeout=2)
+            stop_ass_thread = True
+            if ass_thread:
+                ass_thread.join(timeout=2)
+
+            session = _session
+            _session = None
+            if session is not None:
+                session.stop()
+                # Prefer the actual first part path the splitmuxsink callback
+                # observed; falls back to the anchor we composed at /start.
+                if session.first_part_path:
+                    video_anchor = session.first_part_path
+
+            recording = False
+            start_time = None
+            current_srt_file_rtsp = None
+            current_video_file_rtsp = None
+            current_isp_log_file = None
+            current_ass_file = None
+            current_events_file = None
+            _set_mode(MODE_IDLE)
+
+            if isp_log_path and os.path.exists(isp_log_path):
+                logger.info("ISP log file saved: %s", isp_log_path)
+            if ass_path and os.path.exists(ass_path):
+                logger.info("ASS telemetry file saved: %s", ass_path)
+            if events_path and os.path.exists(events_path):
+                logger.info("Events log saved: %s", events_path)
+
+            if video_anchor and srt_path and os.path.exists(srt_path):
+                logger.info("Starting SRT timing adjustment post-processing...")
+                time.sleep(3)  # let splitmuxsink finalise the trailing part
+                video_duration = sum_session_video_duration(video_anchor)
+                if video_duration:
+                    parts = list_session_parts(video_anchor)
+                    logger.info(
+                        "Session video duration: %.2fs across %d part(s)",
+                        video_duration, len(parts),
+                    )
+                    adjust_srt_timing(srt_path, video_duration)
+                    if ass_path and os.path.exists(ass_path):
+                        adjust_ass_timing(ass_path, video_duration)
+                else:
+                    logger.warning(
+                        "Could not determine session video duration, "
+                        "subtitle timing not adjusted",
+                    )
+
+            logger.info("Recording stopped successfully")
             return jsonify({"success": True})
-        
-        log_event("recording_stopping", "Stop requested")
-        
-        # Save file paths before clearing globals
-        video_path = current_video_file_rtsp
-        srt_path = current_srt_file_rtsp
-        ass_path = current_ass_file
-        isp_log_path = current_isp_log_file
-        events_path = current_events_file
-        
-        # Stop SRT thread
-        stop_srt_thread = True
-        if srt_thread:
-            srt_thread.join(timeout=2)
-        
-        # Stop ISP log thread
-        stop_isp_log_thread = True
-        if isp_log_thread:
-            isp_log_thread.join(timeout=2)
-        
-        # Stop ASS telemetry thread
-        stop_ass_thread = True
-        if ass_thread:
-            ass_thread.join(timeout=2)
-        
-        # Stop GStreamer stderr monitoring thread
-        stop_gst_stderr_thread = True
-        if gst_stderr_thread:
-            gst_stderr_thread.join(timeout=2)
-        
-        # Stop recording health watchdog thread
-        stop_watchdog_thread = True
-        if watchdog_thread:
-            watchdog_thread.join(timeout=2)
-        
-        # Stop RTSP recording process
-        if rtsp_process:
-            logger.info("Stopping RTSP recording process gracefully...")
-            
-            # Send SIGINT (Ctrl+C) to GStreamer for EOS
-            rtsp_process.send_signal(signal.SIGINT)
-            
-            # Wait for the process to handle EOS
-            try:
-                rtsp_process.wait(timeout=7)
-                logger.info("RTSP recording process stopped successfully")
-                log_event("recording_stopped", "Graceful shutdown")
-            except subprocess.TimeoutExpired:
-                logger.warning("RTSP process did not exit gracefully, force killing")
-                log_event("stop_timeout", "SIGINT did not stop GStreamer within 7s, force killing")
-                rtsp_process.kill()
-                rtsp_process.wait()
-                logger.info("RTSP recording process force killed")
-        
-        recording = False
-        start_time = None
-        rtsp_process = None
-        current_srt_file_rtsp = None
-        current_video_file_rtsp = None
-        current_isp_log_file = None
-        current_ass_file = None
-        current_events_file = None
-        
-        # Log sidecar file completion
-        if isp_log_path and os.path.exists(isp_log_path):
-            logger.info(f"ISP log file saved: {isp_log_path}")
-        if ass_path and os.path.exists(ass_path):
-            logger.info(f"ASS telemetry file saved: {ass_path}")
-        if events_path and os.path.exists(events_path):
-            logger.info(f"Events log saved: {events_path}")
-        
-        # Post-processing: Adjust SRT timing to match actual video duration
-        if video_path and srt_path and os.path.exists(video_path) and os.path.exists(srt_path):
-            logger.info("Starting SRT timing adjustment post-processing...")
-            
-            # Wait for video file to be fully written and finalized
-            time.sleep(3)
-            
-            # Get actual video duration
-            video_duration = get_video_duration(video_path)
-            if video_duration:
-                logger.info(f"Video duration: {video_duration:.2f} seconds")
-                adjust_srt_timing(srt_path, video_duration)
-                if ass_path and os.path.exists(ass_path):
-                    adjust_ass_timing(ass_path, video_duration)
-            else:
-                logger.warning("Could not determine video duration, subtitle timing not adjusted")
-        
-        logger.info("Recording process stopped successfully")
-        return jsonify({"success": True})
-    except Exception as e:
-        logger.error(f"Error in stop endpoint: {str(e)}")
-        recording = False
-        start_time = None
-        if rtsp_process:
-            try:
-                rtsp_process.kill()
-            except:
-                pass
-        rtsp_process = None
-        current_srt_file_rtsp = None
-        current_video_file_rtsp = None
-        current_isp_log_file = None
-        current_ass_file = None
-        current_events_file = None
-        return jsonify({"success": False, "message": str(e)}), 500
+        except Exception as e:
+            logger.exception("Error in /stop")
+            _session = None
+            recording = False
+            start_time = None
+            current_srt_file_rtsp = None
+            current_video_file_rtsp = None
+            current_isp_log_file = None
+            current_ass_file = None
+            current_events_file = None
+            _set_mode(MODE_IDLE)
+            return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    global rtsp_process, recording, start_time
+    """Status of whichever mode is currently active.
+
+    ``mode`` plus the video-specific or timelapse-specific blocks let
+    the widget switch UI without juggling two separate endpoints.
+    """
+    global recording, start_time
     try:
-        # Check if RTSP process has died and clean up
-        if rtsp_process and rtsp_process.poll() is not None:
-            logger.warning("RTSP recording process has died")
-            log_event("process_died", f"Detected dead GStreamer process in /status")
-            try:
-                rtsp_process.kill()
-            except:
-                pass
-            rtsp_process = None
-        
-        # Stop recording if RTSP process is dead or None
-        if not rtsp_process or rtsp_process.poll() is not None:
-            if recording:
-                logger.info("Recording process has stopped")
-                recording = False
-                start_time = None
+        # Auto-clean if the watchdog thread died unexpectedly while video mode
+        # was supposed to be active (e.g. uncaught exception in _run_one).
+        if mode == MODE_VIDEO and (_session is None or not _session.is_alive()):
+            logger.warning("Recording session is no longer alive; clearing mode")
+            log_event("session_died", "RecordingSession watchdog exited unexpectedly")
+            recording = False
+            start_time = None
+            _set_mode(MODE_IDLE)
 
-        # Determine health grade
-        rtsp_alive = bool(rtsp_process and rtsp_process.poll() is None)
-        if not recording:
+        # Video stats
+        sess = _session
+        rtsp_alive = bool(sess and sess.is_alive())
+        gst_errors = sess.gst_errors if sess else 0
+        gst_warnings = sess.gst_warnings if sess else 0
+        file_stalls = sess.file_stalls if sess else 0
+        restarts = sess.restart_count if sess else 0
+        last_exit = sess.last_exit if sess else None
+        current_part_path = sess.last_pattern if sess else None
+
+        if mode == MODE_IDLE:
             health = "idle"
-        elif not rtsp_alive or gst_error_count > 0:
-            health = "failed"
-        elif gst_warning_count > 0 or file_stall_count > 0:
-            health = "degraded"
-        else:
-            health = "healthy"
+        elif mode == MODE_VIDEO:
+            if not rtsp_alive or gst_errors > 0:
+                health = "failed"
+            elif gst_warnings > 0 or file_stalls > 0 or restarts > 0:
+                health = "degraded"
+            else:
+                health = "healthy"
+        else:  # timelapse
+            tl = _timelapse
+            if tl is None or not tl.is_alive():
+                health = "failed"
+            elif tl.miss_count > 0 and tl.snap_count == 0:
+                health = "failed"
+            elif tl.miss_count > 0:
+                health = "degraded"
+            else:
+                health = "healthy"
 
-        # File size of current recording
+        # File size of the most recent in-progress part.
         file_size_mb = 0.0
-        if current_video_file_rtsp and os.path.exists(current_video_file_rtsp):
-            file_size_mb = round(os.path.getsize(current_video_file_rtsp) / (1024 * 1024), 1)
+        if current_part_path and os.path.exists(current_part_path):
+            file_size_mb = round(os.path.getsize(current_part_path) / (1024 * 1024), 1)
+
+        # Timelapse stats
+        tl = _timelapse
+        timelapse_block = {
+            "active": mode == MODE_TIMELAPSE,
+            "snap_count": tl.snap_count if tl else 0,
+            "miss_count": tl.miss_count if tl else 0,
+            "last_snap_size_bytes": tl.last_snap_size_bytes if tl else 0,
+            "last_snap_path": (os.path.basename(tl.last_snap_path)
+                               if tl and tl.last_snap_path else None),
+            "last_snap_at": (tl.last_snap_at.isoformat()
+                             if tl and tl.last_snap_at else None),
+            "snapshot_url": snapshot_url,
+        }
 
         disk_free = _read_disk_free_mb()
+        active_start = start_time if mode == MODE_VIDEO else (tl.start_time if (tl and mode == MODE_TIMELAPSE) else None)
 
         resp = jsonify({
+            "mode": mode,
             "recording": recording,
-            "start_time": start_time.isoformat() if start_time else None,
-            "duration_seconds": round((datetime.now() - start_time).total_seconds(), 1) if start_time else 0,
+            "start_time": active_start.isoformat() if active_start else None,
+            "duration_seconds": round((datetime.now() - active_start).total_seconds(), 1) if active_start else 0,
             "rtsp_process_alive": rtsp_alive,
             "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
             "file_size_mb": file_size_mb,
+            "current_part": (os.path.basename(current_part_path)
+                              if current_part_path else None),
+            "restarts": restarts,
+            "last_exit": last_exit,
             "disk_free_mb": disk_free,
-            "gst_errors": gst_error_count,
-            "gst_warnings": gst_warning_count,
-            "file_stalls": file_stall_count,
+            "gst_errors": gst_errors,
+            "gst_warnings": gst_warnings,
+            "file_stalls": file_stalls,
             "health": health,
             "container_format": container_format,
-            "stream_protocol": stream_protocol
+            "stream_protocol": stream_protocol,
+            "timelapse": timelapse_block,
         })
         resp.headers['Cache-Control'] = 'no-store'
         return resp
@@ -1285,66 +1740,192 @@ def get_status():
 
 @app.route('/list', methods=['GET'])
 def list_videos():
+    """Return on-disk recordings, including timelapse session folders."""
     try:
         video_dir = "/app/videorecordings"
         if not os.path.exists(video_dir):
             os.makedirs(video_dir)
-            
-        videos = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.ts'))]
-        videos.sort(reverse=True)  # Most recent first
-        return jsonify({"videos": videos})
+
+        videos = []
+        timelapses = []
+        for name in os.listdir(video_dir):
+            full = os.path.join(video_dir, name)
+            if os.path.isdir(full) and name.startswith("timelapse_"):
+                try:
+                    jpgs = [f for f in os.listdir(full) if f.endswith('.jpg')]
+                except Exception:
+                    jpgs = []
+                timelapses.append({
+                    "name": name,
+                    "snap_count": len(jpgs),
+                })
+            elif name.endswith(('.mp4', '.ts')):
+                videos.append(name)
+        videos.sort(reverse=True)
+        timelapses.sort(key=lambda t: t["name"], reverse=True)
+        return jsonify({"videos": videos, "timelapses": timelapses})
     except Exception as e:
         logger.error(f"Error in list endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
 
-@app.route('/download/<filename>')
+@app.route('/download/<path:filename>')
 def download(filename):
+    """Download any file under /app/videorecordings (incl. timelapse_*/<jpg>)."""
     try:
-        return send_file(
-            os.path.join("/app/videorecordings", filename),
-            as_attachment=True
-        )
+        full = os.path.realpath(os.path.join("/app/videorecordings", filename))
+        # Path-traversal guard: never serve outside the videorecordings root.
+        root = os.path.realpath("/app/videorecordings")
+        if not full.startswith(root + os.sep):
+            return jsonify({"success": False, "message": "Invalid path"}), 400
+        return send_file(full, as_attachment=True)
     except Exception as e:
         logger.error(f"Error in download endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/filesize', methods=['GET'])
 def get_filesize():
-    """Return the size of the actively-recording video (or most recent one)."""
+    """Return the active recording's size, or the most-recent file if idle.
+
+    For timelapse the "size" is the cumulative bytes written to the
+    active session folder, and the "filename" is the folder name.
+    """
     try:
         video_dir = "/app/videorecordings"
+
+        if mode == MODE_VIDEO:
+            sess = _session
+            if sess and sess.last_pattern and os.path.exists(sess.last_pattern):
+                path = sess.last_pattern
+                # Sum every part written so far so the displayed size matches
+                # the *whole* recording, not just the current splitmuxsink fragment.
+                total = sum(
+                    os.path.getsize(p) for p in list_session_parts(sess.first_part_path)
+                    if os.path.exists(p)
+                )
+                return jsonify({
+                    "success": True,
+                    "filename": os.path.basename(path),
+                    "size_bytes": total,
+                    "recording": True,
+                    "mode": mode,
+                })
+
+        if mode == MODE_TIMELAPSE:
+            tl = _timelapse
+            if tl is not None:
+                folder = os.path.basename(os.path.dirname(tl.last_snap_path)) if tl.last_snap_path else None
+                size = 0
+                if tl.last_snap_path:
+                    parent = os.path.dirname(tl.last_snap_path)
+                    try:
+                        for f in os.listdir(parent):
+                            full = os.path.join(parent, f)
+                            if os.path.isfile(full):
+                                size += os.path.getsize(full)
+                    except Exception:
+                        pass
+                return jsonify({
+                    "success": True,
+                    "filename": folder,
+                    "size_bytes": size,
+                    "recording": True,
+                    "mode": mode,
+                    "snap_count": tl.snap_count,
+                })
+
+        # Idle: report the most recent on-disk video.
         path = None
         filename = None
-
-        if recording and current_video_file_rtsp and os.path.exists(current_video_file_rtsp):
-            path = current_video_file_rtsp
-            filename = os.path.basename(path)
-        else:
-            if os.path.exists(video_dir):
-                mp4s = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.ts'))]
-                mp4s.sort(reverse=True)
-                if mp4s:
-                    filename = mp4s[0]
-                    path = os.path.join(video_dir, filename)
+        if os.path.exists(video_dir):
+            files = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.ts'))]
+            files.sort(reverse=True)
+            if files:
+                filename = files[0]
+                path = os.path.join(video_dir, filename)
 
         if path and os.path.exists(path):
-            size_bytes = os.path.getsize(path)
             return jsonify({
                 "success": True,
                 "filename": filename,
-                "size_bytes": size_bytes,
-                "recording": recording
+                "size_bytes": os.path.getsize(path),
+                "recording": False,
+                "mode": mode,
             })
-
         return jsonify({
             "success": True,
             "filename": None,
             "size_bytes": 0,
-            "recording": recording
+            "recording": False,
+            "mode": mode,
         })
     except Exception as e:
         logger.error(f"Error in filesize endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
+
+# ---------------------------------------------------------------------------
+# Timelapse (2 Hz HTTP snap) endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/timelapse/start', methods=['GET'])
+def timelapse_start():
+    """Start the 2 Hz HTTP-snap timelapse loop.
+
+    Mutually exclusive with video recording (HTTP 409 if a recording
+    is already running).
+    """
+    global _timelapse
+    with _mode_lock:
+        if mode == MODE_TIMELAPSE:
+            return jsonify({"success": False, "message": "Timelapse already running"}), 400
+        if mode == MODE_VIDEO:
+            return jsonify({"success": False,
+                            "message": "Video recording is active; stop it first"}), 409
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_dir = os.path.join("/app/videorecordings", f"timelapse_{timestamp}")
+            session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir)
+            try:
+                session.start()
+            except Exception as e:
+                logger.exception("Failed to start TimelapseSession")
+                return jsonify({"success": False, "message": str(e)}), 500
+            _timelapse = session
+            _set_mode(MODE_TIMELAPSE)
+            logger.info("Timelapse started: %s (snap_url=%s)", out_dir, snapshot_url)
+            return jsonify({
+                "success": True,
+                "folder": os.path.basename(out_dir),
+                "snapshot_url": snapshot_url,
+            })
+        except Exception as e:
+            logger.exception("Error in /timelapse/start")
+            return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/timelapse/stop', methods=['GET'])
+def timelapse_stop():
+    """Stop the active timelapse loop and return final stats."""
+    global _timelapse
+    with _mode_lock:
+        if mode != MODE_TIMELAPSE:
+            return jsonify({"success": True, "message": "Not running"})
+        try:
+            session = _timelapse
+            _timelapse = None
+            stats = {"snap_count": 0, "miss_count": 0, "folder": None}
+            if session is not None:
+                session.stop()
+                stats["snap_count"] = session.snap_count
+                stats["miss_count"] = session.miss_count
+                if session.last_snap_path:
+                    stats["folder"] = os.path.basename(os.path.dirname(session.last_snap_path))
+            _set_mode(MODE_IDLE)
+            logger.info("Timelapse stopped: snaps=%d misses=%d",
+                        stats["snap_count"], stats["miss_count"])
+            return jsonify({"success": True, **stats})
+        except Exception as e:
+            logger.exception("Error in /timelapse/stop")
+            _set_mode(MODE_IDLE)
+            return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/widget')
 def widget():

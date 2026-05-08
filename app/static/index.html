@@ -149,6 +149,33 @@
 
         .config-saved.visible { opacity: 1; }
 
+        .timelapse-section {
+            margin: 15px 0;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background-color: #fff8e1;
+        }
+        .timelapse-section h3 {
+            margin: 0 0 8px 0;
+            font-size: 1em;
+            color: #b26a00;
+        }
+        .timelapse-stats {
+            font-family: monospace;
+            font-size: 0.9em;
+            color: #555;
+            margin: 6px 0;
+        }
+        button.btn-timelapse {
+            background-color: #fb8c00;
+            color: white;
+            border-color: #ef6c00;
+        }
+        button.btn-timelapse:hover:not(:disabled) {
+            background-color: #ef6c00;
+        }
+
         .file-manager-wrapper {
             width: 100vw;
             position: relative;
@@ -232,6 +259,12 @@
             </select>
             <span class="config-saved" id="formatSaved">Saved</span>
         </div>
+        <div class="config-row" style="margin-top: 8px;">
+            <label for="snapshotUrl">Snapshot URL:</label>
+            <input type="text" id="snapshotUrl" placeholder="http://192.168.2.10/cgi-bin/onesnap.cgi" style="width: 320px;">
+            <button onclick="saveSnapshotUrl()">Save</button>
+            <span class="config-saved" id="snapshotSaved">Saved</span>
+        </div>
     </div>
     <div class="status-container">
         <p>Status: <span id="recordingStatus">Stopped</span><span id="recordingTime" style="display: none;"></span></p>
@@ -270,9 +303,26 @@
         <button id="startButton" onclick="startRecording()">Start Recording</button>
         <button id="stopButton" onclick="stopRecording()" disabled>Stop Recording</button>
     </div>
-    
+
+    <div class="timelapse-section">
+        <h3>Timelapse (2 Hz HTTP Snapshots)</h3>
+        <p style="font-size: 0.9em; color: #555; margin-bottom: 8px;">
+            Mutually exclusive with video recording. Captures one JPEG every 500&nbsp;ms
+            from the camera's snapshot CGI and writes them to <code>timelapse_&lt;timestamp&gt;/</code>
+            with a <code>telemetry.csv</code> sidecar so each frame is geotaggable.
+        </p>
+        <div class="controls">
+            <button id="timelapseStartBtn" class="btn-timelapse" onclick="startTimelapse()">Start Timelapse</button>
+            <button id="timelapseStopBtn" class="btn-timelapse" onclick="stopTimelapse()" disabled>Stop Timelapse</button>
+        </div>
+        <div class="timelapse-stats" id="timelapseStats">Idle</div>
+    </div>
+
     <h2>Recorded Videos</h2>
     <ul id="videoList"></ul>
+
+    <h2>Timelapse Sessions</h2>
+    <ul id="timelapseList"></ul>
 
     <!-- Iframe to embed the BlueOS file browser -->
     <div class="file-manager-wrapper">
@@ -324,7 +374,9 @@ function updateUIToRecording() {
     document.getElementById("stopButton").disabled = false;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
-    
+    // Timelapse can't run alongside video.
+    document.getElementById("timelapseStartBtn").disabled = true;
+
     startTime = new Date();
     document.getElementById("recordingTime").style.display = "inline";
     clearInterval(recordingTimer);
@@ -343,13 +395,69 @@ function updateUIToStopped() {
     document.getElementById("stopButton").disabled = true;
     document.getElementById("containerFormat").disabled = false;
     document.getElementById("streamProtocol").disabled = false;
-    
+    document.getElementById("timelapseStartBtn").disabled = false;
+
     clearInterval(recordingTimer);
     document.getElementById("recordingTime").style.display = "none";
     
     // Slow down telemetry updates when not recording
     clearInterval(telemetryTimer);
     telemetryTimer = setInterval(fetchTelemetry, 5000);
+}
+
+async function startTimelapse() {
+    try {
+        const res = await axios.get('/timelapse/start');
+        if (res.data.success) {
+            document.getElementById("errorMessage").style.display = "none";
+            updateUIToTimelapse();
+        } else {
+            document.getElementById("errorMessage").textContent = res.data.message || "Failed to start timelapse";
+            document.getElementById("errorMessage").style.display = "block";
+        }
+    } catch (e) {
+        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Timelapse error";
+        document.getElementById("errorMessage").style.display = "block";
+    }
+}
+
+async function stopTimelapse() {
+    try {
+        const res = await axios.get('/timelapse/stop');
+        if (res.data.success) {
+            document.getElementById("errorMessage").style.display = "none";
+            updateUIToIdle();
+            await fetchVideos();
+        }
+    } catch (e) {
+        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Timelapse stop error";
+        document.getElementById("errorMessage").style.display = "block";
+    }
+}
+
+function updateUIToTimelapse() {
+    document.getElementById("recordingStatus").textContent = "Timelapse";
+    document.getElementById("recordingStatus").className = "recording";
+    document.getElementById("startButton").disabled = true;
+    document.getElementById("stopButton").disabled = true;
+    document.getElementById("timelapseStartBtn").disabled = true;
+    document.getElementById("timelapseStopBtn").disabled = false;
+    document.getElementById("containerFormat").disabled = true;
+    document.getElementById("streamProtocol").disabled = true;
+}
+
+function updateUIToIdle() {
+    document.getElementById("recordingStatus").textContent = "Stopped";
+    document.getElementById("recordingStatus").className = "";
+    document.getElementById("startButton").disabled = false;
+    document.getElementById("stopButton").disabled = true;
+    document.getElementById("timelapseStartBtn").disabled = false;
+    document.getElementById("timelapseStopBtn").disabled = true;
+    document.getElementById("containerFormat").disabled = false;
+    document.getElementById("streamProtocol").disabled = false;
+    document.getElementById("timelapseStats").textContent = "Idle";
+    clearInterval(recordingTimer);
+    document.getElementById("recordingTime").style.display = "none";
 }
 
 function updateRecordingTime() {
@@ -366,8 +474,8 @@ function updateRecordingTime() {
 async function checkRecordingStatus() {
     try {
         const response = await axios.get('/status');
-        const isRecording = response.data.recording;
-        const currentUIState = document.getElementById("recordingStatus").textContent === "Recording";
+        const serverMode = response.data.mode || (response.data.recording ? 'video' : 'idle');
+        const currentLabel = document.getElementById("recordingStatus").textContent;
         const endpoint = response.data.rtsp_h265_endpoint;
         if (endpoint) {
             document.getElementById("cameraEndpoint").textContent = endpoint;
@@ -383,20 +491,37 @@ async function checkRecordingStatus() {
             protoSelect.value = response.data.stream_protocol;
         }
 
-        // If status has changed, update UI to match
-        if (isRecording && !currentUIState) {
-            console.log("Detected recording started externally");
-            if (response.data.duration_seconds > 0) {
-                startTime = new Date(Date.now() - response.data.duration_seconds * 1000);
-            } else {
-                startTime = new Date();
+        if (serverMode === 'video') {
+            if (currentLabel !== "Recording") {
+                console.log("Detected recording started");
+                if (response.data.duration_seconds > 0) {
+                    startTime = new Date(Date.now() - response.data.duration_seconds * 1000);
+                } else {
+                    startTime = new Date();
+                }
+                updateUIToRecording();
             }
-            updateUIToRecording();
-        } else if (!isRecording && currentUIState) {
-            console.log("Detected recording stopped externally");
-            updateUIToStopped();
-            // Refresh video list when recording stops
-            await fetchVideos();
+        } else if (serverMode === 'timelapse') {
+            if (currentLabel !== "Timelapse") {
+                console.log("Detected timelapse started");
+                updateUIToTimelapse();
+            }
+        } else {
+            if (currentLabel === "Recording" || currentLabel === "Timelapse") {
+                console.log("Mode returned to idle");
+                updateUIToIdle();
+                await fetchVideos();
+            }
+        }
+
+        // Refresh timelapse stats line whenever timelapse data is present.
+        const tl = response.data.timelapse;
+        if (tl) {
+            const last = tl.last_snap_path ? ` last: ${tl.last_snap_path}` : '';
+            const stats = serverMode === 'timelapse'
+                ? `snaps: ${tl.snap_count} · misses: ${tl.miss_count}${last}`
+                : (tl.snap_count > 0 ? `last session snaps: ${tl.snap_count}` : 'Idle');
+            document.getElementById("timelapseStats").textContent = stats;
         }
     } catch (error) {
         console.error("Error checking recording status:", error);
@@ -429,13 +554,20 @@ async function fetchVideos() {
         const response = await axios.get('/list');
         const videoList = document.getElementById("videoList");
         videoList.innerHTML = '';
-        response.data.videos.forEach(video => {
+        (response.data.videos || []).forEach(video => {
             const li = document.createElement('li');
             const a = document.createElement('a');
             a.href = `/download/${video}`;
             a.textContent = video;
             li.appendChild(a);
             videoList.appendChild(li);
+        });
+        const tlList = document.getElementById("timelapseList");
+        tlList.innerHTML = '';
+        (response.data.timelapses || []).forEach(t => {
+            const li = document.createElement('li');
+            li.textContent = `${t.name} — ${t.snap_count} snapshot${t.snap_count === 1 ? '' : 's'}`;
+            tlList.appendChild(li);
         });
     } catch (error) {
         console.error("Error fetching videos:", error);
@@ -454,8 +586,33 @@ async function loadConfig() {
         if (response.data.stream_protocol) {
             document.getElementById("streamProtocol").value = response.data.stream_protocol;
         }
+        if (response.data.snapshot_url) {
+            document.getElementById("snapshotUrl").value = response.data.snapshot_url;
+        }
     } catch (error) {
         console.error("Error loading config:", error);
+    }
+}
+
+async function saveSnapshotUrl() {
+    const url = document.getElementById("snapshotUrl").value.trim();
+    if (!url) return;
+    try {
+        const response = await axios.post('/config', { snapshot_url: url });
+        if (response.data.success) {
+            const badge = document.getElementById("snapshotSaved");
+            badge.classList.add("visible");
+            setTimeout(() => badge.classList.remove("visible"), 2000);
+        } else {
+            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save snapshot URL";
+            document.getElementById("errorMessage").style.display = "block";
+            loadConfig();
+        }
+    } catch (error) {
+        const msg = error.response?.data?.message || "Failed to save snapshot URL";
+        document.getElementById("errorMessage").textContent = msg;
+        document.getElementById("errorMessage").style.display = "block";
+        loadConfig();
     }
 }
 
