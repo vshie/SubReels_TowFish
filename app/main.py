@@ -1328,12 +1328,23 @@ class TimelapseSession:
         self.last_snap_size_bytes = 0
         self.last_snap_path = None
         self.last_snap_at = None
+        # Wall-clock gap (ms) between the most recent snap finishing
+        # and its parallel telemetry fetch finishing. Surfaces the
+        # tightness of snap/GPS sync on /status so a field operator
+        # can spot mavlink2rest going slow without scraping the CSV.
+        self.last_sync_skew_ms = -1.0
 
     def start(self):
         if self._thread is not None:
             raise RuntimeError("TimelapseSession already started")
         os.makedirs(self._out_dir, exist_ok=True)
         # Telemetry CSV header so each .jpg can be geotagged later.
+        # Last three columns expose the per-snap timing budget so a
+        # reviewer can spot if mavlink fell behind: ``snap_ms`` is
+        # the JPEG HTTP round-trip, ``telem_ms`` is the parallel
+        # mavlink2rest fetch, and ``sync_skew_ms`` is the wall-clock
+        # gap between when the snap finished and when telemetry came
+        # back (small = JPEG and GPS share the same instant).
         try:
             with open(self._csv_path, 'w', newline='') as f:
                 w = csv.writer(f)
@@ -1341,6 +1352,7 @@ class TimelapseSession:
                     'timestamp', 'seq', 'jpg', 'size_bytes',
                     'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
                     'depth_m', 'temperature_c',
+                    'snap_ms', 'telem_ms', 'sync_skew_ms',
                 ])
         except Exception:
             logger.exception("TIMELAPSE failed to write CSV header")
@@ -1374,6 +1386,48 @@ class TimelapseSession:
             return None, "not_jpeg_magic"
         return body, "ok"
 
+    def _fetch_telemetry_block(self):
+        """Read the full telemetry block in one shot.
+
+        Designed to be called from a worker thread that runs in parallel
+        with ``_fetch_jpeg`` so the GPS / heading / altitude samples
+        share the same wall-clock window as the camera shutter (the
+        snap CGI takes ~200 ms, each mavlink2rest GET ~10-300 ms; in
+        parallel they overlap).
+
+        Returns a dict (always populated, with None values where data
+        was unavailable) plus a ``fetch_ms`` field so the CSV can
+        record how stale the telemetry was relative to the snap.
+        """
+        t0 = time.monotonic()
+        try:
+            bb_lat, bb_lon, bb_alt = get_blueboat_gps_position()
+            heading = get_towfish_heading()
+            if bb_lat is not None and bb_lon is not None and heading is not None:
+                gps_lat, gps_lon = calculate_offset_position(
+                    bb_lat, bb_lon, heading, 4.0,
+                )
+            else:
+                gps_lat, gps_lon = bb_lat, bb_lon
+            tow_alt = get_towfish_altitude()
+            depth = get_depth_data()
+            temp = get_baro_data()
+        except Exception:
+            logger.exception("TIMELAPSE telemetry fetch raised")
+            bb_lat = bb_lon = bb_alt = None
+            gps_lat = gps_lon = None
+            heading = None
+            tow_alt = None
+            depth = None
+            temp = None
+        return {
+            'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
+            'gps_lat': gps_lat, 'gps_lon': gps_lon,
+            'heading': heading, 'tow_alt': tow_alt,
+            'depth': depth, 'temp': temp,
+            'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
+        }
+
     def _loop(self):
         next_fire = time.monotonic()
         while not self._stop_event.is_set():
@@ -1383,38 +1437,76 @@ class TimelapseSession:
                     break
             next_fire = max(next_fire + _TIMELAPSE_PERIOD_S, time.monotonic())
 
-            jpeg, reason = self._fetch_jpeg()
+            # ---- Synchronised capture ------------------------------
+            # Stamp wall-clock ONCE, then fire JPEG + telemetry in
+            # parallel so the GPS sample is taken in the same wall-
+            # clock window as the camera shutter. Without this the
+            # mavlink2rest GETs add 200-500 ms of skew on top of the
+            # camera's own ~200 ms snap latency, which at typical tow
+            # speeds (1-2 m/s) is already 0.2-1 m of position error.
             ts_local = datetime.now()
             ts_utc = datetime.now(tz=timezone.utc)
+            t_start = time.monotonic()
+
+            telem_holder = {'data': None, 'done_at': None}
+
+            def _telem_worker():
+                telem_holder['data'] = self._fetch_telemetry_block()
+                telem_holder['done_at'] = time.monotonic()
+
+            telem_thread = threading.Thread(
+                target=_telem_worker, name="tl-telem", daemon=True,
+            )
+            telem_thread.start()
+
+            jpeg, reason = self._fetch_jpeg()
+            snap_done_at = time.monotonic()
+
+            # Allow the telemetry fetch up to one full snap period
+            # past the JPEG response before we give up. In the typical
+            # case both finish within ~300 ms of each other so this
+            # join returns immediately.
+            telem_thread.join(timeout=_TIMELAPSE_PERIOD_S)
+            telemetry = telem_holder['data']
+            telem_done_at = telem_holder['done_at']
+
+            snap_ms = round((snap_done_at - t_start) * 1000, 1)
+            telem_ms = (telemetry or {}).get('fetch_ms', -1.0)
+            sync_skew_ms = (
+                round(abs(snap_done_at - telem_done_at) * 1000, 1)
+                if telem_done_at is not None else -1.0
+            )
+
             if jpeg is None:
                 self.miss_count += 1
-                logger.warning("TIMELAPSE snap miss (%s)", reason)
+                logger.warning(
+                    "TIMELAPSE snap miss (%s) snap_ms=%.1f telem_ms=%.1f",
+                    reason, snap_ms, telem_ms,
+                )
                 continue
 
-            # Fetch the telemetry block ONCE per snap and reuse it for
-            # both EXIF embedding and the CSV sidecar; matches the
-            # convention used by ``update_srt_file`` so a JPEG and the
-            # SRT entry at the same wall-clock time agree exactly.
-            try:
-                bb_lat, bb_lon, bb_alt = get_blueboat_gps_position()
-                heading = get_towfish_heading()
-                if bb_lat is not None and bb_lon is not None and heading is not None:
-                    gps_lat, gps_lon = calculate_offset_position(
-                        bb_lat, bb_lon, heading, 4.0,
-                    )
-                else:
-                    gps_lat, gps_lon = bb_lat, bb_lon
-                tow_alt = get_towfish_altitude()  # negative when underwater
-                depth = get_depth_data()
-                temp = get_baro_data()
-            except Exception:
-                logger.exception("TIMELAPSE telemetry fetch failed")
+            if telemetry is None:
+                logger.warning(
+                    "TIMELAPSE telemetry timed out (snap_ms=%.1f, "
+                    "limit=%.0f ms); EXIF will lack GPS this frame",
+                    snap_ms, _TIMELAPSE_PERIOD_S * 1000,
+                )
                 bb_lat = bb_lon = bb_alt = None
                 gps_lat = gps_lon = None
                 heading = None
                 tow_alt = None
                 depth = None
                 temp = None
+            else:
+                bb_lat = telemetry['bb_lat']
+                bb_lon = telemetry['bb_lon']
+                bb_alt = telemetry['bb_alt']
+                gps_lat = telemetry['gps_lat']
+                gps_lon = telemetry['gps_lon']
+                heading = telemetry['heading']
+                tow_alt = telemetry['tow_alt']
+                depth = telemetry['depth']
+                temp = telemetry['temp']
 
             # Embed GPS+heading+timestamp into EXIF before writing so
             # the on-disk JPEG is self-describing (geotagged in any
@@ -1449,10 +1541,17 @@ class TimelapseSession:
             self.last_snap_path = path
             self.last_snap_size_bytes = len(jpeg)
             self.last_snap_at = ts_local
+            self.last_sync_skew_ms = sync_skew_ms
 
-            # CSV sidecar keeps its historical schema:
-            #   altitude_m = BlueBoat GPS altitude above MSL (bb_alt)
-            #   depth_m    = towfish depth (positive)
+            # CSV sidecar keeps its historical schema and adds three
+            # timing columns at the end so you can audit per-frame
+            # snap-vs-telemetry sync after the fact:
+            #   altitude_m    = BlueBoat GPS altitude above MSL (bb_alt)
+            #   depth_m       = towfish depth (positive)
+            #   snap_ms       = JPEG HTTP round-trip
+            #   telem_ms      = parallel mavlink2rest round-trip
+            #   sync_skew_ms  = wall-clock gap between snap done /
+            #                   telemetry done (small = tight sync)
             try:
                 with open(self._csv_path, 'a', newline='') as f:
                     w = csv.writer(f)
@@ -1465,6 +1564,9 @@ class TimelapseSession:
                         f"{heading:.1f}" if heading is not None else "",
                         f"{depth:.2f}" if depth is not None else "",
                         f"{temp:.2f}" if temp is not None else "",
+                        f"{snap_ms:.1f}",
+                        f"{telem_ms:.1f}" if telem_ms >= 0 else "",
+                        f"{sync_skew_ms:.1f}" if sync_skew_ms >= 0 else "",
                     ])
             except Exception:
                 logger.exception("TIMELAPSE CSV write failed")
@@ -1824,6 +1926,12 @@ def get_status():
                                if tl and tl.last_snap_path else None),
             "last_snap_at": (tl.last_snap_at.isoformat()
                              if tl and tl.last_snap_at else None),
+            # Snap-vs-telemetry sync skew (ms) for the most recent
+            # frame; small numbers mean the EXIF GPS/heading was
+            # sampled in the same wall-clock window as the JPEG.
+            "last_sync_skew_ms": (tl.last_sync_skew_ms
+                                  if tl and tl.last_sync_skew_ms is not None
+                                  else -1.0),
             "snapshot_url": snapshot_url,
         }
 

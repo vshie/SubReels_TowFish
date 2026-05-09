@@ -391,6 +391,14 @@ async function pollStatus() {
             const tl = data.timelapse || {};
             const parts = [`snaps: ${tl.snap_count || 0}`];
             if (tl.miss_count > 0) parts.push(`<span class="warn">misses: ${tl.miss_count}</span>`);
+            // Sync skew = ms between snap & GPS sample landing.
+            // Highlight in yellow if either GPS lagged the snap by
+            // more than half a snap period (250 ms @ 2 Hz).
+            const skew = tl.last_sync_skew_ms;
+            if (typeof skew === 'number' && skew >= 0) {
+                const cls = skew > 250 ? 'warn' : '';
+                parts.push(`<span class="${cls}">sync: ${skew.toFixed(0)} ms</span>`);
+            }
             parts.push(`free: ${data.disk_free_mb || 0} MB`);
             statsRow.innerHTML = parts.join(' &middot; ');
         } else {

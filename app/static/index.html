@@ -518,8 +518,15 @@ async function checkRecordingStatus() {
         const tl = response.data.timelapse;
         if (tl) {
             const last = tl.last_snap_path ? ` last: ${tl.last_snap_path}` : '';
+            // Surface snap-vs-GPS sync skew alongside snap counts so
+            // a configurator can spot mavlink2rest going sluggish
+            // without scraping telemetry.csv after the dive.
+            let skewStr = '';
+            if (typeof tl.last_sync_skew_ms === 'number' && tl.last_sync_skew_ms >= 0) {
+                skewStr = ` · sync: ${tl.last_sync_skew_ms.toFixed(0)} ms`;
+            }
             const stats = serverMode === 'timelapse'
-                ? `snaps: ${tl.snap_count} · misses: ${tl.miss_count}${last}`
+                ? `snaps: ${tl.snap_count} · misses: ${tl.miss_count}${skewStr}${last}`
                 : (tl.snap_count > 0 ? `last session snaps: ${tl.snap_count}` : 'Idle');
             document.getElementById("timelapseStats").textContent = stats;
         }
