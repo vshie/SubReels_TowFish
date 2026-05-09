@@ -41,7 +41,9 @@ WORKDIR /app
 COPY app/ .
 
 # Install Python dependencies
-RUN pip3 install flask requests websockets
+# - piexif: pure-python EXIF reader/writer used to stamp GPS lat/lon/altitude
+#   and the towfish heading into every timelapse-mode JPEG.
+RUN pip3 install flask requests websockets piexif
 
 # Create directory for video recordings
 RUN mkdir -p /app/videorecordings

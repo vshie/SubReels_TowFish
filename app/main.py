@@ -13,6 +13,9 @@ import math
 import websockets
 import csv
 import re
+import io
+import piexif
+from datetime import timezone
 from websockets.exceptions import ConnectionClosed
 
 import gi
@@ -1236,6 +1239,80 @@ class RecordingSession:
 _TIMELAPSE_PERIOD_S = 0.5  # 2 Hz
 _TIMELAPSE_HTTP_TIMEOUT_S = 1.5
 
+def _decimal_deg_to_dms_rationals(deg):
+    """Convert decimal degrees -> EXIF-style ((d,1),(m,1),(s*10000,10000))."""
+    deg = abs(float(deg))
+    d = int(deg)
+    m_full = (deg - d) * 60.0
+    m = int(m_full)
+    s = (m_full - m) * 60.0
+    return ((d, 1), (m, 1), (int(round(s * 10000)), 10000))
+
+def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc):
+    """Build piexif-encoded EXIF bytes embedding the towfish position.
+
+    Mirrors what ``update_srt_file`` writes into the .srt:
+
+    * ``lat`` / ``lon`` are the BlueBoat fix offset 4 m along the
+      towfish heading (already computed by the caller).
+    * ``alt_m`` is the towfish AHRS2 altitude (negative when underwater)
+      -- written as ``GPSAltitude`` with ``GPSAltitudeRef = 1`` (below
+      sea level) when negative.
+    * ``heading_deg`` is the towfish yaw (true heading, 0..360) and
+      becomes ``GPSImgDirection`` so map clients render the camera
+      bearing at each frame.
+    * ``ts_local`` / ``ts_utc`` populate ``DateTimeOriginal`` (local
+      wall-clock for the operator) and ``GPSDateStamp`` /
+      ``GPSTimeStamp`` (always UTC, per EXIF spec).
+
+    Returns ``None`` when there's nothing useful to embed.
+    """
+    have_gps = lat is not None and lon is not None
+    have_heading = heading_deg is not None
+    if not (have_gps or have_heading):
+        return None
+
+    gps_ifd = {}
+
+    if have_gps:
+        gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
+        gps_ifd[piexif.GPSIFD.GPSLatitude] = _decimal_deg_to_dms_rationals(lat)
+        gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
+        gps_ifd[piexif.GPSIFD.GPSLongitude] = _decimal_deg_to_dms_rationals(lon)
+        if alt_m is not None:
+            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 1 if alt_m < 0 else 0
+            gps_ifd[piexif.GPSIFD.GPSAltitude] = (int(round(abs(alt_m) * 1000)), 1000)
+
+    if have_heading:
+        # 'T' = true heading. The towfish yaw is from the IMU so this
+        # is the absolute heading the camera is pointing.
+        gps_ifd[piexif.GPSIFD.GPSImgDirectionRef] = b'T'
+        gps_ifd[piexif.GPSIFD.GPSImgDirection] = (int(round(heading_deg * 100)), 100)
+
+    # GPS time/date in UTC per spec, regardless of system locale.
+    gps_ifd[piexif.GPSIFD.GPSTimeStamp] = (
+        (ts_utc.hour, 1),
+        (ts_utc.minute, 1),
+        (int(round(ts_utc.second * 100)), 100),
+    )
+    gps_ifd[piexif.GPSIFD.GPSDateStamp] = ts_utc.strftime('%Y:%m:%d').encode('ascii')
+
+    dt_str = ts_local.strftime('%Y:%m:%d %H:%M:%S').encode('ascii')
+    exif_ifd = {
+        piexif.ExifIFD.DateTimeOriginal: dt_str,
+        piexif.ExifIFD.DateTimeDigitized: dt_str,
+    }
+    image_ifd = {
+        piexif.ImageIFD.DateTime: dt_str,
+        piexif.ImageIFD.Software: b"BlueOS-VideoRecorder Towfish",
+    }
+
+    try:
+        return piexif.dump({"0th": image_ifd, "Exif": exif_ifd, "GPS": gps_ifd})
+    except Exception:
+        logger.exception("EXIF dump failed")
+        return None
+
 class TimelapseSession:
     """Background thread that GETs JPEGs from the camera's snap CGI."""
 
@@ -1307,11 +1384,56 @@ class TimelapseSession:
             next_fire = max(next_fire + _TIMELAPSE_PERIOD_S, time.monotonic())
 
             jpeg, reason = self._fetch_jpeg()
-            ts = datetime.now()
+            ts_local = datetime.now()
+            ts_utc = datetime.now(tz=timezone.utc)
             if jpeg is None:
                 self.miss_count += 1
                 logger.warning("TIMELAPSE snap miss (%s)", reason)
                 continue
+
+            # Fetch the telemetry block ONCE per snap and reuse it for
+            # both EXIF embedding and the CSV sidecar; matches the
+            # convention used by ``update_srt_file`` so a JPEG and the
+            # SRT entry at the same wall-clock time agree exactly.
+            try:
+                bb_lat, bb_lon, bb_alt = get_blueboat_gps_position()
+                heading = get_towfish_heading()
+                if bb_lat is not None and bb_lon is not None and heading is not None:
+                    gps_lat, gps_lon = calculate_offset_position(
+                        bb_lat, bb_lon, heading, 4.0,
+                    )
+                else:
+                    gps_lat, gps_lon = bb_lat, bb_lon
+                tow_alt = get_towfish_altitude()  # negative when underwater
+                depth = get_depth_data()
+                temp = get_baro_data()
+            except Exception:
+                logger.exception("TIMELAPSE telemetry fetch failed")
+                bb_lat = bb_lon = bb_alt = None
+                gps_lat = gps_lon = None
+                heading = None
+                tow_alt = None
+                depth = None
+                temp = None
+
+            # Embed GPS+heading+timestamp into EXIF before writing so
+            # the on-disk JPEG is self-describing (geotagged in any
+            # standard map / photo viewer). Failure here is non-fatal:
+            # the raw JPEG and CSV row still get written.
+            try:
+                exif_bytes = _build_gps_exif_bytes(
+                    gps_lat, gps_lon, tow_alt, heading, ts_local, ts_utc,
+                )
+                if exif_bytes is not None:
+                    # piexif.insert with raw bytes requires either a
+                    # path or a BytesIO output buffer; using BytesIO
+                    # keeps the rewrite in memory so we still write
+                    # the file exactly once.
+                    out_buf = io.BytesIO()
+                    piexif.insert(exif_bytes, jpeg, out_buf)
+                    jpeg = out_buf.getvalue()
+            except Exception:
+                logger.exception("TIMELAPSE EXIF insert failed; saving raw JPEG")
 
             self.snap_count += 1
             seq = self.snap_count
@@ -1326,29 +1448,26 @@ class TimelapseSession:
                 continue
             self.last_snap_path = path
             self.last_snap_size_bytes = len(jpeg)
-            self.last_snap_at = ts
+            self.last_snap_at = ts_local
 
+            # CSV sidecar keeps its historical schema:
+            #   altitude_m = BlueBoat GPS altitude above MSL (bb_alt)
+            #   depth_m    = towfish depth (positive)
             try:
-                lat, lon, alt = get_blueboat_gps_position()
-                heading = get_towfish_heading()
-                if lat is not None and lon is not None and heading is not None:
-                    lat, lon = calculate_offset_position(lat, lon, heading, 4.0)
-                depth = get_depth_data()
-                temp = get_baro_data()
                 with open(self._csv_path, 'a', newline='') as f:
                     w = csv.writer(f)
                     w.writerow([
-                        ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                        ts_local.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                         seq, filename, len(jpeg),
-                        f"{lat:.6f}" if lat is not None else "",
-                        f"{lon:.6f}" if lon is not None else "",
-                        f"{alt:.2f}" if alt is not None else "",
+                        f"{gps_lat:.6f}" if gps_lat is not None else "",
+                        f"{gps_lon:.6f}" if gps_lon is not None else "",
+                        f"{bb_alt:.2f}" if bb_alt is not None else "",
                         f"{heading:.1f}" if heading is not None else "",
                         f"{depth:.2f}" if depth is not None else "",
                         f"{temp:.2f}" if temp is not None else "",
                     ])
             except Exception:
-                logger.exception("TIMELAPSE telemetry write failed")
+                logger.exception("TIMELAPSE CSV write failed")
         logger.info("TIMELAPSE loop exiting (snaps=%d, misses=%d)",
                     self.snap_count, self.miss_count)
 
