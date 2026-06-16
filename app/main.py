@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Mode state -- the recorder runs in exactly one mode at a time:
 #   "idle"       : nothing happening
-#   "video"      : RTSP H.265 RecordingSession is active
+#   "video"      : RTSP H.264 RecordingSession is active
 #   "timelapse"  : 2 Hz HTTP-snap TimelapseSession is active
 # Mode transitions go through _mode_lock so the Flask routes can never
 # leave the recorder in a half-started state across both modes.
@@ -82,8 +82,12 @@ stop_ass_thread = False
 current_ass_file = None
 ass_subtitle_counter = 0
 
-# RTSP endpoint for H.265 video stream
-RTSP_H265_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+# RTSP endpoint for the RadCam video stream. The camera was reconfigured
+# so ``stream_0`` now serves H.264 (was H.265) -- the H.264 path is the
+# only one ``_build_pipeline_description`` knows about. Variable name kept
+# generic (``RTSP_ENDPOINT``) so swapping the camera/codec in the future
+# only needs the parser/depayloader updated, not call sites.
+RTSP_ENDPOINT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
 
 # WebSocket server for Cockpit data lake variables
 DATA_LAKE_WS_HOST = "0.0.0.0"
@@ -870,19 +874,30 @@ def _read_disk_free_mb():
 # In-process GStreamer recording with auto-restart watchdog.
 #
 # Replaces the legacy ``subprocess.Popen(["gst-launch-1.0", ...])`` path.
-# Key motivations (informed by today's tow-fish dive + the doris
-# tony-video-h265 reference):
+# The pipeline shape itself mirrors the hauv-v2 branch's RTSP recorder
+# (UDP transport, latency=5000, h264parse config-interval=-1, big leaky
+# queue between parser and muxer); the only structural addition here is
+# ``splitmuxsink`` so the watchdog can roll a new on-disk part on each
+# pipeline rebuild without losing what was already recorded. Key
+# motivations:
 #
-# * RTSP drops at 50 Mbit/s HEVC silently kill the recorder. The watchdog
+# * RTSP drops at 4K bitrates silently kill the recorder. The watchdog
 #   here detects ERROR/EOS on the GStreamer bus *and* file-stall and
 #   restarts the pipeline automatically; per-restart files are written
 #   via ``splitmuxsink`` so we never lose the previously-recorded data.
+#   Only the /stop Flask route ever sets the stop event -- everything
+#   else respawns.
+# * Codec is H.264 (was H.265): at 4K the H.265 RTSP path on this camera
+#   kept dropping at random large file sizes. H.264 over the same RTSP
+#   transport is markedly more stable end-to-end, at the cost of larger
+#   files. The user reconfigured the camera so ``stream_0`` now serves
+#   H.264.
 # * The 1-hour MPEG-TS PTS offset that breaks VLC playback comes from
 #   ``mpegtsmux`` reusing rtspsrc's first PTS. ``splitmuxsink`` opens a
 #   fresh muxer per fragment (PTS resets to zero) so every part plays
 #   straight away.
 # * ``wait-for-keyframe=true`` + ``alignment=au`` + ``config-interval=-1``
-#   guarantee every part starts at a decodable VPS+SPS+PPS+IDR.
+#   guarantee every part starts at a decodable SPS+PPS+IDR.
 # * ``async-finalize=false`` per the doris h265 docstring: their tests
 #   showed ``async-finalize=true`` could silently freeze splitmuxsink
 #   mid-rotation while the bus continued to report the pipeline healthy.
@@ -909,11 +924,24 @@ def _ensure_gst_init():
             logger.info("GStreamer initialized (version %s)", Gst.version_string())
 
 def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsink"):
-    """Build the gst-parse_launch description for one RTSP H.265 session.
+    """Build the gst-parse_launch description for one RTSP H.264 session.
 
-    Output is always written via splitmuxsink so we get fresh PTS per
-    segment (VLC can play it) and the watchdog can roll a new file on
-    each pipeline rebuild.
+    Mirrors the hauv-v2 branch's RTSP recording pipeline (UDP transport,
+    latency=5000, h264parse config-interval=-1, big leaky queue between
+    parser and muxer) but swaps the single ``filesink`` for a
+    ``splitmuxsink`` so the watchdog can roll a new on-disk part on each
+    pipeline rebuild without losing what was already recorded.
+
+    Why we switched off H.265 here: at 4K bitrates the H.265 RTSP path
+    on this camera kept dropping at random large file sizes, which
+    forced a watchdog respawn and produced lots of short, unplayable
+    parts. H.264 over the same RTSP transport is markedly more stable
+    end-to-end at the cost of larger files. The user reconfigured the
+    camera so ``stream_0`` now serves H.264.
+
+    Per-fragment PTS reset by splitmuxsink also keeps VLC happy (the
+    old single-mpegtsmux path produced a 1-hour PTS offset that broke
+    playback until you scrubbed past it).
     """
     if container_fmt == "mpegts":
         muxer_factory = "mpegtsmux"
@@ -922,10 +950,16 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsin
     proto = proto if proto in VALID_STREAM_PROTOCOLS else DEFAULT_STREAM_PROTOCOL
     return (
         f"rtspsrc location={rtsp_url} is-live=true latency=5000 "
-        f"protocols={proto} retry=5 timeout=5000000 do-retransmission=false "
-        f"! rtph265depay wait-for-keyframe=true "
-        f"! h265parse config-interval=-1 "
-        f"! video/x-h265,stream-format=byte-stream,alignment=au "
+        f"protocols={proto} retry=5 timeout=5000000 "
+        f"! rtph264depay wait-for-keyframe=true "
+        f"! h264parse config-interval=-1 "
+        # hauv-v2 leaky queue: absorbs RTSP jitter so a brief mux stall
+        # never back-pressures the depayloader (which would otherwise
+        # drop the RTP session). 30 s of headroom, no byte/buffer cap,
+        # leak the oldest frames downstream if anything ever wedges.
+        f"! queue max-size-time=30000000000 max-size-bytes=0 max-size-buffers=0 "
+        f"leaky=downstream silent=true "
+        f"! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! splitmuxsink name={mux_name} max-size-time=0 "
         f"muxer-factory={muxer_factory} send-keyframe-requests=true "
         f"async-finalize=false"
@@ -1117,7 +1151,7 @@ class RecordingSession:
     def _send_eos_with_timeout(self, pipeline, bus):
         """Send EOS in a worker thread and wait, falling back to NULL.
 
-        On a live HEVC ``rtspsrc protocols=udp`` pipeline the
+        On a live ``rtspsrc protocols=udp`` pipeline the
         ``send_event(EOS)`` call has been observed to block for many
         minutes, starving the rest of the process. Run it in a thread
         and bound it with a wall-clock timeout so we always reach the
@@ -1656,7 +1690,7 @@ def config():
                         "snapshot_url": snapshot_url})
 
     resp = jsonify({
-        "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
+        "rtsp_endpoint": RTSP_ENDPOINT,
         "tow_vehicle_ip": tow_vehicle_ip,
         "container_format": container_format,
         "stream_protocol": stream_protocol,
@@ -1667,13 +1701,15 @@ def config():
 
 @app.route('/start', methods=['GET'])
 def start():
-    """Start an H.265 recording session.
+    """Start an H.264 recording session.
 
     Mutually exclusive with timelapse mode (HTTP 409 if a timelapse
     is already running). The actual GStreamer pipeline lives in a
     background ``RecordingSession`` watchdog thread that auto-restarts
     on RTSP drops or file stalls; this handler only sets up sidecars
-    and kicks the watchdog off.
+    and kicks the watchdog off. Only the /stop route ever asks the
+    session to actually stop -- every other exit (ERROR/EOS/stall)
+    is treated as something the watchdog should recover from.
     """
     global recording, start_time
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
@@ -1713,7 +1749,7 @@ def start():
                       f"container={container_format} proto={stream_protocol}")
 
             session = RecordingSession(
-                rtsp_url=RTSP_H265_ENDPOINT,
+                rtsp_url=RTSP_ENDPOINT,
                 out_dir="/app/videorecordings",
                 base_filename=base_filename,
                 ext=ext,
@@ -1944,7 +1980,7 @@ def get_status():
             "start_time": active_start.isoformat() if active_start else None,
             "duration_seconds": round((datetime.now() - active_start).total_seconds(), 1) if active_start else 0,
             "rtsp_process_alive": rtsp_alive,
-            "rtsp_h265_endpoint": RTSP_H265_ENDPOINT,
+            "rtsp_endpoint": RTSP_ENDPOINT,
             "file_size_mb": file_size_mb,
             "current_part": (os.path.basename(current_part_path)
                               if current_part_path else None),
