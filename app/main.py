@@ -126,6 +126,11 @@ VALID_CONTAINER_FORMATS = ("mp4", "mpegts")
 DEFAULT_STREAM_PROTOCOL = "udp"
 VALID_STREAM_PROTOCOLS = ("udp", "tcp")
 DEFAULT_SNAPSHOT_URL = "http://192.168.2.10/cgi-bin/onesnap.cgi"
+# What the automatic transect monitor captures per leg:
+#   "video"     -> one RTSP .ts file per waypoint leg (+ per-leg SRT/ASS)
+#   "timelapse" -> 2 Hz geotagged JPEGs into one subfolder per leg
+DEFAULT_TRANSECT_CAPTURE_TYPE = "video"
+VALID_TRANSECT_CAPTURE_TYPES = ("video", "timelapse")
 
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
@@ -134,6 +139,7 @@ def load_config():
         "container_format": DEFAULT_CONTAINER_FORMAT,
         "stream_protocol": DEFAULT_STREAM_PROTOCOL,
         "snapshot_url": DEFAULT_SNAPSHOT_URL,
+        "transect_capture_type": DEFAULT_TRANSECT_CAPTURE_TYPE,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -148,6 +154,8 @@ def load_config():
         defaults["stream_protocol"] = DEFAULT_STREAM_PROTOCOL
     if not isinstance(defaults["snapshot_url"], str) or not defaults["snapshot_url"].strip():
         defaults["snapshot_url"] = DEFAULT_SNAPSHOT_URL
+    if defaults["transect_capture_type"] not in VALID_TRANSECT_CAPTURE_TYPES:
+        defaults["transect_capture_type"] = DEFAULT_TRANSECT_CAPTURE_TYPE
     return defaults
 
 def save_config(cfg):
@@ -284,6 +292,7 @@ tow_vehicle_ip = _cfg["tow_vehicle_ip"]
 container_format = _cfg["container_format"]
 stream_protocol = _cfg["stream_protocol"]
 snapshot_url = _cfg["snapshot_url"]
+transect_capture_type = _cfg["transect_capture_type"]
 
 # Mavlink URLs (Towfish heading at 192.168.2.2)
 towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
@@ -1670,17 +1679,37 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc):
         logger.exception("EXIF dump failed")
         return None
 
-class TimelapseSession:
-    """Background thread that GETs JPEGs from the camera's snap CGI."""
+_TIMELAPSE_CSV_HEADER = [
+    'timestamp', 'seq', 'jpg', 'size_bytes',
+    'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
+    'depth_m', 'temperature_c',
+    'snap_ms', 'telem_ms', 'sync_skew_ms',
+]
 
-    def __init__(self, snap_url, out_dir):
+
+class TimelapseSession:
+    """Background thread that GETs JPEGs from the camera's snap CGI.
+
+    Two layouts:
+      * Manual timelapse (``per_leg=False``): all JPEGs + one
+        ``telemetry.csv`` land directly in ``out_dir`` with sequential
+        ``00001.jpg`` names.
+      * Transect timelapse (``per_leg=True``): ``out_dir`` is the
+        session root and each waypoint leg gets its own subfolder
+        (``out_dir/wpNN/``) with its own ``telemetry.csv`` and a
+        per-leg sequence counter. The monitor calls :meth:`set_leg`
+        at entry and at every leg boundary. Until the first leg is
+        set the loop captures nothing.
+    """
+
+    def __init__(self, snap_url, out_dir, per_leg=False):
         self._snap_url = snap_url
-        self._out_dir = out_dir
+        self._base_dir = out_dir
+        self._per_leg = per_leg
         self._stop_event = threading.Event()
         self._thread = None
-        self._csv_path = os.path.join(out_dir, "telemetry.csv")
         self.start_time = None
-        self.snap_count = 0
+        self.snap_count = 0          # session-wide total (all legs)
         self.miss_count = 0
         self.last_snap_size_bytes = 0
         self.last_snap_path = None
@@ -1691,34 +1720,62 @@ class TimelapseSession:
         # can spot mavlink2rest going slow without scraping the CSV.
         self.last_sync_skew_ms = -1.0
 
+        # Current output target (swapped per leg under the lock). For
+        # manual mode it is fixed to out_dir for the session lifetime.
+        self._leg_lock = threading.Lock()
+        self._leg_label = None
+        if per_leg:
+            self._leg_dir = None
+            self._leg_csv = None
+        else:
+            self._leg_dir = out_dir
+            self._leg_csv = os.path.join(out_dir, "telemetry.csv")
+        self._leg_seq = 0            # per-leg (or per-session) counter
+        self.leg_count = 0
+
+    def _write_csv_header(self, csv_path):
+        try:
+            with open(csv_path, 'w', newline='') as f:
+                csv.writer(f).writerow(_TIMELAPSE_CSV_HEADER)
+        except Exception:
+            logger.exception("TIMELAPSE failed to write CSV header: %s", csv_path)
+
     def start(self):
         if self._thread is not None:
             raise RuntimeError("TimelapseSession already started")
-        os.makedirs(self._out_dir, exist_ok=True)
-        # Telemetry CSV header so each .jpg can be geotagged later.
-        # Last three columns expose the per-snap timing budget so a
-        # reviewer can spot if mavlink fell behind: ``snap_ms`` is
-        # the JPEG HTTP round-trip, ``telem_ms`` is the parallel
-        # mavlink2rest fetch, and ``sync_skew_ms`` is the wall-clock
-        # gap between when the snap finished and when telemetry came
-        # back (small = JPEG and GPS share the same instant).
-        try:
-            with open(self._csv_path, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    'timestamp', 'seq', 'jpg', 'size_bytes',
-                    'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
-                    'depth_m', 'temperature_c',
-                    'snap_ms', 'telem_ms', 'sync_skew_ms',
-                ])
-        except Exception:
-            logger.exception("TIMELAPSE failed to write CSV header")
+        os.makedirs(self._base_dir, exist_ok=True)
+        # Manual mode writes its single CSV header up front; per-leg mode
+        # defers until set_leg() opens the first leg subfolder.
+        if not self._per_leg:
+            self._write_csv_header(self._leg_csv)
         self.start_time = datetime.now()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop, name="timelapse-loop", daemon=True,
         )
         self._thread.start()
+
+    def set_leg(self, label):
+        """Switch capture output to a new per-leg subfolder (per_leg only).
+
+        Creates ``<base>/<label>/`` with a fresh ``telemetry.csv`` and
+        resets the per-leg sequence counter so each leg's JPEGs start at
+        ``00001.jpg``. Safe to call from the monitor thread while the
+        capture loop runs.
+        """
+        if not self._per_leg:
+            return None
+        leg_dir = os.path.join(self._base_dir, label)
+        os.makedirs(leg_dir, exist_ok=True)
+        csv_path = os.path.join(leg_dir, "telemetry.csv")
+        self._write_csv_header(csv_path)
+        with self._leg_lock:
+            self._leg_dir = leg_dir
+            self._leg_csv = csv_path
+            self._leg_seq = 0
+            self._leg_label = label
+            self.leg_count += 1
+        return leg_dir
 
     def is_alive(self):
         return self._thread is not None and self._thread.is_alive()
@@ -1793,6 +1850,13 @@ class TimelapseSession:
                 if self._stop_event.wait(timeout=next_fire - now):
                     break
             next_fire = max(next_fire + _TIMELAPSE_PERIOD_S, time.monotonic())
+
+            # Per-leg mode: until the monitor opens the first leg there's
+            # nowhere to write, so idle without burning the snap budget.
+            with self._leg_lock:
+                leg_ready = self._leg_dir is not None
+            if self._per_leg and not leg_ready:
+                continue
 
             # ---- Synchronised capture ------------------------------
             # Stamp wall-clock ONCE, then fire JPEG + telemetry in
@@ -1884,10 +1948,20 @@ class TimelapseSession:
             except Exception:
                 logger.exception("TIMELAPSE EXIF insert failed; saving raw JPEG")
 
+            # Capture the active leg target + claim a per-leg sequence
+            # number atomically so a concurrent set_leg() can't split a
+            # frame across two folders.
+            with self._leg_lock:
+                leg_dir = self._leg_dir
+                leg_csv = self._leg_csv
+                self._leg_seq += 1
+                seq = self._leg_seq
+            if leg_dir is None:
+                self.miss_count += 1
+                continue
             self.snap_count += 1
-            seq = self.snap_count
             filename = f"{seq:05d}.jpg"
-            path = os.path.join(self._out_dir, filename)
+            path = os.path.join(leg_dir, filename)
             try:
                 with open(path, 'wb') as f:
                     f.write(jpeg)
@@ -1910,7 +1984,7 @@ class TimelapseSession:
             #   sync_skew_ms  = wall-clock gap between snap done /
             #                   telemetry done (small = tight sync)
             try:
-                with open(self._csv_path, 'a', newline='') as f:
+                with open(leg_csv, 'a', newline='') as f:
                     w = csv.writer(f)
                     w.writerow([
                         ts_local.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
@@ -1955,11 +2029,17 @@ def register_service():
 @app.route('/config', methods=['GET', 'POST'])
 def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
+    global transect_capture_type
 
     if request.method == 'POST':
         if mode != MODE_IDLE:
             return jsonify({"success": False,
                             "message": f"Cannot change config while {mode} active"}), 400
+        # The transect monitor owns the recorder even while sitting in
+        # its "waiting" state, so block capture-type changes then too.
+        if _transect_monitor is not None and _transect_monitor.state != "disabled":
+            return jsonify({"success": False,
+                            "message": "Cannot change config while transect monitor is enabled"}), 400
 
         data = request.get_json(silent=True) or {}
         changed = False
@@ -1967,6 +2047,15 @@ def config():
         new_ip = data.get('tow_vehicle_ip', '').strip()
         if new_ip:
             tow_vehicle_ip = new_ip
+            changed = True
+
+        new_capture = data.get('transect_capture_type')
+        if new_capture is not None:
+            new_capture = str(new_capture).strip().lower()
+            if new_capture not in VALID_TRANSECT_CAPTURE_TYPES:
+                return jsonify({"success": False,
+                                "message": f"transect_capture_type must be one of {VALID_TRANSECT_CAPTURE_TYPES}"}), 400
+            transect_capture_type = new_capture
             changed = True
 
         new_fmt = data.get('container_format', '').strip().lower()
@@ -2000,17 +2089,20 @@ def config():
         save_config({"tow_vehicle_ip": tow_vehicle_ip,
                       "container_format": container_format,
                       "stream_protocol": stream_protocol,
-                      "snapshot_url": snapshot_url})
+                      "snapshot_url": snapshot_url,
+                      "transect_capture_type": transect_capture_type})
         logger.info(
             "Config updated: tow_vehicle_ip=%s, container_format=%s, "
-            "stream_protocol=%s, snapshot_url=%s",
+            "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
+            transect_capture_type,
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
                         "container_format": container_format,
                         "stream_protocol": stream_protocol,
-                        "snapshot_url": snapshot_url})
+                        "snapshot_url": snapshot_url,
+                        "transect_capture_type": transect_capture_type})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -2018,6 +2110,7 @@ def config():
         "container_format": container_format,
         "stream_protocol": stream_protocol,
         "snapshot_url": snapshot_url,
+        "transect_capture_type": transect_capture_type,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -2226,6 +2319,44 @@ def _stop_video_session():
 
     logger.info("Recording stopped successfully")
 
+def _start_transect_timelapse(initial_label):
+    """Stand up a per-leg TimelapseSession; flip ``mode`` to MODE_TRANSECT.
+
+    Mirror of :func:`_start_video_session` for the image capture type.
+    Returns the session root dir (``transect_<TS>/``), which doubles as
+    the manifest's parent. Caller must hold ``_mode_lock``.
+    """
+    global _timelapse
+    os.makedirs("/app/videorecordings", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join("/app/videorecordings", f"transect_{timestamp}")
+
+    session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir, per_leg=True)
+    try:
+        session.start()
+        session.set_leg(initial_label)
+    except Exception:
+        logger.exception("Failed to start transect TimelapseSession")
+        _set_mode(MODE_IDLE)
+        _timelapse = None
+        raise
+
+    _timelapse = session
+    _set_mode(MODE_TRANSECT)
+    log_event("transect_timelapse_started", out_dir)
+    logger.info("Transect timelapse started: %s (snap_url=%s)", out_dir, snapshot_url)
+    return out_dir
+
+def _stop_transect_timelapse():
+    """Tear down the transect TimelapseSession; flip ``mode`` to IDLE."""
+    global _timelapse
+    session = _timelapse
+    _timelapse = None
+    if session is not None:
+        session.stop()
+    _set_mode(MODE_IDLE)
+    logger.info("Transect timelapse stopped")
+
 # ── Transect monitor ─────────────────────────────────────────────────────
 # Background thread that polls the tow vehicle's mavlink2rest for mission
 # state and drives the existing RecordingSession lifecycle automatically.
@@ -2342,6 +2473,11 @@ class TransectMonitor:
         self.current_seq = None
         self.leg_count = 0
         self.session_started_at = None
+        # Capture type for the in-flight session, snapshotted from the
+        # global config when the session starts ("video" or "timelapse")
+        # so a mid-mission config change can't split one session across
+        # both capture backends.
+        self._capture_type = None
 
         # Per-leg bookkeeping
         self._leg_started_at = None
@@ -2395,9 +2531,12 @@ class TransectMonitor:
                 except Exception:
                     logger.exception("close_leg on disable failed")
                 try:
-                    _stop_video_session()
+                    if self._capture_type == "timelapse":
+                        _stop_transect_timelapse()
+                    else:
+                        _stop_video_session()
                 except Exception:
-                    logger.exception("stop_video_session on disable failed")
+                    logger.exception("stop capture on disable failed")
         self.state = "disabled"
         self._note_event("monitor disabled")
 
@@ -2518,23 +2657,34 @@ class TransectMonitor:
     def _enter_recording(self, state):
         seq = state['mission_seq'] if state['mission_seq'] is not None else 0
         wp_label = f"wp{int(seq):02d}"
+        # Snapshot the capture type once for the whole session.
+        capture = transect_capture_type
+        self._capture_type = capture
         try:
             with _mode_lock:
                 if mode != MODE_IDLE:
                     self._note_event(f"cannot enter: mode={mode}")
                     return
-                anchor = _start_video_session(
-                    base_prefix="transect",
-                    target_mode=MODE_TRANSECT,
-                    initial_label=wp_label,
-                    per_leg_sidecars=True,
-                )
+                if capture == "timelapse":
+                    anchor = _start_transect_timelapse(wp_label)
+                else:
+                    anchor = _start_video_session(
+                        base_prefix="transect",
+                        target_mode=MODE_TRANSECT,
+                        initial_label=wp_label,
+                        per_leg_sidecars=True,
+                    )
         except Exception as e:
-            logger.exception("TransectMonitor: _start_video_session failed")
+            logger.exception("TransectMonitor: start (%s) failed", capture)
             self._note_event(f"start failed: {e}")
             return
 
-        self._manifest_path = _transect_manifest_path(anchor)
+        # Manifest lives beside the session: a sibling .ndjson for video
+        # parts, or manifest.ndjson inside the image session folder.
+        if capture == "timelapse":
+            self._manifest_path = os.path.join(anchor, "manifest.ndjson")
+        else:
+            self._manifest_path = _transect_manifest_path(anchor)
         try:
             _manifest_write_header(self._manifest_path, anchor)
         except Exception:
@@ -2548,7 +2698,7 @@ class TransectMonitor:
         self._stop_evidence_since = None
         self._mission_complete_latch = False
         self._begin_leg(state, seq)
-        self._note_event(f"started session at wp{seq:02d}")
+        self._note_event(f"started {capture} session at wp{seq:02d}")
 
     def _exit_recording(self, state, reason):
         try:
@@ -2558,9 +2708,12 @@ class TransectMonitor:
         try:
             with _mode_lock:
                 if mode == MODE_TRANSECT:
-                    _stop_video_session()
+                    if self._capture_type == "timelapse":
+                        _stop_transect_timelapse()
+                    else:
+                        _stop_video_session()
         except Exception:
-            logger.exception("stop_video_session on exit failed")
+            logger.exception("stop capture on exit failed")
         self.state = "waiting"
         self.current_seq = None
         self._leg_started_at = None
@@ -2573,7 +2726,7 @@ class TransectMonitor:
         self._note_event(f"stopped session: {reason}")
 
     def _roll_leg(self, state):
-        """Close the previous leg row and split to a new file for the new WP."""
+        """Close the previous leg and roll to a new file/folder for the new WP."""
         prior_leg_dur = 0.0
         if self._leg_started_at is not None:
             prior_leg_dur = (datetime.now() - self._leg_started_at).total_seconds()
@@ -2585,22 +2738,35 @@ class TransectMonitor:
 
         new_seq = state['mission_seq']
         wp_label = f"wp{int(new_seq):02d}"
-        session = _session  # snapshot for thread-safety
 
-        if prior_leg_dur < _TRANSECT_MIN_LEG_DURATION_S:
-            # Bursty seq advance (DO_CHANGE_SPEED, etc.). Don't emit a
-            # split-now -- just relabel the in-flight file's *next*
-            # rollover so the WP catches up once we actually move on.
-            if session is not None:
-                with session._lock:
-                    session._next_label = wp_label
-            self._note_event(
-                f"seq -> {new_seq} (no split, prior leg {prior_leg_dur:.1f}s)"
-            )
+        short_leg = prior_leg_dur < _TRANSECT_MIN_LEG_DURATION_S
+        if self._capture_type == "timelapse":
+            tl = _timelapse  # snapshot for thread-safety
+            if short_leg:
+                # Bursty seq advance -> don't spin up a tiny leg folder;
+                # let frames keep landing in the current one.
+                self._note_event(
+                    f"seq -> {new_seq} (no new folder, prior leg {prior_leg_dur:.1f}s)"
+                )
+            else:
+                if tl is not None:
+                    tl.set_leg(wp_label)
+                self._note_event(f"seq -> {new_seq} (new leg folder)")
         else:
-            if session is not None:
-                session.split_now(wp_label)
-            self._note_event(f"seq -> {new_seq} (split)")
+            session = _session  # snapshot for thread-safety
+            if short_leg:
+                # Don't emit a split-now -- just relabel the in-flight
+                # file's *next* rollover so the WP catches up later.
+                if session is not None:
+                    with session._lock:
+                        session._next_label = wp_label
+                self._note_event(
+                    f"seq -> {new_seq} (no split, prior leg {prior_leg_dur:.1f}s)"
+                )
+            else:
+                if session is not None:
+                    session.split_now(wp_label)
+                self._note_event(f"seq -> {new_seq} (split)")
 
         self.current_seq = new_seq
         self.leg_count += 1
@@ -2639,13 +2805,22 @@ class TransectMonitor:
             "wp_dist_start": self._leg_started_wp_dist,
             "wp_dist_end": end_state.get('wp_dist'),
             "close_reason": reason,
+            "capture_type": self._capture_type,
+        }
+        if self._capture_type == "timelapse":
+            tl = _timelapse
+            # For images the "leg file" is the per-leg subfolder, and we
+            # also record how many JPEGs landed in it.
+            row["leg_dir"] = (os.path.basename(tl._leg_dir)
+                              if tl is not None and tl._leg_dir else None)
+            row["leg_images"] = tl._leg_seq if tl is not None else None
+        else:
             # ``last_pattern`` is the most recent path splitmuxsink
             # opened; for the closing row this is the file the leg
             # actually wrote to. None if the session has already torn
             # down (shouldn't happen here, but defended).
-            "leg_file": (os.path.basename(_session.last_pattern)
-                         if _session is not None and _session.last_pattern else None),
-        }
+            row["leg_file"] = (os.path.basename(_session.last_pattern)
+                               if _session is not None and _session.last_pattern else None)
         _manifest_append(self._manifest_path, row)
 
     # -- diagnostics --------------------------------------------------
@@ -2661,9 +2836,25 @@ class TransectMonitor:
     def snapshot(self):
         """Pull a JSON-serialisable status snapshot for /status."""
         last = self.last_state or {}
+        # Current leg artifact + (for images) frame count, depending on
+        # the active capture backend.
+        current_leg_file = None
+        leg_images = None
+        if self._capture_type == "timelapse":
+            tl = _timelapse
+            if tl is not None and tl._leg_dir:
+                current_leg_file = os.path.basename(tl._leg_dir)
+                leg_images = tl._leg_seq
+        else:
+            if _session and _session.last_pattern:
+                current_leg_file = os.path.basename(_session.last_pattern)
         return {
             "enabled": self.state != "disabled",
             "state": self.state,
+            # Active session's capture type, plus the configured default
+            # so the UI can show the toggle even while idle/waiting.
+            "capture_type": self._capture_type,
+            "configured_capture_type": transect_capture_type,
             "mode_num": last.get('mode_num'),
             "armed": last.get('armed'),
             "mission_seq": last.get('mission_seq'),
@@ -2671,8 +2862,8 @@ class TransectMonitor:
             "groundspeed": last.get('groundspeed'),
             "heading": last.get('heading'),
             "leg_count": self.leg_count,
-            "current_leg_file": (os.path.basename(_session.last_pattern)
-                                  if _session and _session.last_pattern else None),
+            "current_leg_file": current_leg_file,
+            "leg_images": leg_images,
             "session_started_at": (self.session_started_at.isoformat()
                                     if self.session_started_at else None),
             "last_event": self.last_event,
@@ -2860,15 +3051,19 @@ def list_videos():
         timelapses = []
         for name in os.listdir(video_dir):
             full = os.path.join(video_dir, name)
-            if os.path.isdir(full) and name.startswith("timelapse_"):
+            if os.path.isdir(full) and (name.startswith("timelapse_")
+                                        or name.startswith("transect_")):
+                # Count JPEGs recursively so transect image sessions
+                # (which nest one wpNN/ subfolder per leg) report their
+                # full frame total, not just the root folder.
+                jpgs = 0
                 try:
-                    jpgs = [f for f in os.listdir(full) if f.endswith('.jpg')]
+                    for _root, _dirs, _files in os.walk(full):
+                        jpgs += sum(1 for f in _files if f.endswith('.jpg'))
                 except Exception:
-                    jpgs = []
-                timelapses.append({
-                    "name": name,
-                    "snap_count": len(jpgs),
-                })
+                    jpgs = 0
+                if jpgs > 0 or name.startswith("timelapse_"):
+                    timelapses.append({"name": name, "snap_count": jpgs})
             elif name.endswith(('.mp4', '.ts')):
                 videos.append(name)
         videos.sort(reverse=True)
@@ -2921,6 +3116,7 @@ def get_filesize():
                 })
 
         if mode == MODE_TRANSECT:
+            # Video transect: current leg .ts size.
             sess = _session
             if sess and sess.last_pattern and os.path.exists(sess.last_pattern):
                 path = sess.last_pattern
@@ -2934,6 +3130,26 @@ def get_filesize():
                     "size_bytes": os.path.getsize(path),
                     "recording": True,
                     "mode": mode,
+                })
+            # Image transect: current leg subfolder name + frame count.
+            tl = _timelapse
+            if tl is not None and tl.last_snap_path:
+                leg_dir = os.path.dirname(tl.last_snap_path)
+                size = 0
+                try:
+                    for f in os.listdir(leg_dir):
+                        full = os.path.join(leg_dir, f)
+                        if os.path.isfile(full):
+                            size += os.path.getsize(full)
+                except Exception:
+                    pass
+                return jsonify({
+                    "success": True,
+                    "filename": os.path.basename(leg_dir),
+                    "size_bytes": size,
+                    "recording": True,
+                    "mode": mode,
+                    "snap_count": tl.snap_count,
                 })
 
         if mode == MODE_TIMELAPSE:

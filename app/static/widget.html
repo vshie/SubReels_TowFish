@@ -198,6 +198,25 @@
 
         .stats-row span.warn { color: #ef9a9a; }
 
+        .capture-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+            font-size: 11px;
+            color: #b0bec5;
+        }
+        .capture-row select {
+            flex: 1;
+            background: #2a2f3a;
+            color: #e0e0e0;
+            border: 1px solid #3a4150;
+            border-radius: 4px;
+            padding: 3px 6px;
+            font-size: 11px;
+        }
+        .capture-row select:disabled { opacity: 0.5; }
+
         .error-msg {
             margin-top: 8px;
             padding: 6px 8px;
@@ -215,6 +234,14 @@
             <button id="modeVideoBtn" class="active" onclick="setMode('video')">VIDEO</button>
             <button id="modeTimelapseBtn" onclick="setMode('timelapse')">TIMELAPSE 2 Hz</button>
             <button id="modeTransectBtn"  onclick="setMode('transect')">TRANSECT AUTO</button>
+        </div>
+
+        <div class="capture-row" id="captureRow" style="display:none;">
+            <label for="transectCapture">Capture:</label>
+            <select id="transectCapture" onchange="saveCaptureType()">
+                <option value="video">Video (.ts/leg)</option>
+                <option value="timelapse">Images 2 Hz/leg</option>
+            </select>
         </div>
 
         <div class="header">
@@ -249,6 +276,8 @@ const modeTimelapseBtn= document.getElementById('modeTimelapseBtn');
 const modeTransectBtn = document.getElementById('modeTransectBtn');
 const modeTitle       = document.getElementById('modeTitle');
 const statsRow        = document.getElementById('statsRow');
+const captureRow      = document.getElementById('captureRow');
+const transectCapture = document.getElementById('transectCapture');
 
 // Local mode selection (what the user has *picked*); the active mode
 // reported by the server is in serverMode and overrides UI when active.
@@ -362,6 +391,25 @@ function renderUI() {
     modeTimelapseBtn.disabled = lock;
     modeTransectBtn.disabled = lock;
     actionBtn.disabled = false;
+
+    // Capture-type selector only matters for transect; lock it once the
+    // monitor is engaged (capture type is fixed for the session).
+    captureRow.style.display = (m === 'transect') ? 'flex' : 'none';
+    transectCapture.disabled = transectOwned;
+}
+
+async function saveCaptureType() {
+    try {
+        const res = await fetch('/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transect_capture_type: transectCapture.value }),
+        });
+        const data = await res.json();
+        if (!data.success) showError(data.message || 'Failed to set capture type');
+    } catch (e) {
+        showError('Connection error');
+    }
 }
 
 function startDurationTimer(serverDurationSec) {
@@ -447,6 +495,12 @@ async function pollStatus() {
         // legs but the monitor is still in charge.
         const tx = data.transect || null;
         transectMonState = tx && tx.enabled ? (tx.state || 'waiting') : 'disabled';
+        // Keep the capture-type selector in sync with the server's
+        // configured default, unless the operator is actively choosing.
+        if (tx && transectCapture !== document.activeElement && !isTransectOwned()) {
+            const cfg = tx.configured_capture_type || tx.capture_type;
+            if (cfg) transectCapture.value = cfg;
+        }
 
         if (isActive()) {
             // Sync the selected mode to whatever the server is doing so

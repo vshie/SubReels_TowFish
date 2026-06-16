@@ -357,6 +357,14 @@
             written to a sibling <code>transect_&lt;TS&gt;_manifest.ndjson</code>.
             Mutually exclusive with manual recording and timelapse.
         </p>
+        <div class="config-row" style="margin-bottom: 8px;">
+            <label for="transectCaptureType">Capture as:</label>
+            <select id="transectCaptureType" autocomplete="off" onchange="saveTransectCaptureType()">
+                <option value="video">Video (.ts per leg)</option>
+                <option value="timelapse">Images (2 Hz JPEG per leg)</option>
+            </select>
+            <span class="config-saved" id="captureTypeSaved">Saved</span>
+        </div>
         <div class="controls">
             <button id="transectEnableBtn"  class="btn-transect" onclick="enableTransect()">Enable Transect Auto</button>
             <button id="transectDisableBtn" class="btn-transect" onclick="disableTransect()" disabled>Disable Transect Auto</button>
@@ -423,6 +431,7 @@ function updateUIToRecording() {
     // Mutually exclusive with timelapse and transect-auto.
     document.getElementById("timelapseStartBtn").disabled = true;
     document.getElementById("transectEnableBtn").disabled = true;
+    document.getElementById("transectCaptureType").disabled = true;
 
     startTime = new Date();
     document.getElementById("recordingTime").style.display = "inline";
@@ -444,6 +453,7 @@ function updateUIToStopped() {
     document.getElementById("streamProtocol").disabled = false;
     document.getElementById("timelapseStartBtn").disabled = false;
     document.getElementById("transectEnableBtn").disabled = false;
+    document.getElementById("transectCaptureType").disabled = false;
 
     clearInterval(recordingTimer);
     document.getElementById("recordingTime").style.display = "none";
@@ -491,6 +501,7 @@ function updateUIToTimelapse() {
     document.getElementById("timelapseStartBtn").disabled = true;
     document.getElementById("timelapseStopBtn").disabled = false;
     document.getElementById("transectEnableBtn").disabled = true;
+    document.getElementById("transectCaptureType").disabled = true;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
 }
@@ -504,6 +515,7 @@ function updateUIToIdle() {
     document.getElementById("timelapseStopBtn").disabled = true;
     document.getElementById("transectEnableBtn").disabled = false;
     document.getElementById("transectDisableBtn").disabled = true;
+    document.getElementById("transectCaptureType").disabled = false;
     document.getElementById("containerFormat").disabled = false;
     document.getElementById("streamProtocol").disabled = false;
     document.getElementById("timelapseStats").textContent = "Idle";
@@ -557,6 +569,7 @@ function updateUIToTransectArmed() {
     document.getElementById("timelapseStopBtn").disabled = true;
     document.getElementById("transectEnableBtn").disabled = true;
     document.getElementById("transectDisableBtn").disabled = false;
+    document.getElementById("transectCaptureType").disabled = true;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
 }
@@ -635,11 +648,13 @@ async function checkRecordingStatus() {
         // see what's happening at a glance.
         if (tx) {
             if (tx.enabled) {
-                const parts = [`state: ${tx.state}`];
+                const cap = tx.capture_type || tx.configured_capture_type || 'video';
+                const parts = [`state: ${tx.state}`, `capture: ${cap === 'timelapse' ? 'images' : 'video'}`];
                 if (tx.mission_seq !== null && tx.mission_seq !== undefined) {
                     parts.push(`seq: ${tx.mission_seq}`);
                 }
                 if (tx.leg_count) parts.push(`legs: ${tx.leg_count}`);
+                if (typeof tx.leg_images === 'number') parts.push(`imgs: ${tx.leg_images}`);
                 if (typeof tx.wp_dist === 'number' && tx.wp_dist > 0) {
                     parts.push(`wp_dist: ${tx.wp_dist.toFixed(1)} m`);
                 }
@@ -652,7 +667,7 @@ async function checkRecordingStatus() {
                 if (flags.length) parts.push(flags.join(' '));
                 let line = parts.join(' · ');
                 if (tx.last_event) line += `\nlast: ${tx.last_event}`;
-                if (tx.current_leg_file) line += `\nfile: ${tx.current_leg_file}`;
+                if (tx.current_leg_file) line += `\n${cap === 'timelapse' ? 'leg' : 'file'}: ${tx.current_leg_file}`;
                 document.getElementById("transectStats").textContent = line;
             } else {
                 document.getElementById("transectStats").textContent = "Disabled";
@@ -741,8 +756,32 @@ async function loadConfig() {
         if (response.data.snapshot_url) {
             document.getElementById("snapshotUrl").value = response.data.snapshot_url;
         }
+        if (response.data.transect_capture_type) {
+            document.getElementById("transectCaptureType").value = response.data.transect_capture_type;
+        }
     } catch (error) {
         console.error("Error loading config:", error);
+    }
+}
+
+async function saveTransectCaptureType() {
+    const captureType = document.getElementById("transectCaptureType").value;
+    try {
+        const response = await axios.post('/config', { transect_capture_type: captureType });
+        if (response.data.success) {
+            const badge = document.getElementById("captureTypeSaved");
+            badge.classList.add("visible");
+            setTimeout(() => badge.classList.remove("visible"), 2000);
+        } else {
+            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save capture type";
+            document.getElementById("errorMessage").style.display = "block";
+            loadConfig();
+        }
+    } catch (error) {
+        const msg = error.response?.data?.message || "Failed to save capture type";
+        document.getElementById("errorMessage").textContent = msg;
+        document.getElementById("errorMessage").style.display = "block";
+        loadConfig();
     }
 }
 
