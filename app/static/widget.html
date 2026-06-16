@@ -80,6 +80,20 @@
             animation: pulse 1.2s infinite;
         }
 
+        /* Transect monitor: blue while a leg is recording, slower-pulse
+           amber while the monitor is enabled but waiting for the boat
+           to start navigating (state == "waiting"). */
+        .rec-dot.active.transect {
+            background: #4fc3f7;
+            box-shadow: 0 0 8px #4fc3f7;
+        }
+        .rec-dot.armed-transect {
+            background: #ffd54f;
+            box-shadow: 0 0 8px #ffd54f;
+            animation: pulse 1.8s ease-in-out infinite;
+            display: inline-block;
+        }
+
         .rec-dot.active.timelapse {
             background: #fb8c00;
             animation: pulse 1.2s infinite;
@@ -105,6 +119,7 @@
 
         .duration.active { color: #ef9a9a; }
         .duration.active.timelapse { color: #ffcc80; }
+        .duration.active.transect { color: #4fc3f7; }
 
         .btn {
             width: 100%;
@@ -137,6 +152,8 @@
 
         .btn-stop.timelapse { background: #fb8c00; }
         .btn-stop.timelapse:hover:not(:disabled) { background: #ef6c00; }
+        .btn-stop.transect { background: #0288d1; }
+        .btn-stop.transect:hover:not(:disabled) { background: #01579b; }
 
         .file-info {
             margin-top: 12px;
@@ -168,6 +185,7 @@
         }
 
         .file-size.timelapse { color: #ffcc80; }
+        .file-size.transect  { color: #4fc3f7; }
 
         .stats-row {
             margin-top: 6px;
@@ -196,6 +214,7 @@
         <div class="mode-switch" id="modeSwitch">
             <button id="modeVideoBtn" class="active" onclick="setMode('video')">VIDEO</button>
             <button id="modeTimelapseBtn" onclick="setMode('timelapse')">TIMELAPSE 2 Hz</button>
+            <button id="modeTransectBtn"  onclick="setMode('transect')">TRANSECT AUTO</button>
         </div>
 
         <div class="header">
@@ -227,6 +246,7 @@ const fileSizeEl      = document.getElementById('fileSize');
 const errorMsg        = document.getElementById('errorMsg');
 const modeVideoBtn    = document.getElementById('modeVideoBtn');
 const modeTimelapseBtn= document.getElementById('modeTimelapseBtn');
+const modeTransectBtn = document.getElementById('modeTransectBtn');
 const modeTitle       = document.getElementById('modeTitle');
 const statsRow        = document.getElementById('statsRow');
 
@@ -234,14 +254,30 @@ const statsRow        = document.getElementById('statsRow');
 // reported by the server is in serverMode and overrides UI when active.
 let selectedMode = 'video';
 let serverMode   = 'idle';
+// Transect monitor state: 'disabled' | 'waiting' | 'recording'. The
+// monitor can be enabled (waiting) while serverMode is still 'idle';
+// we keep this separate so the action button correctly reads "Disable
+// Transect Auto" even before the boat starts navigating.
+let transectMonState = 'disabled';
 let startTime    = null;
 let durationTimer= null;
 
 function isActive() {
-    return serverMode === 'video' || serverMode === 'timelapse';
+    return serverMode === 'video'
+        || serverMode === 'timelapse'
+        || serverMode === 'transect';
+}
+
+function isTransectOwned() {
+    // True whenever the transect monitor is in charge -- either
+    // currently recording a leg or just waiting for the mission to
+    // start. Used so the mode-switch buttons lock to TRANSECT AUTO
+    // while the monitor is engaged.
+    return serverMode === 'transect' || transectMonState !== 'disabled';
 }
 
 function activeMode() {
+    if (isTransectOwned()) return 'transect';
     return isActive() ? serverMode : selectedMode;
 }
 
@@ -266,27 +302,46 @@ function showError(msg) {
 }
 
 function setMode(m) {
-    if (isActive()) return; // can't switch while running
+    // Block mode changes while ANY mode is engaged (manual recording,
+    // timelapse, or transect monitor enabled).
+    if (isActive() || isTransectOwned()) return;
     selectedMode = m;
     modeVideoBtn.classList.toggle('active',     m === 'video');
     modeTimelapseBtn.classList.toggle('active', m === 'timelapse');
+    modeTransectBtn.classList.toggle('active',  m === 'transect');
     renderUI();
 }
 
 function renderUI() {
     const m = activeMode();
     const active = isActive();
+    const transectOwned = isTransectOwned();
 
     if (m === 'video') {
         modeTitle.textContent = 'Video Recorder';
         actionBtn.textContent = active ? 'Stop Recording' : 'Start Recording';
-    } else {
+    } else if (m === 'timelapse') {
         modeTitle.textContent = 'Timelapse Snapshots';
         actionBtn.textContent = active ? 'Stop Timelapse' : 'Start Timelapse';
+    } else {
+        // Transect: action toggles the monitor, not the recording.
+        // Title shows the underlying sub-state so the operator can
+        // tell the difference between "armed but waiting" and "recording".
+        if (transectMonState === 'recording') {
+            modeTitle.textContent = 'Transect Auto -- Recording';
+        } else if (transectMonState === 'waiting') {
+            modeTitle.textContent = 'Transect Auto -- Waiting for AUTO';
+        } else {
+            modeTitle.textContent = 'Transect Auto';
+        }
+        actionBtn.textContent = transectOwned
+            ? 'Disable Transect Auto'
+            : 'Enable Transect Auto';
     }
 
-    actionBtn.className = 'btn ' + (active ? 'btn-stop' : 'btn-start');
+    actionBtn.className = 'btn ' + ((active || transectOwned) ? 'btn-stop' : 'btn-start');
     if (active && m === 'timelapse') actionBtn.classList.add('timelapse');
+    if (transectOwned)               actionBtn.classList.add('transect');
 
     recDot.className = 'rec-dot';
     durationEl.className = 'duration';
@@ -294,10 +349,18 @@ function renderUI() {
         recDot.classList.add('active', m);
         durationEl.classList.add('active');
         if (m === 'timelapse') durationEl.classList.add('timelapse');
+        if (m === 'transect')  durationEl.classList.add('transect');
+    } else if (transectOwned && transectMonState === 'waiting') {
+        // Distinct "armed but not yet recording" indicator.
+        recDot.classList.add('armed-transect');
     }
 
-    modeVideoBtn.disabled = active;
-    modeTimelapseBtn.disabled = active;
+    // Lock mode buttons while anything is engaged so the operator
+    // can't accidentally switch tracks mid-mission.
+    const lock = active || transectOwned;
+    modeVideoBtn.disabled = lock;
+    modeTimelapseBtn.disabled = lock;
+    modeTransectBtn.disabled = lock;
     actionBtn.disabled = false;
 }
 
@@ -325,11 +388,22 @@ async function toggleActive() {
     actionBtn.disabled = true;
     errorMsg.style.display = 'none';
 
+    // Pick endpoint based on what's *currently* engaged. Transect has
+    // its own enable/disable pair because the recording start is
+    // delegated to the monitor (it spins up a RecordingSession when
+    // the boat starts navigating, not when the user clicks).
     let endpoint;
-    if (isActive()) {
+    const transectOwned = isTransectOwned();
+    if (transectOwned) {
+        endpoint = '/transect/disable';
+    } else if (isActive()) {
         endpoint = serverMode === 'timelapse' ? '/timelapse/stop' : '/stop';
+    } else if (selectedMode === 'transect') {
+        endpoint = '/transect/enable';
+    } else if (selectedMode === 'timelapse') {
+        endpoint = '/timelapse/start';
     } else {
-        endpoint = selectedMode === 'timelapse' ? '/timelapse/start' : '/start';
+        endpoint = '/start';
     }
 
     try {
@@ -340,8 +414,14 @@ async function toggleActive() {
             actionBtn.disabled = false;
             return;
         }
-        // Optimistic UI update; pollStatus will reconcile.
-        if (endpoint.endsWith('/start') || endpoint === '/timelapse/start') {
+        // Optimistic UI update; pollStatus will reconcile within ~2 s.
+        if (endpoint === '/transect/enable') {
+            transectMonState = 'waiting';
+        } else if (endpoint === '/transect/disable') {
+            transectMonState = 'disabled';
+            serverMode = 'idle';
+            stopDurationTimer();
+        } else if (endpoint.endsWith('/start') || endpoint === '/timelapse/start') {
             serverMode = selectedMode;
             startDurationTimer();
         } else {
@@ -360,24 +440,41 @@ async function pollStatus() {
         const res  = await fetch('/status');
         const data = await res.json();
         const newMode = data.mode || (data.recording ? 'video' : 'idle');
-        const wasActive = isActive();
+        const wasActive = isActive() || isTransectOwned();
         serverMode = newMode;
+        // Capture monitor state separately so we know "monitor enabled
+        // but waiting" -- the recorder mode goes back to 'idle' between
+        // legs but the monitor is still in charge.
+        const tx = data.transect || null;
+        transectMonState = tx && tx.enabled ? (tx.state || 'waiting') : 'disabled';
 
         if (isActive()) {
             // Sync the selected mode to whatever the server is doing so
-            // the UI doesn't flip mid-recording on external start.
-            if (selectedMode !== serverMode) {
+            // the UI doesn't flip mid-recording on external start. The
+            // transect mode also locks selectedMode below.
+            if (selectedMode !== serverMode && !isTransectOwned()) {
                 selectedMode = serverMode;
                 modeVideoBtn.classList.toggle('active',     serverMode === 'video');
                 modeTimelapseBtn.classList.toggle('active', serverMode === 'timelapse');
+                modeTransectBtn.classList.toggle('active',  serverMode === 'transect');
             }
             startDurationTimer(data.duration_seconds);
-        } else if (wasActive) {
+        } else if (wasActive && !isTransectOwned()) {
             stopDurationTimer();
         }
 
+        // While the monitor is engaged, the UI should always show
+        // TRANSECT AUTO as the selected mode so the button labels and
+        // colours line up.
+        if (isTransectOwned()) {
+            selectedMode = 'transect';
+            modeVideoBtn.classList.toggle('active',     false);
+            modeTimelapseBtn.classList.toggle('active', false);
+            modeTransectBtn.classList.toggle('active',  true);
+        }
+
         // Stats line
-        if (serverMode === 'video') {
+        if (serverMode === 'video' && !isTransectOwned()) {
             const restarts = data.restarts || 0;
             const errs = data.gst_errors || 0;
             const stalls = data.file_stalls || 0;
@@ -401,6 +498,24 @@ async function pollStatus() {
             }
             parts.push(`free: ${data.disk_free_mb || 0} MB`);
             statsRow.innerHTML = parts.join(' &middot; ');
+        } else if (isTransectOwned()) {
+            // Transect status line: state, current seq + leg count,
+            // wp_dist when navigating, AUTO/armed flags, and the most
+            // recent event so the operator can see what just happened.
+            const parts = [`state: <strong>${tx.state}</strong>`];
+            if (tx.mission_seq !== null && tx.mission_seq !== undefined) {
+                parts.push(`seq: ${tx.mission_seq}`);
+            }
+            if (tx.leg_count > 0) parts.push(`legs: ${tx.leg_count}`);
+            if (typeof tx.wp_dist === 'number' && tx.wp_dist > 0) {
+                parts.push(`wp_dist: ${tx.wp_dist.toFixed(1)} m`);
+            }
+            const flags = [];
+            if (tx.mode_num !== 10) flags.push(`mode=${tx.mode_num}`);
+            if (tx.armed === false) flags.push('disarmed');
+            if (flags.length) parts.push(`<span class="warn">${flags.join(' ')}</span>`);
+            parts.push(`free: ${data.disk_free_mb || 0} MB`);
+            statsRow.innerHTML = parts.join(' &middot; ');
         } else {
             statsRow.innerHTML = '';
         }
@@ -421,10 +536,12 @@ async function pollFileSize() {
             fileNameEl.textContent = label;
             fileSizeEl.textContent = formatBytes(data.size_bytes);
             fileSizeEl.classList.toggle('timelapse', data.mode === 'timelapse');
+            fileSizeEl.classList.toggle('transect',  data.mode === 'transect');
         } else {
             fileNameEl.textContent = 'No files yet';
             fileSizeEl.textContent = '';
             fileSizeEl.classList.remove('timelapse');
+            fileSizeEl.classList.remove('transect');
         }
     } catch (_) {}
 }

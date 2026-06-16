@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 MODE_IDLE = "idle"
 MODE_VIDEO = "video"
 MODE_TIMELAPSE = "timelapse"
+# Automatic recording mode: the recorder watches the tow vehicle's
+# mission state via mavlink2rest and drives a RecordingSession on its
+# own (one .ts file per waypoint leg, rolled at each MISSION_CURRENT.seq
+# change). Mutually exclusive with both manual MODE_VIDEO and
+# MODE_TIMELAPSE.
+MODE_TRANSECT = "transect"
 
 _mode_lock = threading.Lock()
 mode = MODE_IDLE
@@ -149,6 +155,117 @@ def _blueboat_attitude_url():
 
 def _blueboat_vfr_hud_url():
     return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/VFR_HUD'
+
+def _tow_mavlink_url(msg_name):
+    """Compose a mavlink2rest URL on the tow vehicle for one message name.
+
+    Used by ``get_mission_state()`` to read mission/navigation messages
+    from the ArduRover-based tow vehicle (HEARTBEAT, MISSION_CURRENT,
+    NAV_CONTROLLER_OUTPUT, ...). Same host as the BlueBoat GPS / VFR_HUD
+    helpers above.
+    """
+    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/{msg_name}'
+
+# ── ArduRover constants ──────────────────────────────────────────────────
+# Custom mode numbers for ArduRover (Plane / Sub / Copter use different
+# tables). AUTO is the only mode we care about for transect triggering.
+# See https://ardupilot.org/rover/docs/parameters.html#mode-rc-or-channel
+ROVER_MODE_AUTO = 10
+# base_mode field on HEARTBEAT: bit 0x80 == MAV_MODE_FLAG_SAFETY_ARMED
+MAV_MODE_FLAG_SAFETY_ARMED = 0x80
+
+# How long ``get_mission_state()`` waits for one mavlink2rest GET. Has to
+# stay short: the TransectMonitor calls this at ~3 Hz, and the tow vehicle
+# can briefly be slow when MAVLink is congested mid-mission.
+_MISSION_HTTP_TIMEOUT_S = 0.6
+
+def _mav_get_message(url):
+    """Single mavlink2rest GET, returning the ``message`` dict or None.
+
+    ``NAV_CONTROLLER_OUTPUT`` returns an empty body (zero bytes) when the
+    autopilot is idle, which json.loads chokes on; we treat any unparseable
+    or non-200 response as "not currently available" rather than an error.
+    """
+    try:
+        resp = requests.get(url, timeout=_MISSION_HTTP_TIMEOUT_S)
+        if resp.status_code != 200 or not resp.content:
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        msg = data.get('message')
+        if not isinstance(msg, dict):
+            return None
+        # Stash the freshness timestamp on the dict so callers (the
+        # STATUSTEXT dedup, in particular) can tell whether the same
+        # payload was reposted vs a genuinely new sample.
+        msg['__last_update'] = (data.get('status', {})
+                                 .get('time', {})
+                                 .get('last_update'))
+        return msg
+    except Exception as e:
+        logger.debug("mavlink2rest GET %s failed: %s", url, e)
+        return None
+
+def _decode_statustext(msg):
+    """Assemble the array-of-chars STATUSTEXT payload into a Python string.
+
+    mavlink2rest serialises STATUSTEXT.text as a 50-element char array
+    (one JSON string per byte) and pads with NULs. Returns the trimmed
+    string or '' if the message is missing/empty.
+    """
+    if not msg:
+        return ''
+    chars = msg.get('text') or []
+    if not isinstance(chars, list):
+        return ''
+    return ''.join(c for c in chars if isinstance(c, str)).rstrip('\x00').rstrip()
+
+def get_mission_state():
+    """Snapshot the tow vehicle's mission/navigation state.
+
+    Returns a dict with every key always present (Nones where unavailable)
+    so the TransectMonitor state machine can read it without defensive
+    .get() chains. Designed to be safe to call ~3 Hz from a background
+    thread; each underlying GET is bounded by ``_MISSION_HTTP_TIMEOUT_S``
+    and a failure on any one message degrades that field to None rather
+    than raising.
+
+    NAV_CONTROLLER_OUTPUT is only published while the vehicle is actively
+    navigating (AUTO/GUIDED with a target), so ``wp_dist``/``target_bearing``
+    will be None during idle/HOLD even when the rest of the snapshot is
+    populated -- this is normal and the monitor's "navigating" predicate
+    uses ``wp_dist`` *or* ``groundspeed`` to handle both cases.
+    """
+    hb = _mav_get_message(_tow_mavlink_url('HEARTBEAT'))
+    mc = _mav_get_message(_tow_mavlink_url('MISSION_CURRENT'))
+    nav = _mav_get_message(_tow_mavlink_url('NAV_CONTROLLER_OUTPUT'))
+    vfr = _mav_get_message(_tow_mavlink_url('VFR_HUD'))
+    st = _mav_get_message(_tow_mavlink_url('STATUSTEXT'))
+
+    mode_num = hb.get('custom_mode') if hb else None
+    base_mode = ((hb or {}).get('base_mode') or {}).get('bits', 0) or 0
+    armed = bool(base_mode & MAV_MODE_FLAG_SAFETY_ARMED)
+
+    return {
+        'mode_num': mode_num,
+        'armed': armed,
+        'mission_seq': mc.get('seq') if mc else None,
+        'wp_dist': nav.get('wp_dist') if nav else None,
+        'target_bearing': nav.get('target_bearing') if nav else None,
+        'xtrack_error': nav.get('xtrack_error') if nav else None,
+        'groundspeed': vfr.get('groundspeed') if vfr else None,
+        'heading': vfr.get('heading') if vfr else None,
+        'statustext': _decode_statustext(st),
+        # Used by the monitor to dedup STATUSTEXT (mavlink2rest holds
+        # only the *latest* string, so the same "Reached waypoint #N"
+        # payload can be served for many seconds; the timestamp lets us
+        # tell whether it's actually new).
+        'statustext_time': (st or {}).get('__last_update'),
+        'statustext_severity': (((st or {}).get('severity') or {})
+                                 .get('type')),
+    }
 
 _cfg = load_config()
 tow_vehicle_ip = _cfg["tow_vehicle_ip"]
@@ -978,7 +1095,7 @@ class RecordingSession:
                  container_fmt, proto):
         self._rtsp_url = rtsp_url
         self._out_dir = out_dir
-        self._base_filename = base_filename  # "video_rtsp_<TS>"
+        self._base_filename = base_filename  # "video_rtsp_<TS>" or "transect_<TS>"
         self._ext = ext  # ".ts" or ".mp4"
         self._container_fmt = container_fmt
         self._proto = proto
@@ -990,6 +1107,12 @@ class RecordingSession:
         self._pipeline = None
         self._muxsink = None
         self._current_part = 0
+        # Optional label appended to the next fragment filename. The
+        # TransectMonitor flips this via :meth:`split_now` to tag each
+        # leg's .ts file with its WP index, e.g. ``_wp03``. None means
+        # "no extra label", which preserves the historical naming for
+        # the manual /start path.
+        self._next_label = None
         self.restart_count = 0
         self.last_pattern = None
         self.last_exit = None
@@ -999,6 +1122,9 @@ class RecordingSession:
         self.gst_errors = 0
         self.gst_warnings = 0
         self.file_stalls = 0
+        # Counts splitmuxsink ``split-now`` invocations so /status can
+        # show how many legs a transect session has rolled.
+        self.split_count = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1023,15 +1149,59 @@ class RecordingSession:
             if self._thread.is_alive():
                 logger.warning("RecordingSession watchdog did not exit in %.1fs", timeout_s)
 
+    def split_now(self, label=None):
+        """Roll a fresh fragment immediately, stamping the next file with ``label``.
+
+        Used by :class:`TransectMonitor` at each waypoint boundary so the
+        upcoming ``.ts`` file carries the new WP index in its filename
+        (e.g. ``transect_<TS>_part03_00000_wp03.ts``). The existing
+        ``splitmuxsink`` keeps the RTSP pipeline alive across the split,
+        so the only "missing" footage is the few hundred ms the muxer
+        spends rotating to the next file at an IDR boundary.
+
+        Safe to call from any thread: ``_next_label`` is set under the
+        same lock the format-location callback observes, and the
+        ``split-now`` action signal is async (the muxer dispatches it
+        to its streaming thread, which then calls back into
+        ``_on_format_location``).
+
+        No-op if the pipeline isn't running yet (the very first part
+        comes up naturally on PLAYING).
+        """
+        with self._lock:
+            self._next_label = label
+            mux = self._muxsink
+        if mux is None:
+            return False
+        try:
+            mux.emit("split-now")
+            self.split_count += 1
+            log_event("split_now", f"label={label}")
+            return True
+        except Exception:
+            logger.exception("splitmuxsink split-now emit failed")
+            return False
+
     # ------------------------------------------------------------------
     # splitmuxsink format-location callback
     # ------------------------------------------------------------------
     def _on_format_location(self, _splitmux, fragment_id):
-        """Compose the on-disk path for the next .ts/.mp4 fragment."""
+        """Compose the on-disk path for the next .ts/.mp4 fragment.
+
+        Honours ``self._next_label`` -- set by :meth:`split_now` from the
+        transect monitor -- so each leg's file is named with its WP
+        index (``..._wp03.ts``). Reads-and-clears the label atomically
+        under the same lock ``split_now`` uses, so a second split that
+        fires while we're still composing this path can't lose its label.
+        """
+        with self._lock:
+            label = self._next_label
+            self._next_label = None
+        label_part = f"_{label}" if label else ""
         path = os.path.join(
             self._out_dir,
             f"{self._base_filename}_part{self._current_part:02d}_"
-            f"{int(fragment_id):05d}{self._ext}",
+            f"{int(fragment_id):05d}{label_part}{self._ext}",
         )
         self.last_pattern = path
         if self.first_part_path is None:
@@ -1699,17 +1869,25 @@ def config():
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 
-@app.route('/start', methods=['GET'])
-def start():
-    """Start an H.264 recording session.
+# ── Shared video-session lifecycle helpers ───────────────────────────────
+# Used by both the manual ``/start`` & ``/stop`` Flask routes *and* the
+# automatic ``TransectMonitor``. Both helpers assume the caller already
+# holds ``_mode_lock`` so the transect monitor and HTTP routes can never
+# race each other into a half-open state.
+def _start_video_session(base_prefix, target_mode, initial_label=None):
+    """Stand up a new RecordingSession + sidecars; flip ``mode`` to ``target_mode``.
 
-    Mutually exclusive with timelapse mode (HTTP 409 if a timelapse
-    is already running). The actual GStreamer pipeline lives in a
-    background ``RecordingSession`` watchdog thread that auto-restarts
-    on RTSP drops or file stalls; this handler only sets up sidecars
-    and kicks the watchdog off. Only the /stop route ever asks the
-    session to actually stop -- every other exit (ERROR/EOS/stall)
-    is treated as something the watchdog should recover from.
+    Returns the anchor path of the (yet-to-exist) first part. Raises on
+    failure, after cleaning up any partial state the caller would
+    otherwise have to undo. ``base_prefix`` is the filename root (e.g.
+    ``video_rtsp`` for manual recording or ``transect_<TS>`` for the
+    monitor); ``target_mode`` is the mode the caller wants to be in once
+    the session is live (``MODE_VIDEO`` or ``MODE_TRANSECT``).
+
+    ``initial_label`` (optional) is the first leg label the transect
+    monitor wants stamped onto the very first .ts file -- e.g. ``wp01``.
+    Without it the historical "no label" naming is preserved for the
+    manual recording path.
     """
     global recording, start_time
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
@@ -1718,97 +1896,88 @@ def start():
     global ass_thread, stop_ass_thread, current_ass_file, ass_subtitle_counter
     global _session
 
-    with _mode_lock:
-        if mode == MODE_VIDEO:
-            return jsonify({"success": False, "message": "Already recording"}), 400
-        if mode == MODE_TIMELAPSE:
-            return jsonify({"success": False,
-                            "message": "Timelapse is active; stop it first"}), 409
-        try:
-            os.makedirs("/app/videorecordings", exist_ok=True)
+    os.makedirs("/app/videorecordings", exist_ok=True)
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            ext = ".ts" if container_format == "mpegts" else ".mp4"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = ".ts" if container_format == "mpegts" else ".mp4"
 
-            base_filename = f"video_rtsp_{timestamp}"
-            # Sidecars are named off the *first* part path so the existing
-            # post-processing helpers (adjust_srt_timing, etc.) keep their
-            # historical pair-by-name relationship.
-            anchor_path = os.path.join("/app/videorecordings",
-                                       f"{base_filename}_part00_00000{ext}")
-            current_video_file_rtsp = anchor_path
+    base_filename = f"{base_prefix}_{timestamp}"
+    label_suffix = f"_{initial_label}" if initial_label else ""
+    # Sidecars are named off the *first* part path so the existing
+    # post-processing helpers (adjust_srt_timing, etc.) keep their
+    # historical pair-by-name relationship.
+    anchor_path = os.path.join("/app/videorecordings",
+                               f"{base_filename}_part00_00000{label_suffix}{ext}")
+    current_video_file_rtsp = anchor_path
 
-            current_srt_file_rtsp = create_srt_file(anchor_path)
-            srt_subtitle_counter = 0
-            current_isp_log_file = create_isp_log_file(anchor_path)
-            current_ass_file = create_ass_file(anchor_path)
-            ass_subtitle_counter = 0
-            current_events_file = create_events_file(anchor_path)
+    current_srt_file_rtsp = create_srt_file(anchor_path)
+    srt_subtitle_counter = 0
+    current_isp_log_file = create_isp_log_file(anchor_path)
+    current_ass_file = create_ass_file(anchor_path)
+    ass_subtitle_counter = 0
+    current_events_file = create_events_file(anchor_path)
 
-            log_event("recording_starting",
-                      f"container={container_format} proto={stream_protocol}")
+    log_event("recording_starting",
+              f"container={container_format} proto={stream_protocol} "
+              f"mode={target_mode} prefix={base_prefix}")
 
-            session = RecordingSession(
-                rtsp_url=RTSP_ENDPOINT,
-                out_dir="/app/videorecordings",
-                base_filename=base_filename,
-                ext=ext,
-                container_fmt=container_format,
-                proto=stream_protocol,
-            )
-            try:
-                session.start()
-            except Exception as e:
-                logger.exception("Failed to start RecordingSession")
-                _set_mode(MODE_IDLE)
-                _session = None
-                current_srt_file_rtsp = None
-                current_video_file_rtsp = None
-                current_isp_log_file = None
-                current_ass_file = None
-                current_events_file = None
-                return jsonify({"success": False, "message": str(e)}), 500
+    session = RecordingSession(
+        rtsp_url=RTSP_ENDPOINT,
+        out_dir="/app/videorecordings",
+        base_filename=base_filename,
+        ext=ext,
+        container_fmt=container_format,
+        proto=stream_protocol,
+    )
+    # Pre-seed the first leg's label so the very first ``_on_format_location``
+    # callback (which happens before the monitor sees its first state
+    # transition) already names the file with the WP index.
+    if initial_label:
+        session._next_label = initial_label
+    try:
+        session.start()
+    except Exception:
+        logger.exception("Failed to start RecordingSession")
+        _set_mode(MODE_IDLE)
+        _session = None
+        current_srt_file_rtsp = None
+        current_video_file_rtsp = None
+        current_isp_log_file = None
+        current_ass_file = None
+        current_events_file = None
+        raise
 
-            _session = session
-            _set_mode(MODE_VIDEO)
-            recording = True
-            start_time = datetime.now()
+    _session = session
+    _set_mode(target_mode)
+    recording = True
+    start_time = datetime.now()
 
-            stop_srt_thread = False
-            srt_thread = threading.Thread(target=update_srt_file, daemon=True)
-            srt_thread.start()
+    stop_srt_thread = False
+    srt_thread = threading.Thread(target=update_srt_file, daemon=True)
+    srt_thread.start()
 
-            stop_isp_log_thread = False
-            isp_log_thread = threading.Thread(target=update_isp_log, daemon=True)
-            isp_log_thread.start()
+    stop_isp_log_thread = False
+    isp_log_thread = threading.Thread(target=update_isp_log, daemon=True)
+    isp_log_thread.start()
 
-            stop_ass_thread = False
-            ass_thread = threading.Thread(target=update_ass_file, daemon=True)
-            ass_thread.start()
+    stop_ass_thread = False
+    ass_thread = threading.Thread(target=update_ass_file, daemon=True)
+    ass_thread.start()
 
-            log_event("recording_started", f"anchor={anchor_path}")
-            logger.info("Recording started: anchor=%s", anchor_path)
-            return jsonify({"success": True})
-        except Exception as e:
-            logger.exception("Error in /start")
-            _set_mode(MODE_IDLE)
-            _session = None
-            recording = False
-            start_time = None
-            current_srt_file_rtsp = None
-            current_video_file_rtsp = None
-            current_isp_log_file = None
-            current_ass_file = None
-            current_events_file = None
-            return jsonify({"success": False, "message": str(e)}), 500
+    log_event("recording_started", f"anchor={anchor_path}")
+    logger.info("Recording started: anchor=%s", anchor_path)
+    return anchor_path
 
-@app.route('/stop', methods=['GET'])
-def stop():
-    """Stop the active RecordingSession and finalise sidecars.
+def _stop_video_session():
+    """Tear down the active RecordingSession + sidecars; flip ``mode`` to IDLE.
 
-    Sidecar timing is adjusted across the *sum of all part durations*
-    so SRT/ASS scaling stays accurate even when the watchdog rebuilt
-    the pipeline (RTSP drop) one or more times during the session.
+    Drives the same post-processing the legacy ``/stop`` route did
+    (sidecar joins, splitmuxsink finalise wait, SRT/ASS timing rescale
+    over the *sum* of part durations so the timeline still matches the
+    on-disk video even if the watchdog rebuilt the pipeline mid-session).
+    Always leaves the recorder in MODE_IDLE on exit, even when the
+    post-processing step itself raises -- so a hung helper can never
+    wedge the mode state.
     """
     global recording, start_time
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp
@@ -1817,85 +1986,517 @@ def stop():
     global ass_thread, stop_ass_thread, current_ass_file
     global _session
 
+    log_event("recording_stopping", "Stop requested")
+
+    video_anchor = current_video_file_rtsp
+    srt_path = current_srt_file_rtsp
+    ass_path = current_ass_file
+    isp_log_path = current_isp_log_file
+    events_path = current_events_file
+
+    stop_srt_thread = True
+    if srt_thread:
+        srt_thread.join(timeout=2)
+    stop_isp_log_thread = True
+    if isp_log_thread:
+        isp_log_thread.join(timeout=2)
+    stop_ass_thread = True
+    if ass_thread:
+        ass_thread.join(timeout=2)
+
+    session = _session
+    _session = None
+    if session is not None:
+        session.stop()
+        # Prefer the actual first part path the splitmuxsink callback
+        # observed; falls back to the anchor we composed at /start.
+        if session.first_part_path:
+            video_anchor = session.first_part_path
+
+    recording = False
+    start_time = None
+    current_srt_file_rtsp = None
+    current_video_file_rtsp = None
+    current_isp_log_file = None
+    current_ass_file = None
+    current_events_file = None
+    _set_mode(MODE_IDLE)
+
+    if isp_log_path and os.path.exists(isp_log_path):
+        logger.info("ISP log file saved: %s", isp_log_path)
+    if ass_path and os.path.exists(ass_path):
+        logger.info("ASS telemetry file saved: %s", ass_path)
+    if events_path and os.path.exists(events_path):
+        logger.info("Events log saved: %s", events_path)
+
+    if video_anchor and srt_path and os.path.exists(srt_path):
+        logger.info("Starting SRT timing adjustment post-processing...")
+        time.sleep(3)  # let splitmuxsink finalise the trailing part
+        video_duration = sum_session_video_duration(video_anchor)
+        if video_duration:
+            parts = list_session_parts(video_anchor)
+            logger.info(
+                "Session video duration: %.2fs across %d part(s)",
+                video_duration, len(parts),
+            )
+            adjust_srt_timing(srt_path, video_duration)
+            if ass_path and os.path.exists(ass_path):
+                adjust_ass_timing(ass_path, video_duration)
+        else:
+            logger.warning(
+                "Could not determine session video duration, "
+                "subtitle timing not adjusted",
+            )
+
+    logger.info("Recording stopped successfully")
+
+# ── Transect monitor ─────────────────────────────────────────────────────
+# Background thread that polls the tow vehicle's mavlink2rest for mission
+# state and drives the existing RecordingSession lifecycle automatically.
+# State machine:
+#
+#   disabled  --enable--> waiting
+#   waiting   --armed+AUTO+navigating--> recording
+#   recording --MISSION_CURRENT.seq change--> recording (split_now)
+#   recording --!AUTO || disarmed || Mission Complete || nav lost--> waiting
+#   *         --disable--> disabled (stops any in-flight session)
+#
+# Per-leg .ts files are produced by emitting splitmuxsink's "split-now"
+# action signal with the new WP index stamped as the file label, so the
+# RTSP pipeline stays alive across leg boundaries -- only the few
+# hundred ms it takes the muxer to rotate at an IDR boundary is "lost".
+# ─────────────────────────────────────────────────────────────────────────
+
+# How often the monitor wakes to re-read mission state. 3 Hz gives ~330ms
+# worst-case latency between MISSION_CURRENT.seq changing and the file
+# rolling, which is much smaller than typical leg durations (>10s).
+_TRANSECT_POLL_INTERVAL_S = 0.33
+
+# NAV_CONTROLLER_OUTPUT can briefly drop out during mode transitions or
+# mavlink2rest hiccups. We tolerate this gap before declaring "nav lost"
+# and tearing the session down; without it we'd see false exits.
+_TRANSECT_NAV_LOST_GRACE_S = 5.0
+
+# Some mission items (DO_CHANGE_SPEED, condition commands, NAV_DELAY)
+# advance MISSION_CURRENT.seq without changing the navigation target.
+# If the prior "leg" was shorter than this, we don't emit a real
+# split-now; instead we just relabel the in-flight file so the WP index
+# still catches up. This avoids a long string of fractional-second
+# .ts files at mission start.
+_TRANSECT_MIN_LEG_DURATION_S = 1.0
+
+# Below this groundspeed AND when wp_dist is missing, we treat the
+# vehicle as "not navigating" -- avoids starting a session when the
+# operator armed in AUTO but the mission hasn't moved yet.
+_TRANSECT_NAV_SPEED_THRESHOLD = 0.2  # m/s
+
+
+def _transect_manifest_path(anchor_path):
+    """Sibling path of the session anchor: ``<prefix>_manifest.ndjson``.
+
+    Lives next to the leg .ts files in the same recording directory so
+    a single rsync brings the whole session.
+    """
+    base = os.path.basename(anchor_path)
+    # Strip the ``_part00_NNNNN[_wpNN].ts`` suffix off the anchor name to
+    # get a stable session prefix.
+    stem = base.split("_part00_")[0] if "_part00_" in base else os.path.splitext(base)[0]
+    return os.path.join(os.path.dirname(anchor_path), f"{stem}_manifest.ndjson")
+
+
+def _manifest_write_header(path, anchor):
+    """Truncate-and-write a one-row session header into the manifest file."""
+    with open(path, "w") as f:
+        f.write(json.dumps({
+            "ts": time.time(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "event": "session_start",
+            "anchor": os.path.basename(anchor),
+            "tow_vehicle_ip": tow_vehicle_ip,
+        }) + "\n")
+
+
+def _manifest_append(path, row):
+    """Append one JSON row (newline-terminated) to the manifest, swallowing IO errors."""
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        logger.exception("Could not append row to transect manifest")
+
+
+class TransectMonitor:
+    """Background poller that drives one RecordingSession per AUTO mission.
+
+    Designed to be cheap when idle: when ``state == "waiting"`` it just
+    GETs five mavlink2rest messages at ~3 Hz. Only flips into
+    ``"recording"`` once the tow vehicle is armed, in AUTO, and actually
+    moving toward a waypoint.
+
+    Thread safety:
+      - Mode transitions (start/stop session) are wrapped in
+        ``_mode_lock`` so they cannot interleave with the manual
+        /start, /stop, /timelapse routes.
+      - Reads of the shared ``_session`` global outside the lock are
+        only used for diagnostics or to emit ``split-now`` (the muxer
+        itself is reference-counted by GStreamer; emit-on-stale is safe).
+    """
+
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        # Public, surfaced on /status
+        self.state = "disabled"  # disabled | waiting | recording
+        self.last_event = ""
+        self.last_event_at = None
+        self.last_state = None  # last get_mission_state() snapshot
+        self.current_seq = None
+        self.leg_count = 0
+        self.session_started_at = None
+
+        # Per-leg bookkeeping
+        self._leg_started_at = None
+        self._leg_started_seq = None
+        self._leg_started_position = (None, None, None)
+        self._leg_started_heading = None
+        self._leg_started_groundspeed = None
+        self._leg_started_wp_dist = None
+        self._manifest_path = None
+
+        # STATUSTEXT dedup: mavlink2rest holds only the latest msg, so
+        # the same payload can be replayed for many seconds. We use the
+        # ``last_update`` timestamp on the wrapper as the dedup key.
+        self._last_statustext_time = None
+
+        # NAV freshness debounce (monotonic seconds).
+        self._last_nav_seen_at = None
+
+    # -- lifecycle ----------------------------------------------------
+    def enable(self):
+        """Spin up the poll thread and arm the state machine."""
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("TransectMonitor already enabled")
+        self._stop_event.clear()
+        self.state = "waiting"
+        self._note_event("monitor enabled")
+        self._thread = threading.Thread(
+            target=self._poll, name="transect-monitor", daemon=True,
+        )
+        self._thread.start()
+
+    def disable(self):
+        """Stop the poll thread and tear down any in-flight session."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=8.0)
+        self._thread = None
+        # If we were mid-recording, close it cleanly. Done under lock to
+        # avoid racing the Flask routes.
+        with _mode_lock:
+            if mode == MODE_TRANSECT:
+                try:
+                    self._close_leg(self.last_state, "monitor_disabled")
+                except Exception:
+                    logger.exception("close_leg on disable failed")
+                try:
+                    _stop_video_session()
+                except Exception:
+                    logger.exception("stop_video_session on disable failed")
+        self.state = "disabled"
+        self._note_event("monitor disabled")
+
+    # -- poll loop ----------------------------------------------------
+    def _poll(self):
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.exception("TransectMonitor tick failed")
+            # Use Event.wait so disable() can interrupt the sleep
+            # immediately instead of waiting up to _POLL_INTERVAL_S.
+            self._stop_event.wait(_TRANSECT_POLL_INTERVAL_S)
+
+    def _tick(self):
+        state = get_mission_state()
+        self.last_state = state
+
+        # STATUSTEXT: only the "new" payload matters (mavlink2rest holds
+        # last value across many polls).
+        if (state['statustext_time'] is not None
+                and state['statustext_time'] != self._last_statustext_time):
+            self._last_statustext_time = state['statustext_time']
+            self._handle_statustext(state['statustext'])
+
+        # "Are we navigating right now?" — true if wp_dist > 0 (most
+        # reliable) or if the boat is moving above the speed threshold
+        # (covers brief NAV msg dropouts during mode transitions).
+        navigating = (
+            (state['wp_dist'] is not None and state['wp_dist'] > 0)
+            or (state['groundspeed'] is not None
+                and state['groundspeed'] > _TRANSECT_NAV_SPEED_THRESHOLD)
+        )
+        if navigating:
+            self._last_nav_seen_at = time.monotonic()
+
+        is_auto = (state['mode_num'] == ROVER_MODE_AUTO)
+        is_armed = bool(state['armed'])
+
+        if self.state == "waiting":
+            if is_auto and is_armed and navigating:
+                self._enter_recording(state)
+            return
+
+        if self.state == "recording":
+            # Exit predicates -- bail out cleanly if the vehicle leaves
+            # AUTO, disarms, or appears to have stopped navigating.
+            nav_lost = (
+                self._last_nav_seen_at is not None
+                and (time.monotonic() - self._last_nav_seen_at)
+                    > _TRANSECT_NAV_LOST_GRACE_S
+            )
+            if (not is_auto) or (not is_armed) or nav_lost:
+                reasons = []
+                if not is_auto:
+                    reasons.append(f"mode!=AUTO({state['mode_num']})")
+                if not is_armed:
+                    reasons.append("disarmed")
+                if nav_lost:
+                    reasons.append("nav_lost")
+                self._exit_recording(state, ",".join(reasons) or "unknown")
+                return
+
+            # Leg boundary -- MISSION_CURRENT.seq changed.
+            if (state['mission_seq'] is not None
+                    and state['mission_seq'] != self.current_seq):
+                self._roll_leg(state)
+
+    # -- state machine transitions -----------------------------------
+    def _handle_statustext(self, txt):
+        """React to a freshly-arrived STATUSTEXT line."""
+        if not txt:
+            return
+        self._note_event(f"statustext: {txt}")
+        if "Mission Complete" in txt and self.state == "recording":
+            # Mode/disarm paths will catch this within a few ticks too,
+            # but acting on STATUSTEXT lets us finalise immediately so
+            # the trailing leg's manifest row gets the correct reason.
+            self._exit_recording(self.last_state, "mission_complete")
+
+    def _enter_recording(self, state):
+        seq = state['mission_seq'] if state['mission_seq'] is not None else 0
+        wp_label = f"wp{int(seq):02d}"
+        try:
+            with _mode_lock:
+                if mode != MODE_IDLE:
+                    self._note_event(f"cannot enter: mode={mode}")
+                    return
+                anchor = _start_video_session(
+                    base_prefix="transect",
+                    target_mode=MODE_TRANSECT,
+                    initial_label=wp_label,
+                )
+        except Exception as e:
+            logger.exception("TransectMonitor: _start_video_session failed")
+            self._note_event(f"start failed: {e}")
+            return
+
+        self._manifest_path = _transect_manifest_path(anchor)
+        try:
+            _manifest_write_header(self._manifest_path, anchor)
+        except Exception:
+            logger.exception("Manifest header write failed")
+
+        self.state = "recording"
+        self.current_seq = seq
+        self.leg_count = 1
+        self.session_started_at = datetime.now()
+        self._begin_leg(state, seq)
+        self._note_event(f"started session at wp{seq:02d}")
+
+    def _exit_recording(self, state, reason):
+        try:
+            self._close_leg(state, reason)
+        except Exception:
+            logger.exception("close_leg on exit failed")
+        try:
+            with _mode_lock:
+                if mode == MODE_TRANSECT:
+                    _stop_video_session()
+        except Exception:
+            logger.exception("stop_video_session on exit failed")
+        self.state = "waiting"
+        self.current_seq = None
+        self._leg_started_at = None
+        self._leg_started_seq = None
+        self.session_started_at = None
+        self._manifest_path = None
+        self._note_event(f"stopped session: {reason}")
+
+    def _roll_leg(self, state):
+        """Close the previous leg row and split to a new file for the new WP."""
+        prior_leg_dur = 0.0
+        if self._leg_started_at is not None:
+            prior_leg_dur = (datetime.now() - self._leg_started_at).total_seconds()
+
+        try:
+            self._close_leg(state, "next_wp")
+        except Exception:
+            logger.exception("close_leg in roll_leg failed")
+
+        new_seq = state['mission_seq']
+        wp_label = f"wp{int(new_seq):02d}"
+        session = _session  # snapshot for thread-safety
+
+        if prior_leg_dur < _TRANSECT_MIN_LEG_DURATION_S:
+            # Bursty seq advance (DO_CHANGE_SPEED, etc.). Don't emit a
+            # split-now -- just relabel the in-flight file's *next*
+            # rollover so the WP catches up once we actually move on.
+            if session is not None:
+                with session._lock:
+                    session._next_label = wp_label
+            self._note_event(
+                f"seq -> {new_seq} (no split, prior leg {prior_leg_dur:.1f}s)"
+            )
+        else:
+            if session is not None:
+                session.split_now(wp_label)
+            self._note_event(f"seq -> {new_seq} (split)")
+
+        self.current_seq = new_seq
+        self.leg_count += 1
+        self._begin_leg(state, new_seq)
+
+    # -- per-leg manifest --------------------------------------------
+    def _begin_leg(self, state, seq):
+        self._leg_started_at = datetime.now()
+        self._leg_started_seq = seq
+        self._leg_started_position = get_blueboat_gps_position()
+        self._leg_started_heading = state.get('heading')
+        self._leg_started_groundspeed = state.get('groundspeed')
+        self._leg_started_wp_dist = state.get('wp_dist')
+
+    def _close_leg(self, state, reason):
+        if self._leg_started_seq is None or not self._manifest_path:
+            return
+        end_lat, end_lon, _end_alt = get_blueboat_gps_position()
+        end_time = datetime.now()
+        end_state = state or {}
+        row = {
+            "ts": time.time(),
+            "event": "leg_close",
+            "seq": self._leg_started_seq,
+            "start_time": (self._leg_started_at.strftime(
+                "%Y-%m-%d %H:%M:%S.%f")[:-3] if self._leg_started_at else None),
+            "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "duration_s": (round((end_time - self._leg_started_at).total_seconds(), 2)
+                           if self._leg_started_at else None),
+            "start_lat": self._leg_started_position[0],
+            "start_lon": self._leg_started_position[1],
+            "end_lat": end_lat,
+            "end_lon": end_lon,
+            "heading_start": self._leg_started_heading,
+            "groundspeed_start": self._leg_started_groundspeed,
+            "wp_dist_start": self._leg_started_wp_dist,
+            "wp_dist_end": end_state.get('wp_dist'),
+            "close_reason": reason,
+            # ``last_pattern`` is the most recent path splitmuxsink
+            # opened; for the closing row this is the file the leg
+            # actually wrote to. None if the session has already torn
+            # down (shouldn't happen here, but defended).
+            "leg_file": (os.path.basename(_session.last_pattern)
+                         if _session is not None and _session.last_pattern else None),
+        }
+        _manifest_append(self._manifest_path, row)
+
+    # -- diagnostics --------------------------------------------------
+    def _note_event(self, text):
+        self.last_event = text
+        self.last_event_at = datetime.now()
+        try:
+            log_event("transect", text)
+        except Exception:
+            pass
+        logger.info("TRANSECT: %s", text)
+
+    def snapshot(self):
+        """Pull a JSON-serialisable status snapshot for /status."""
+        last = self.last_state or {}
+        return {
+            "enabled": self.state != "disabled",
+            "state": self.state,
+            "mode_num": last.get('mode_num'),
+            "armed": last.get('armed'),
+            "mission_seq": last.get('mission_seq'),
+            "wp_dist": last.get('wp_dist'),
+            "groundspeed": last.get('groundspeed'),
+            "heading": last.get('heading'),
+            "leg_count": self.leg_count,
+            "current_leg_file": (os.path.basename(_session.last_pattern)
+                                  if _session and _session.last_pattern else None),
+            "session_started_at": (self.session_started_at.isoformat()
+                                    if self.session_started_at else None),
+            "last_event": self.last_event,
+            "last_event_at": (self.last_event_at.isoformat()
+                              if self.last_event_at else None),
+            "statustext": last.get('statustext'),
+        }
+
+
+# Singleton handle, populated by /transect/enable.
+_transect_monitor = None
+
+@app.route('/start', methods=['GET'])
+def start():
+    """Start an H.264 recording session.
+
+    Mutually exclusive with timelapse and transect modes. The actual
+    GStreamer pipeline lives in a background ``RecordingSession``
+    watchdog thread that auto-restarts on RTSP drops or file stalls;
+    this handler just sets up sidecars and kicks the watchdog off via
+    :func:`_start_video_session`. Only the /stop route ever asks the
+    session to actually stop -- every other exit (ERROR/EOS/stall) is
+    treated as something the watchdog should recover from.
+    """
+    with _mode_lock:
+        if mode == MODE_VIDEO:
+            return jsonify({"success": False, "message": "Already recording"}), 400
+        if mode == MODE_TIMELAPSE:
+            return jsonify({"success": False,
+                            "message": "Timelapse is active; stop it first"}), 409
+        if mode == MODE_TRANSECT:
+            return jsonify({"success": False,
+                            "message": "Transect monitor is active; disable it first"}), 409
+        try:
+            _start_video_session(base_prefix="video_rtsp",
+                                 target_mode=MODE_VIDEO)
+            return jsonify({"success": True})
+        except Exception as e:
+            logger.exception("Error in /start")
+            return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/stop', methods=['GET'])
+def stop():
+    """Stop the active manual RecordingSession and finalise sidecars.
+
+    Only stops sessions started via /start (mode == MODE_VIDEO). A
+    transect-mode session is owned by the monitor and must be stopped
+    via /transect/disable so the monitor can update its own state
+    cleanly.
+    """
     with _mode_lock:
         if mode != MODE_VIDEO:
+            if mode == MODE_TRANSECT:
+                return jsonify({"success": False,
+                                "message": "Transect monitor is active; use /transect/disable"}), 409
             return jsonify({"success": True, "message": "Not recording"})
         try:
-            log_event("recording_stopping", "Stop requested")
-
-            video_anchor = current_video_file_rtsp
-            srt_path = current_srt_file_rtsp
-            ass_path = current_ass_file
-            isp_log_path = current_isp_log_file
-            events_path = current_events_file
-
-            stop_srt_thread = True
-            if srt_thread:
-                srt_thread.join(timeout=2)
-            stop_isp_log_thread = True
-            if isp_log_thread:
-                isp_log_thread.join(timeout=2)
-            stop_ass_thread = True
-            if ass_thread:
-                ass_thread.join(timeout=2)
-
-            session = _session
-            _session = None
-            if session is not None:
-                session.stop()
-                # Prefer the actual first part path the splitmuxsink callback
-                # observed; falls back to the anchor we composed at /start.
-                if session.first_part_path:
-                    video_anchor = session.first_part_path
-
-            recording = False
-            start_time = None
-            current_srt_file_rtsp = None
-            current_video_file_rtsp = None
-            current_isp_log_file = None
-            current_ass_file = None
-            current_events_file = None
-            _set_mode(MODE_IDLE)
-
-            if isp_log_path and os.path.exists(isp_log_path):
-                logger.info("ISP log file saved: %s", isp_log_path)
-            if ass_path and os.path.exists(ass_path):
-                logger.info("ASS telemetry file saved: %s", ass_path)
-            if events_path and os.path.exists(events_path):
-                logger.info("Events log saved: %s", events_path)
-
-            if video_anchor and srt_path and os.path.exists(srt_path):
-                logger.info("Starting SRT timing adjustment post-processing...")
-                time.sleep(3)  # let splitmuxsink finalise the trailing part
-                video_duration = sum_session_video_duration(video_anchor)
-                if video_duration:
-                    parts = list_session_parts(video_anchor)
-                    logger.info(
-                        "Session video duration: %.2fs across %d part(s)",
-                        video_duration, len(parts),
-                    )
-                    adjust_srt_timing(srt_path, video_duration)
-                    if ass_path and os.path.exists(ass_path):
-                        adjust_ass_timing(ass_path, video_duration)
-                else:
-                    logger.warning(
-                        "Could not determine session video duration, "
-                        "subtitle timing not adjusted",
-                    )
-
-            logger.info("Recording stopped successfully")
+            _stop_video_session()
             return jsonify({"success": True})
         except Exception as e:
             logger.exception("Error in /stop")
-            _session = None
-            recording = False
-            start_time = None
-            current_srt_file_rtsp = None
-            current_video_file_rtsp = None
-            current_isp_log_file = None
-            current_ass_file = None
-            current_events_file = None
-            _set_mode(MODE_IDLE)
+            # _stop_video_session resets mode to IDLE in its own finally
+            # path -- here we just surface the error to the caller.
             return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/status', methods=['GET'])
@@ -1994,6 +2595,13 @@ def get_status():
             "container_format": container_format,
             "stream_protocol": stream_protocol,
             "timelapse": timelapse_block,
+            # Per-poll snapshot of the automatic transect monitor. Null
+            # when the monitor was never enabled; otherwise contains
+            # the state machine state, last mission/nav telemetry, leg
+            # count and per-event diagnostic strings (see
+            # TransectMonitor.snapshot for the schema).
+            "transect": (_transect_monitor.snapshot()
+                         if _transect_monitor is not None else None),
         })
         resp.headers['Cache-Control'] = 'no-store'
         return resp
@@ -2069,6 +2677,22 @@ def get_filesize():
                     "success": True,
                     "filename": os.path.basename(path),
                     "size_bytes": total,
+                    "recording": True,
+                    "mode": mode,
+                })
+
+        if mode == MODE_TRANSECT:
+            sess = _session
+            if sess and sess.last_pattern and os.path.exists(sess.last_pattern):
+                path = sess.last_pattern
+                # For transect we report just the *current leg* size --
+                # one file per WP, so summing across legs would be
+                # misleading. The total-session size is implicit in the
+                # transect_*_manifest.ndjson sidecar.
+                return jsonify({
+                    "success": True,
+                    "filename": os.path.basename(path),
+                    "size_bytes": os.path.getsize(path),
                     "recording": True,
                     "mode": mode,
                 })
@@ -2189,6 +2813,57 @@ def timelapse_stop():
             logger.exception("Error in /timelapse/stop")
             _set_mode(MODE_IDLE)
             return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/transect/enable', methods=['GET', 'POST'])
+def transect_enable():
+    """Enable the automatic transect monitor.
+
+    The monitor begins polling the tow vehicle's mission state in the
+    background. It will only stand up a real RecordingSession once the
+    vehicle is armed, in AUTO, and actually navigating. Mutually
+    exclusive with manual MODE_VIDEO and MODE_TIMELAPSE.
+    """
+    global _transect_monitor
+    with _mode_lock:
+        if mode == MODE_VIDEO:
+            return jsonify({"success": False,
+                            "message": "Manual recording is active; stop it first"}), 409
+        if mode == MODE_TIMELAPSE:
+            return jsonify({"success": False,
+                            "message": "Timelapse is active; stop it first"}), 409
+        if _transect_monitor is not None and _transect_monitor.state != "disabled":
+            return jsonify({"success": False, "message": "Already enabled"}), 400
+        try:
+            if _transect_monitor is None:
+                _transect_monitor = TransectMonitor()
+            _transect_monitor.enable()
+            logger.info("Transect monitor enabled (tow_vehicle=%s)", tow_vehicle_ip)
+            return jsonify({"success": True,
+                            "state": _transect_monitor.state,
+                            "tow_vehicle_ip": tow_vehicle_ip})
+        except Exception as e:
+            logger.exception("Error in /transect/enable")
+            return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route('/transect/disable', methods=['GET', 'POST'])
+def transect_disable():
+    """Disable the automatic transect monitor.
+
+    If a session is in flight (mode == MODE_TRANSECT) it is stopped
+    cleanly via :func:`_stop_video_session` and the trailing leg's
+    manifest row is finalised first.
+    """
+    global _transect_monitor
+    if _transect_monitor is None or _transect_monitor.state == "disabled":
+        return jsonify({"success": True, "message": "Not enabled"})
+    try:
+        _transect_monitor.disable()
+        snap = _transect_monitor.snapshot()
+        logger.info("Transect monitor disabled (legs=%d)", snap.get("leg_count", 0))
+        return jsonify({"success": True, **snap})
+    except Exception as e:
+        logger.exception("Error in /transect/disable")
+        return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/widget')
 def widget():

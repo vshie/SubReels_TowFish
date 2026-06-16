@@ -167,6 +167,33 @@
             color: #555;
             margin: 6px 0;
         }
+        .transect-section {
+            margin-top: 20px;
+            padding: 12px;
+            background: #e3f2fd;
+            border-left: 4px solid #0288d1;
+            border-radius: 4px;
+        }
+        .transect-section h3 {
+            margin: 0 0 6px 0;
+            color: #01579b;
+            font-size: 1.05em;
+        }
+        .transect-stats {
+            font-family: monospace;
+            font-size: 0.9em;
+            color: #444;
+            margin-top: 6px;
+            white-space: pre-wrap;
+        }
+        button.btn-transect {
+            background: #0288d1;
+            margin-right: 8px;
+        }
+        button.btn-transect:hover:not(:disabled) {
+            background: #01579b;
+        }
+
         button.btn-timelapse {
             background-color: #fb8c00;
             color: white;
@@ -318,6 +345,25 @@
         <div class="timelapse-stats" id="timelapseStats">Idle</div>
     </div>
 
+    <div class="transect-section">
+        <h3>Transect Auto (mavlink-triggered .ts segments)</h3>
+        <p style="font-size: 0.9em; color: #555; margin-bottom: 8px;">
+            When enabled, the recorder polls the tow vehicle's mission state via
+            <code>mavlink2rest</code> and produces one <code>.ts</code> file per waypoint leg.
+            The RTSP pipeline stays alive across leg boundaries (rolled via
+            <code>splitmuxsink split-now</code> at each <code>MISSION_CURRENT.seq</code> change),
+            so the only "missing" footage is the few hundred ms the muxer needs to rotate at
+            an IDR boundary. Per-leg metadata (start/end GPS, heading, <code>wp_dist</code>) is
+            written to a sibling <code>transect_&lt;TS&gt;_manifest.ndjson</code>.
+            Mutually exclusive with manual recording and timelapse.
+        </p>
+        <div class="controls">
+            <button id="transectEnableBtn"  class="btn-transect" onclick="enableTransect()">Enable Transect Auto</button>
+            <button id="transectDisableBtn" class="btn-transect" onclick="disableTransect()" disabled>Disable Transect Auto</button>
+        </div>
+        <div class="transect-stats" id="transectStats">Disabled</div>
+    </div>
+
     <h2>Recorded Videos</h2>
     <ul id="videoList"></ul>
 
@@ -374,8 +420,9 @@ function updateUIToRecording() {
     document.getElementById("stopButton").disabled = false;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
-    // Timelapse can't run alongside video.
+    // Mutually exclusive with timelapse and transect-auto.
     document.getElementById("timelapseStartBtn").disabled = true;
+    document.getElementById("transectEnableBtn").disabled = true;
 
     startTime = new Date();
     document.getElementById("recordingTime").style.display = "inline";
@@ -396,6 +443,7 @@ function updateUIToStopped() {
     document.getElementById("containerFormat").disabled = false;
     document.getElementById("streamProtocol").disabled = false;
     document.getElementById("timelapseStartBtn").disabled = false;
+    document.getElementById("transectEnableBtn").disabled = false;
 
     clearInterval(recordingTimer);
     document.getElementById("recordingTime").style.display = "none";
@@ -442,6 +490,7 @@ function updateUIToTimelapse() {
     document.getElementById("stopButton").disabled = true;
     document.getElementById("timelapseStartBtn").disabled = true;
     document.getElementById("timelapseStopBtn").disabled = false;
+    document.getElementById("transectEnableBtn").disabled = true;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
 }
@@ -453,11 +502,63 @@ function updateUIToIdle() {
     document.getElementById("stopButton").disabled = true;
     document.getElementById("timelapseStartBtn").disabled = false;
     document.getElementById("timelapseStopBtn").disabled = true;
+    document.getElementById("transectEnableBtn").disabled = false;
+    document.getElementById("transectDisableBtn").disabled = true;
     document.getElementById("containerFormat").disabled = false;
     document.getElementById("streamProtocol").disabled = false;
     document.getElementById("timelapseStats").textContent = "Idle";
     clearInterval(recordingTimer);
     document.getElementById("recordingTime").style.display = "none";
+}
+
+// ── Transect Auto ────────────────────────────────────────────────────────
+async function enableTransect() {
+    try {
+        const res = await axios.get('/transect/enable');
+        if (res.data.success) {
+            document.getElementById("errorMessage").style.display = "none";
+            updateUIToTransectArmed();
+        } else {
+            document.getElementById("errorMessage").textContent = res.data.message || "Failed to enable transect";
+            document.getElementById("errorMessage").style.display = "block";
+        }
+    } catch (e) {
+        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Transect enable error";
+        document.getElementById("errorMessage").style.display = "block";
+    }
+}
+
+async function disableTransect() {
+    try {
+        const res = await axios.get('/transect/disable');
+        if (res.data.success) {
+            document.getElementById("errorMessage").style.display = "none";
+            updateUIToIdle();
+            document.getElementById("transectEnableBtn").disabled = false;
+            document.getElementById("transectDisableBtn").disabled = true;
+            document.getElementById("transectStats").textContent = "Disabled";
+            await fetchVideos();
+        }
+    } catch (e) {
+        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Transect disable error";
+        document.getElementById("errorMessage").style.display = "block";
+    }
+}
+
+// "Armed" = monitor enabled (state == waiting or recording). Locks the
+// manual recording / timelapse buttons since the modes are mutually
+// exclusive; lets the user only disable the monitor.
+function updateUIToTransectArmed() {
+    document.getElementById("recordingStatus").textContent = "Transect Auto";
+    document.getElementById("recordingStatus").className = "recording";
+    document.getElementById("startButton").disabled = true;
+    document.getElementById("stopButton").disabled = true;
+    document.getElementById("timelapseStartBtn").disabled = true;
+    document.getElementById("timelapseStopBtn").disabled = true;
+    document.getElementById("transectEnableBtn").disabled = true;
+    document.getElementById("transectDisableBtn").disabled = false;
+    document.getElementById("containerFormat").disabled = true;
+    document.getElementById("streamProtocol").disabled = true;
 }
 
 function updateRecordingTime() {
@@ -491,7 +592,10 @@ async function checkRecordingStatus() {
             protoSelect.value = response.data.stream_protocol;
         }
 
-        if (serverMode === 'video') {
+        const tx = response.data.transect;
+        const transectOwned = !!(tx && tx.enabled);
+
+        if (serverMode === 'video' && !transectOwned) {
             if (currentLabel !== "Recording") {
                 console.log("Detected recording started");
                 if (response.data.duration_seconds > 0) {
@@ -506,11 +610,52 @@ async function checkRecordingStatus() {
                 console.log("Detected timelapse started");
                 updateUIToTimelapse();
             }
+        } else if (transectOwned) {
+            // Cover both states: 'waiting' (monitor armed, no leg yet)
+            // and 'recording' (monitor has spun up a session). Both lock
+            // the manual buttons identically.
+            if (currentLabel !== "Transect Auto") {
+                console.log("Detected transect monitor armed");
+                updateUIToTransectArmed();
+            }
         } else {
-            if (currentLabel === "Recording" || currentLabel === "Timelapse") {
+            if (currentLabel === "Recording" || currentLabel === "Timelapse"
+                    || currentLabel === "Transect Auto") {
                 console.log("Mode returned to idle");
                 updateUIToIdle();
+                document.getElementById("transectEnableBtn").disabled = false;
+                document.getElementById("transectDisableBtn").disabled = true;
+                document.getElementById("transectStats").textContent = "Disabled";
                 await fetchVideos();
+            }
+        }
+
+        // Transect status line: state + mission seq + leg count +
+        // wp_dist + AUTO/armed flags + last event so the operator can
+        // see what's happening at a glance.
+        if (tx) {
+            if (tx.enabled) {
+                const parts = [`state: ${tx.state}`];
+                if (tx.mission_seq !== null && tx.mission_seq !== undefined) {
+                    parts.push(`seq: ${tx.mission_seq}`);
+                }
+                if (tx.leg_count) parts.push(`legs: ${tx.leg_count}`);
+                if (typeof tx.wp_dist === 'number' && tx.wp_dist > 0) {
+                    parts.push(`wp_dist: ${tx.wp_dist.toFixed(1)} m`);
+                }
+                if (typeof tx.groundspeed === 'number') {
+                    parts.push(`spd: ${tx.groundspeed.toFixed(2)} m/s`);
+                }
+                const flags = [];
+                if (tx.mode_num !== 10) flags.push(`mode=${tx.mode_num}`);
+                if (tx.armed === false) flags.push('disarmed');
+                if (flags.length) parts.push(flags.join(' '));
+                let line = parts.join(' · ');
+                if (tx.last_event) line += `\nlast: ${tx.last_event}`;
+                if (tx.current_leg_file) line += `\nfile: ${tx.current_leg_file}`;
+                document.getElementById("transectStats").textContent = line;
+            } else {
+                document.getElementById("transectStats").textContent = "Disabled";
             }
         }
 
