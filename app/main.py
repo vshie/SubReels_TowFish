@@ -298,6 +298,18 @@ transect_capture_type = _cfg["transect_capture_type"]
 # extension runs on (host.docker.internal), same as depth/altitude/temp,
 # rather than a hardcoded 192.168.2.2.
 towfish_attitude_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
+servo_output_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SERVO_OUTPUT_RAW'
+
+# Camera tilt is driven by a servo; we read its PWM from SERVO_OUTPUT_RAW
+# and map it linearly to the mount angle. Defaults: channel 16, with
+# 1100 us -> -90 deg and 1900 us -> +90 deg. Sign convention: positive =
+# camera tilted up (toward the surface). Adjust if the servo travel or
+# wiring differs in the field.
+TILT_SERVO_CHANNEL = 16
+TILT_PWM_MIN = 1100
+TILT_PWM_MAX = 1900
+TILT_ANGLE_AT_PWM_MIN = -90.0
+TILT_ANGLE_AT_PWM_MAX = 90.0
 
 # Camera ISP info endpoint
 camera_isp_url = 'http://192.168.2.10/action/getISPInfo'
@@ -764,6 +776,36 @@ def get_towfish_altitude():
     except Exception as e:
         logger.debug(f"Error fetching towfish altitude: {str(e)}")
     return 0.0
+
+def get_towfish_camera_tilt():
+    """Camera tilt (degrees) from the tilt servo PWM. Positive = up.
+
+    Reads ``SERVO_OUTPUT_RAW.servo{N}_raw`` for the configured tilt
+    channel and maps the PWM linearly onto the configured angle
+    endpoints. Returns ``None`` when the message/servo is unavailable
+    (e.g. disarmed, where the channel reports 0).
+    """
+    try:
+        response = requests.get(servo_output_url, timeout=1)
+        if response.status_code == 200:
+            message = response.json().get('message', {})
+            pwm = message.get(f'servo{TILT_SERVO_CHANNEL}_raw', None)
+            if not pwm:  # None or 0 -> servo not driven
+                return None
+            span = TILT_PWM_MAX - TILT_PWM_MIN
+            if span == 0:
+                return None
+            frac = (pwm - TILT_PWM_MIN) / span
+            angle = (TILT_ANGLE_AT_PWM_MIN
+                     + frac * (TILT_ANGLE_AT_PWM_MAX - TILT_ANGLE_AT_PWM_MIN))
+            # Clamp to the configured travel so an out-of-range PWM can't
+            # yield an absurd angle.
+            lo = min(TILT_ANGLE_AT_PWM_MIN, TILT_ANGLE_AT_PWM_MAX)
+            hi = max(TILT_ANGLE_AT_PWM_MIN, TILT_ANGLE_AT_PWM_MAX)
+            return max(lo, min(hi, angle))
+    except Exception as e:
+        logger.debug(f"Error fetching camera tilt: {str(e)}")
+    return None
 
 def create_ass_file(video_path):
     """Create a new .ass (Advanced SubStation Alpha) subtitle file for full telemetry overlay."""
@@ -1616,7 +1658,8 @@ def _decimal_deg_to_dms_rationals(deg):
     s = (m_full - m) * 60.0
     return ((d, 1), (m, 1), (int(round(s * 10000)), 10000))
 
-def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc):
+def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
+                          tilt_deg=None, depth_m=None, temp_c=None):
     """Build piexif-encoded EXIF bytes embedding the towfish position.
 
     Mirrors what ``update_srt_file`` writes into the .srt:
@@ -1632,12 +1675,17 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc):
     * ``ts_local`` / ``ts_utc`` populate ``DateTimeOriginal`` (local
       wall-clock for the operator) and ``GPSDateStamp`` /
       ``GPSTimeStamp`` (always UTC, per EXIF spec).
+    * ``tilt_deg`` (camera tilt, + = up), ``depth_m`` and ``temp_c``
+      have no standard EXIF tags, so they're bundled with the rest into
+      a human-readable ``UserComment`` / ``ImageDescription`` so any
+      viewer surfaces them.
 
     Returns ``None`` when there's nothing useful to embed.
     """
     have_gps = lat is not None and lon is not None
     have_heading = heading_deg is not None
-    if not (have_gps or have_heading):
+    have_extra = tilt_deg is not None or depth_m is not None or temp_c is not None
+    if not (have_gps or have_heading or have_extra):
         return None
 
     gps_ifd = {}
@@ -1675,6 +1723,30 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc):
         piexif.ImageIFD.Software: b"BlueOS-VideoRecorder Towfish",
     }
 
+    # Human-readable bundle: altitude, heading and camera tilt have
+    # (partial) standard tags above, but tilt/depth/temp don't, so we
+    # also write everything as plain text any viewer can show.
+    comment_parts = []
+    if have_gps:
+        comment_parts.append(f"pos={lat:.6f},{lon:.6f}")
+    if alt_m is not None:
+        comment_parts.append(f"alt={alt_m:.2f}m")
+    if have_heading:
+        comment_parts.append(f"hdg={heading_deg:.1f}deg")
+    if tilt_deg is not None:
+        comment_parts.append(f"tilt={tilt_deg:+.1f}deg")
+    if depth_m is not None:
+        comment_parts.append(f"depth={depth_m:.2f}m")
+    if temp_c is not None:
+        comment_parts.append(f"temp={temp_c:.1f}C")
+    comment_parts.append(f"utc={ts_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z")
+    comment = " ".join(comment_parts)
+    if comment:
+        comment_bytes = comment.encode('ascii', 'replace')
+        # EXIF UserComment needs an 8-byte character-code prefix.
+        exif_ifd[piexif.ExifIFD.UserComment] = b"ASCII\x00\x00\x00" + comment_bytes
+        image_ifd[piexif.ImageIFD.ImageDescription] = comment_bytes
+
     try:
         return piexif.dump({"0th": image_ifd, "Exif": exif_ifd, "GPS": gps_ifd})
     except Exception:
@@ -1684,7 +1756,7 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc):
 _TIMELAPSE_CSV_HEADER = [
     'timestamp', 'seq', 'jpg', 'size_bytes',
     'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
-    'depth_m', 'temperature_c',
+    'depth_m', 'temperature_c', 'camera_tilt_deg',
     'snap_ms', 'telem_ms', 'sync_skew_ms',
 ]
 
@@ -1828,6 +1900,7 @@ class TimelapseSession:
             tow_alt = get_towfish_altitude()
             depth = get_depth_data()
             temp = get_baro_data()
+            tilt = get_towfish_camera_tilt()
         except Exception:
             logger.exception("TIMELAPSE telemetry fetch raised")
             bb_lat = bb_lon = bb_alt = None
@@ -1836,11 +1909,12 @@ class TimelapseSession:
             tow_alt = None
             depth = None
             temp = None
+            tilt = None
         return {
             'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
             'gps_lat': gps_lat, 'gps_lon': gps_lon,
             'heading': heading, 'tow_alt': tow_alt,
-            'depth': depth, 'temp': temp,
+            'depth': depth, 'temp': temp, 'tilt': tilt,
             'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
         }
 
@@ -1920,6 +1994,7 @@ class TimelapseSession:
                 tow_alt = None
                 depth = None
                 temp = None
+                tilt = None
             else:
                 bb_lat = telemetry['bb_lat']
                 bb_lon = telemetry['bb_lon']
@@ -1930,14 +2005,16 @@ class TimelapseSession:
                 tow_alt = telemetry['tow_alt']
                 depth = telemetry['depth']
                 temp = telemetry['temp']
+                tilt = telemetry['tilt']
 
-            # Embed GPS+heading+timestamp into EXIF before writing so
-            # the on-disk JPEG is self-describing (geotagged in any
+            # Embed GPS+heading+tilt+timestamp into EXIF before writing
+            # so the on-disk JPEG is self-describing (geotagged in any
             # standard map / photo viewer). Failure here is non-fatal:
             # the raw JPEG and CSV row still get written.
             try:
                 exif_bytes = _build_gps_exif_bytes(
                     gps_lat, gps_lon, tow_alt, heading, ts_local, ts_utc,
+                    tilt_deg=tilt, depth_m=depth, temp_c=temp,
                 )
                 if exif_bytes is not None:
                     # piexif.insert with raw bytes requires either a
@@ -1997,6 +2074,7 @@ class TimelapseSession:
                         f"{heading:.1f}" if heading is not None else "",
                         f"{depth:.2f}" if depth is not None else "",
                         f"{temp:.2f}" if temp is not None else "",
+                        f"{tilt:.1f}" if tilt is not None else "",
                         f"{snap_ms:.1f}",
                         f"{telem_ms:.1f}" if telem_ms >= 0 else "",
                         f"{sync_skew_ms:.1f}" if sync_skew_ms >= 0 else "",
