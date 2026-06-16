@@ -88,6 +88,18 @@ stop_ass_thread = False
 current_ass_file = None
 ass_subtitle_counter = 0
 
+# Subtitle timing reference. SRT/ASS entries are timestamped relative to
+# this epoch and (re)scaled to the encoded video duration when a file is
+# finalised. For manual recording it equals ``start_time`` for the whole
+# session; in transect mode it is reset at every leg rollover so each
+# per-leg ``.srt``/``.ass`` starts at 00:00.
+sidecar_epoch = None
+# Guards swaps of the current_srt_file_rtsp / current_ass_file / counters
+# / sidecar_epoch globals against the SRT/ASS writer threads while a leg
+# rotates its sidecars. Re-entrant so the writer can hold it across its
+# cheap bookkeeping section.
+_sidecar_lock = threading.RLock()
+
 # RTSP endpoint for the RadCam video stream. The camera was reconfigured
 # so ``stream_0`` now serves H.264 (was H.265) -- the H.264 path is the
 # only one ``_build_pipeline_description`` knows about. Variable name kept
@@ -786,15 +798,32 @@ def parse_ass_timestamp(ts):
     return hours * 3600 + minutes * 60 + seconds + centiseconds / 100.0
 
 def update_ass_file():
-    """Update ASS file with comprehensive labeled telemetry at 5 Hz."""
-    global stop_ass_thread, current_ass_file, ass_subtitle_counter
+    """Update ASS overlay with labeled telemetry at 5 Hz.
+
+    Like the SRT writer, timestamps are relative to ``sidecar_epoch``
+    (reset per leg in transect mode). Any field whose source is not fresh
+    is rendered blank ("--") rather than re-using the last value, so the
+    overlay never shows stale numbers during a telemetry dropout.
+    """
+    global stop_ass_thread, ass_subtitle_counter
 
     ass_update_rate = 5
 
-    while not stop_ass_thread and recording and current_ass_file:
+    while not stop_ass_thread and recording:
         try:
-            if start_time:
-                elapsed = (datetime.now() - start_time).total_seconds()
+            with _sidecar_lock:
+                ass_path = current_ass_file
+                epoch = sidecar_epoch
+                if ass_path and epoch:
+                    ass_subtitle_counter += 1
+                    elapsed = (datetime.now() - epoch).total_seconds()
+                    if elapsed < 0:
+                        elapsed = 0.0
+                    have_entry = True
+                else:
+                    have_entry = False
+
+            if have_entry:
                 start_ts = format_ass_timestamp(elapsed)
                 end_ts = format_ass_timestamp(elapsed + 1 / ass_update_rate)
 
@@ -809,8 +838,13 @@ def update_ass_file():
 
                 tf_yaw = f"Yaw:{tf_att['yaw']:.1f}" if 'yaw' in tf_att else "Yaw:--"
                 tf_roll = f"Roll:{tf_att['roll']:.1f}" if 'roll' in tf_att else "Roll:--"
-                tf_parts = f"TF {tf_yaw} {tf_roll} Dep:{tf_depth:.1f} Clm:{tf_climb:.2f} Tmp:{tf_temp:.1f}"
+                tf_dep = f"Dep:{tf_depth:.1f}" if tf_depth is not None else "Dep:--"
+                tf_clm = f"Clm:{tf_climb:.2f}" if tf_climb is not None else "Clm:--"
+                tf_tmp = f"Tmp:{tf_temp:.1f}" if tf_temp is not None else "Tmp:--"
+                tf_parts = f"TF {tf_yaw} {tf_roll} {tf_dep} {tf_clm} {tf_tmp}"
 
+                # BlueBoat fields come from the tow vehicle -- blank them
+                # when not fresh rather than holding the last fix.
                 bb_gps = f"{bb_lat:.6f},{bb_lon:.6f}" if bb_lat is not None else "--,--"
                 bb_yaw = f"Yaw:{bb_att['yaw']:.1f}" if 'yaw' in bb_att else "Yaw:--"
                 bb_pitch = f"Pitch:{bb_att['pitch']:.1f}" if 'pitch' in bb_att else "Pitch:--"
@@ -818,12 +852,13 @@ def update_ass_file():
                 bb_parts = f"BB {bb_gps} {bb_yaw} {bb_pitch} {bb_speed}"
 
                 text = f"{tf_parts} | {bb_parts}"
-
-                ass_subtitle_counter += 1
                 line = f"Dialogue: 0,{start_ts},{end_ts},Telem,,0,0,0,,{text}\n"
 
-                with open(current_ass_file, 'a') as f:
-                    f.write(line)
+                try:
+                    with open(ass_path, 'a') as f:
+                        f.write(line)
+                except Exception as e:
+                    logger.debug("ASS append failed (%s): %s", ass_path, e)
 
             time.sleep(1 / ass_update_rate)
         except Exception as e:
@@ -878,48 +913,72 @@ def adjust_ass_timing(ass_path, video_duration):
         return False
 
 def update_srt_file():
-    """Update SRT file with position data for WebODM processing, synced to video recording"""
-    global stop_srt_thread, current_srt_file_rtsp, start_time, srt_subtitle_counter
-    
+    """Append position data to the active SRT, synced to video recording.
+
+    Timestamps are relative to ``sidecar_epoch`` (reset per leg in
+    transect mode), then rescaled to the encoded duration when the file
+    is finalised. When tow-vehicle telemetry is *not fresh* (GPS fetch
+    failed/timed out) the entry is written with EMPTY position values
+    rather than carrying the last known fix forward -- gaps stay explicit
+    and never get back-filled with stale coordinates.
+    """
+    global stop_srt_thread, srt_subtitle_counter
+
     srt_update_rate = 5  # Updates per second (5 Hz for position data)
-    
-    while not stop_srt_thread and recording and current_srt_file_rtsp:
+
+    while not stop_srt_thread and recording:
         try:
-            if start_time:
-                elapsed = (datetime.now() - start_time).total_seconds()
+            # Cheap bookkeeping under the lock: capture the file + epoch
+            # and claim a sequence number atomically so a concurrent leg
+            # rotation can't interleave a half-written entry.
+            with _sidecar_lock:
+                srt_path = current_srt_file_rtsp
+                epoch = sidecar_epoch
+                if srt_path and epoch:
+                    srt_subtitle_counter += 1
+                    entry_num = srt_subtitle_counter
+                    elapsed = (datetime.now() - epoch).total_seconds()
+                    if elapsed < 0:
+                        elapsed = 0.0
+                else:
+                    entry_num = None
+
+            if entry_num is not None:
                 start_timestamp = format_srt_timestamp(elapsed)
-                end_timestamp = format_srt_timestamp(elapsed + 1/srt_update_rate)
-                
-                # Get BlueBoat position and towfish heading
+                end_timestamp = format_srt_timestamp(elapsed + 1 / srt_update_rate)
+
+                # Fresh fetch every iteration; (None, None, _) means the
+                # tow vehicle is unreachable / data is stale.
                 lat, lon, _ = get_blueboat_gps_position()
                 heading = get_towfish_heading()
-                
-                # Get towfish altitude (negative value when underwater)
                 towfish_alt = get_towfish_altitude()
-                
+
                 if lat is not None and lon is not None:
-                    # Calculate offset position if heading available
                     if heading is not None:
                         offset_lat, offset_lon = calculate_offset_position(lat, lon, heading, 4.0)
                     else:
                         offset_lat, offset_lon = lat, lon
-                    
-                    srt_subtitle_counter += 1
-                    
-                    # Format SRT entry for WebODM (ODM SRT parser expects latitude/longitude/altitude keys)
-                    # Format: latitude: 37.123456 longitude: -122.123456 altitude: -5.2
-                    srt_entry = (
-                        f"{srt_subtitle_counter}\n"
-                        f"{start_timestamp} --> {end_timestamp}\n"
-                        f"latitude: {offset_lat:.6f} longitude: {offset_lon:.6f} altitude: {towfish_alt:.1f}\n"
-                        f"\n"
-                    )
-                    
-                    # Append to SRT file
-                    with open(current_srt_file_rtsp, 'a') as f:
+                    alt_str = f"{towfish_alt:.1f}" if towfish_alt is not None else ""
+                    pos_line = (f"latitude: {offset_lat:.6f} "
+                                f"longitude: {offset_lon:.6f} "
+                                f"altitude: {alt_str}")
+                else:
+                    # Not fresh -> empty values (no stale carry-forward).
+                    pos_line = "latitude:  longitude:  altitude: "
+
+                srt_entry = (
+                    f"{entry_num}\n"
+                    f"{start_timestamp} --> {end_timestamp}\n"
+                    f"{pos_line}\n"
+                    f"\n"
+                )
+                try:
+                    with open(srt_path, 'a') as f:
                         f.write(srt_entry)
-                
-            time.sleep(1/srt_update_rate)
+                except Exception as e:
+                    logger.debug("SRT append failed (%s): %s", srt_path, e)
+
+            time.sleep(1 / srt_update_rate)
         except Exception as e:
             logger.error(f"Error updating SRT file: {str(e)}")
             time.sleep(1)
@@ -1082,6 +1141,79 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsin
         f"async-finalize=false"
     )
 
+def _finalize_leg_sidecars(srt_path, ass_path, ts_path):
+    """Rescale a closed leg's SRT/ASS to that leg's encoded duration.
+
+    Runs in a short-lived daemon thread. ``splitmuxsink`` finalises the
+    ``.ts`` around the time the next fragment opens, so we briefly poll
+    for a stable, non-empty file before asking ffprobe for its duration.
+    A missing duration leaves the (unscaled, wall-clock-timed) sidecars
+    in place rather than corrupting them.
+    """
+    try:
+        duration = None
+        deadline = time.monotonic() + 8.0
+        last_size = -1
+        while time.monotonic() < deadline:
+            if ts_path and os.path.exists(ts_path):
+                sz = os.path.getsize(ts_path)
+                if sz > 0 and sz == last_size:
+                    duration = get_video_duration(ts_path)
+                    if duration:
+                        break
+                last_size = sz
+            time.sleep(0.5)
+        if not duration and ts_path and os.path.exists(ts_path):
+            duration = get_video_duration(ts_path)
+        if duration:
+            if srt_path and os.path.exists(srt_path):
+                adjust_srt_timing(srt_path, duration)
+            if ass_path and os.path.exists(ass_path):
+                adjust_ass_timing(ass_path, duration)
+            logger.info("Per-leg sidecars finalised for %s (%.2fs)",
+                        os.path.basename(ts_path) if ts_path else "?", duration)
+        else:
+            logger.warning("Per-leg finalise: no duration for %s, sidecars left unscaled",
+                           ts_path)
+    except Exception:
+        logger.exception("Per-leg sidecar finalise failed")
+
+
+def _rotate_leg_sidecars(prev_ts_path, new_ts_path):
+    """Swap SRT/ASS to a new leg file, finalising the previous leg's pair.
+
+    Called from the ``splitmuxsink`` format-location callback (GStreamer
+    streaming thread) when a new leg ``.ts`` opens. Kept cheap: creates
+    the new empty sidecars, repoints the globals under ``_sidecar_lock``
+    (resetting counters + ``sidecar_epoch`` so the new leg starts at
+    00:00), and hands the just-closed pair to a background finaliser so
+    ffprobe never blocks the streaming thread.
+    """
+    global current_srt_file_rtsp, current_ass_file
+    global srt_subtitle_counter, ass_subtitle_counter, sidecar_epoch
+
+    with _sidecar_lock:
+        old_srt = current_srt_file_rtsp
+        old_ass = current_ass_file
+
+    new_srt = create_srt_file(new_ts_path)
+    new_ass = create_ass_file(new_ts_path)
+
+    with _sidecar_lock:
+        current_srt_file_rtsp = new_srt
+        current_ass_file = new_ass
+        srt_subtitle_counter = 0
+        ass_subtitle_counter = 0
+        sidecar_epoch = datetime.now()
+
+    threading.Thread(
+        target=_finalize_leg_sidecars,
+        args=(old_srt, old_ass, prev_ts_path),
+        name="leg-sidecar-finalise", daemon=True,
+    ).start()
+    log_event("leg_sidecars_rotated", os.path.basename(new_ts_path))
+
+
 class RecordingSession:
     """One logical recording (one /start ... /stop call).
 
@@ -1092,13 +1224,23 @@ class RecordingSession:
     """
 
     def __init__(self, rtsp_url, out_dir, base_filename, ext,
-                 container_fmt, proto):
+                 container_fmt, proto, per_leg_sidecars=False):
         self._rtsp_url = rtsp_url
         self._out_dir = out_dir
         self._base_filename = base_filename  # "video_rtsp_<TS>" or "transect_<TS>"
         self._ext = ext  # ".ts" or ".mp4"
         self._container_fmt = container_fmt
         self._proto = proto
+        # When True (transect mode), every fragment after the first gets
+        # its own fresh SRT/ASS sidecar named to match, and the previous
+        # fragment's sidecars are finalised to that file's duration. When
+        # False (manual recording), one sidecar set spans the whole
+        # session and is rescaled over the sum of part durations at /stop.
+        self.per_leg_sidecars = per_leg_sidecars
+        # Counts fragments splitmuxsink has opened this session; the first
+        # already has sidecars created at /start, so rotation only kicks
+        # in from the second fragment onward.
+        self._fragment_count = 0
 
         self._stop_event = threading.Event()
         self._thread = None
@@ -1203,10 +1345,21 @@ class RecordingSession:
             f"{self._base_filename}_part{self._current_part:02d}_"
             f"{int(fragment_id):05d}{label_part}{self._ext}",
         )
+        prev_path = self.last_pattern
         self.last_pattern = path
         if self.first_part_path is None:
             self.first_part_path = path
+        self._fragment_count += 1
         log_event("part_opened", path)
+        # Per-leg sidecar rotation (transect only): when a new leg file
+        # opens, hand the just-closed file's SRT/ASS to a background
+        # finaliser and start fresh sidecars matching the new file. The
+        # first fragment is skipped -- its sidecars were created at /start.
+        if self.per_leg_sidecars and self._fragment_count > 1:
+            try:
+                _rotate_leg_sidecars(prev_path, path)
+            except Exception:
+                logger.exception("per-leg sidecar rotation failed")
         return path
 
     # ------------------------------------------------------------------
@@ -1874,7 +2027,8 @@ def config():
 # automatic ``TransectMonitor``. Both helpers assume the caller already
 # holds ``_mode_lock`` so the transect monitor and HTTP routes can never
 # race each other into a half-open state.
-def _start_video_session(base_prefix, target_mode, initial_label=None):
+def _start_video_session(base_prefix, target_mode, initial_label=None,
+                         per_leg_sidecars=False):
     """Stand up a new RecordingSession + sidecars; flip ``mode`` to ``target_mode``.
 
     Returns the anchor path of the (yet-to-exist) first part. Raises on
@@ -1888,8 +2042,12 @@ def _start_video_session(base_prefix, target_mode, initial_label=None):
     monitor wants stamped onto the very first .ts file -- e.g. ``wp01``.
     Without it the historical "no label" naming is preserved for the
     manual recording path.
+
+    ``per_leg_sidecars`` (transect only): when True each leg .ts gets its
+    own matching .srt/.ass, rotated automatically when splitmuxsink opens
+    each new fragment.
     """
-    global recording, start_time
+    global recording, start_time, sidecar_epoch
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     global current_events_file
@@ -1928,6 +2086,7 @@ def _start_video_session(base_prefix, target_mode, initial_label=None):
         ext=ext,
         container_fmt=container_format,
         proto=stream_protocol,
+        per_leg_sidecars=per_leg_sidecars,
     )
     # Pre-seed the first leg's label so the very first ``_on_format_location``
     # callback (which happens before the monitor sees its first state
@@ -1951,6 +2110,9 @@ def _start_video_session(base_prefix, target_mode, initial_label=None):
     _set_mode(target_mode)
     recording = True
     start_time = datetime.now()
+    # Subtitle epoch starts with the session; transect leg rotations
+    # reset it per leg via _rotate_leg_sidecars.
+    sidecar_epoch = start_time
 
     stop_srt_thread = False
     srt_thread = threading.Thread(target=update_srt_file, daemon=True)
@@ -2006,12 +2168,15 @@ def _stop_video_session():
 
     session = _session
     _session = None
+    per_leg = getattr(session, "per_leg_sidecars", False) if session else False
+    last_leg_ts = None
     if session is not None:
         session.stop()
         # Prefer the actual first part path the splitmuxsink callback
         # observed; falls back to the anchor we composed at /start.
         if session.first_part_path:
             video_anchor = session.first_part_path
+        last_leg_ts = session.last_pattern
 
     recording = False
     start_time = None
@@ -2029,7 +2194,18 @@ def _stop_video_session():
     if events_path and os.path.exists(events_path):
         logger.info("Events log saved: %s", events_path)
 
-    if video_anchor and srt_path and os.path.exists(srt_path):
+    if per_leg:
+        # Transect: earlier legs were already finalised on rotation; only
+        # the *final* leg's sidecars remain, rescaled to that one leg's
+        # encoded duration (NOT the session sum). Done in the background
+        # so /transect/disable and the monitor's exit return promptly.
+        if (srt_path or ass_path) and last_leg_ts:
+            threading.Thread(
+                target=_finalize_leg_sidecars,
+                args=(srt_path, ass_path, last_leg_ts),
+                name="leg-sidecar-finalise", daemon=True,
+            ).start()
+    elif video_anchor and srt_path and os.path.exists(srt_path):
         logger.info("Starting SRT timing adjustment post-processing...")
         time.sleep(3)  # let splitmuxsink finalise the trailing part
         video_duration = sum_session_video_duration(video_anchor)
@@ -2057,9 +2233,18 @@ def _stop_video_session():
 #
 #   disabled  --enable--> waiting
 #   waiting   --armed+AUTO+navigating--> recording
-#   recording --MISSION_CURRENT.seq change--> recording (split_now)
-#   recording --!AUTO || disarmed || Mission Complete || nav lost--> waiting
+#   recording --MISSION_CURRENT.seq change (forward)--> recording (split_now)
+#   recording --Mission Complete STATUSTEXT / seq jumps backward--> waiting
+#   recording --left AUTO / disarmed / stopped, sustained 60s--> waiting
 #   *         --disable--> disabled (stops any in-flight session)
+#
+# IMPORTANT -- record regardless of reachability: once recording, the
+# session is NEVER torn down because the tow vehicle became unreachable.
+# Only *positive*, freshly-observed evidence ends a session: a
+# mission-complete STATUSTEXT, a backward seq jump (new mission loaded),
+# or the vehicle being seen (fresh HEARTBEAT/NAV) to have left AUTO /
+# disarmed / stopped navigating for a sustained grace window. Missing or
+# stale telemetry is treated as "unknown", not "stop".
 #
 # Per-leg .ts files are produced by emitting splitmuxsink's "split-now"
 # action signal with the new WP index stamped as the file label, so the
@@ -2072,10 +2257,13 @@ def _stop_video_session():
 # rolling, which is much smaller than typical leg durations (>10s).
 _TRANSECT_POLL_INTERVAL_S = 0.33
 
-# NAV_CONTROLLER_OUTPUT can briefly drop out during mode transitions or
-# mavlink2rest hiccups. We tolerate this gap before declaring "nav lost"
-# and tearing the session down; without it we'd see false exits.
-_TRANSECT_NAV_LOST_GRACE_S = 5.0
+# Once recording, a positive stop condition (left AUTO, disarmed, or
+# stopped navigating -- all observed from FRESH telemetry) must persist
+# continuously for this long before we finalise the session. This rides
+# out GCS-failsafe "CONTINUING AUTO MODE" events, brief mode-flicker, and
+# telemetry blips. A mission-complete STATUSTEXT or a backward seq jump
+# is definitive and bypasses this grace.
+_TRANSECT_STOP_GRACE_S = 60.0
 
 # Some mission items (DO_CHANGE_SPEED, condition commands, NAV_DELAY)
 # advance MISSION_CURRENT.seq without changing the navigation target.
@@ -2169,8 +2357,15 @@ class TransectMonitor:
         # ``last_update`` timestamp on the wrapper as the dedup key.
         self._last_statustext_time = None
 
-        # NAV freshness debounce (monotonic seconds).
-        self._last_nav_seen_at = None
+        # Monotonic timestamp at which a positive stop condition was first
+        # observed continuously; None whenever the latest fresh telemetry
+        # shows the vehicle still running the mission. Drives the 60s
+        # stop grace.
+        self._stop_evidence_since = None
+
+        # Set when a "Mission Complete" STATUSTEXT arrives; consumed by
+        # the next _tick to finalise the session. Cleared on enter/exit.
+        self._mission_complete_latch = False
 
     # -- lifecycle ----------------------------------------------------
     def enable(self):
@@ -2228,19 +2423,26 @@ class TransectMonitor:
             self._last_statustext_time = state['statustext_time']
             self._handle_statustext(state['statustext'])
 
-        # "Are we navigating right now?" — true if wp_dist > 0 (most
-        # reliable) or if the boat is moving above the speed threshold
-        # (covers brief NAV msg dropouts during mode transitions).
+        # Did we get a fresh HEARTBEAT this tick? (mode_num is None when
+        # the vehicle is unreachable / mavlink2rest had no data.) We only
+        # ever act on stop conditions when telemetry is fresh.
+        hb_present = state['mode_num'] is not None
+        is_auto = (state['mode_num'] == ROVER_MODE_AUTO)
+        is_armed = bool(state['armed'])
+
+        # "Navigating" = positive evidence of motion toward a waypoint.
         navigating = (
             (state['wp_dist'] is not None and state['wp_dist'] > 0)
             or (state['groundspeed'] is not None
                 and state['groundspeed'] > _TRANSECT_NAV_SPEED_THRESHOLD)
         )
-        if navigating:
-            self._last_nav_seen_at = time.monotonic()
-
-        is_auto = (state['mode_num'] == ROVER_MODE_AUTO)
-        is_armed = bool(state['armed'])
+        # "Stopped" requires positive evidence too: at least one nav field
+        # present AND showing no motion. If both nav fields are missing we
+        # treat motion as UNKNOWN (not stopped), so flaky NAV/VFR telemetry
+        # can't trigger a false stop.
+        nav_known = (state['wp_dist'] is not None
+                     or state['groundspeed'] is not None)
+        nav_stopped = nav_known and not navigating
 
         if self.state == "waiting":
             if is_auto and is_armed and navigating:
@@ -2248,40 +2450,70 @@ class TransectMonitor:
             return
 
         if self.state == "recording":
-            # Exit predicates -- bail out cleanly if the vehicle leaves
-            # AUTO, disarms, or appears to have stopped navigating.
-            nav_lost = (
-                self._last_nav_seen_at is not None
-                and (time.monotonic() - self._last_nav_seen_at)
-                    > _TRANSECT_NAV_LOST_GRACE_S
-            )
-            if (not is_auto) or (not is_armed) or nav_lost:
-                reasons = []
-                if not is_auto:
-                    reasons.append(f"mode!=AUTO({state['mode_num']})")
-                if not is_armed:
-                    reasons.append("disarmed")
-                if nav_lost:
-                    reasons.append("nav_lost")
-                self._exit_recording(state, ",".join(reasons) or "unknown")
+            # 1) Definitive end: mission-complete STATUSTEXT latched.
+            if self._mission_complete_latch:
+                self._exit_recording(state, "mission_complete")
                 return
 
-            # Leg boundary -- MISSION_CURRENT.seq changed.
+            # 2) Definitive end: MISSION_CURRENT.seq jumped *backwards*,
+            #    i.e. a new mission was loaded/restarted (your BIN log:
+            #    WP#12 complete -> next mission starts at WP#1). Finalise
+            #    this session cleanly; the waiting->recording path then
+            #    starts a fresh transect_<TS>_... session for the new one.
+            if (state['mission_seq'] is not None and self.current_seq is not None
+                    and state['mission_seq'] < self.current_seq):
+                self._exit_recording(
+                    state,
+                    f"mission_restart(seq {self.current_seq}->{state['mission_seq']})",
+                )
+                return
+
+            # 3) Positive, fresh stop evidence -- and ONLY positive. No
+            #    HEARTBEAT (unreachable) is "unknown", never a stop.
+            stop_reason = None
+            if hb_present:
+                if not is_auto:
+                    stop_reason = f"mode!=AUTO({state['mode_num']})"
+                elif not is_armed:
+                    stop_reason = "disarmed"
+                elif nav_stopped:
+                    stop_reason = "nav_stopped"
+            if stop_reason is None:
+                # Mission still running (or telemetry unknown) -> clear the
+                # grace timer; we are emphatically still recording.
+                self._stop_evidence_since = None
+            else:
+                now = time.monotonic()
+                if self._stop_evidence_since is None:
+                    self._stop_evidence_since = now
+                    self._note_event(
+                        f"stop evidence: {stop_reason} "
+                        f"(grace {int(_TRANSECT_STOP_GRACE_S)}s)"
+                    )
+                elif (now - self._stop_evidence_since) > _TRANSECT_STOP_GRACE_S:
+                    self._exit_recording(state, stop_reason)
+                    return
+
+            # 4) Leg boundary -- forward MISSION_CURRENT.seq change.
             if (state['mission_seq'] is not None
                     and state['mission_seq'] != self.current_seq):
                 self._roll_leg(state)
 
     # -- state machine transitions -----------------------------------
     def _handle_statustext(self, txt):
-        """React to a freshly-arrived STATUSTEXT line."""
+        """React to a freshly-arrived STATUSTEXT line.
+
+        Matching is case-insensitive -- ArduPilot emits mixed-case
+        ``Mission Complete``, but log viewers (and some firmware builds)
+        upper-case it. We only *latch* here; the next _tick consumes the
+        latch and finalises, so the work always happens on the monitor
+        thread under the normal flow.
+        """
         if not txt:
             return
         self._note_event(f"statustext: {txt}")
-        if "Mission Complete" in txt and self.state == "recording":
-            # Mode/disarm paths will catch this within a few ticks too,
-            # but acting on STATUSTEXT lets us finalise immediately so
-            # the trailing leg's manifest row gets the correct reason.
-            self._exit_recording(self.last_state, "mission_complete")
+        if "mission complete" in txt.lower():
+            self._mission_complete_latch = True
 
     def _enter_recording(self, state):
         seq = state['mission_seq'] if state['mission_seq'] is not None else 0
@@ -2295,6 +2527,7 @@ class TransectMonitor:
                     base_prefix="transect",
                     target_mode=MODE_TRANSECT,
                     initial_label=wp_label,
+                    per_leg_sidecars=True,
                 )
         except Exception as e:
             logger.exception("TransectMonitor: _start_video_session failed")
@@ -2311,6 +2544,9 @@ class TransectMonitor:
         self.current_seq = seq
         self.leg_count = 1
         self.session_started_at = datetime.now()
+        # Fresh session -> clear any stale stop/complete bookkeeping.
+        self._stop_evidence_since = None
+        self._mission_complete_latch = False
         self._begin_leg(state, seq)
         self._note_event(f"started session at wp{seq:02d}")
 
@@ -2331,6 +2567,9 @@ class TransectMonitor:
         self._leg_started_seq = None
         self.session_started_at = None
         self._manifest_path = None
+        # Reset stop/complete bookkeeping so the next mission starts clean.
+        self._stop_evidence_since = None
+        self._mission_complete_latch = False
         self._note_event(f"stopped session: {reason}")
 
     def _roll_leg(self, state):
