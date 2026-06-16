@@ -294,8 +294,10 @@ stream_protocol = _cfg["stream_protocol"]
 snapshot_url = _cfg["snapshot_url"]
 transect_capture_type = _cfg["transect_capture_type"]
 
-# Mavlink URLs (Towfish heading at 192.168.2.2)
-towfish_attitude_url = 'http://192.168.2.2/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
+# Towfish (ArduSub) telemetry is read through the local BlueOS host the
+# extension runs on (host.docker.internal), same as depth/altitude/temp,
+# rather than a hardcoded 192.168.2.2.
+towfish_attitude_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
 
 # Camera ISP info endpoint
 camera_isp_url = 'http://192.168.2.10/action/getISPInfo'
