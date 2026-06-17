@@ -22,6 +22,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402  (after require_version)
 
+import usb_storage
+
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
@@ -131,6 +133,15 @@ DEFAULT_SNAPSHOT_URL = "http://192.168.2.10/cgi-bin/onesnap.cgi"
 #   "timelapse" -> 2 Hz geotagged JPEGs into one subfolder per leg
 DEFAULT_TRANSECT_CAPTURE_TYPE = "video"
 VALID_TRANSECT_CAPTURE_TYPES = ("video", "timelapse")
+# Where to put new recordings:
+#   "usb"   -> attached USB drive (mounted at /mnt/usb) when usable, else
+#              fall back to the local extension volume.
+#   "local" -> always use the local extension volume (/app/videorecordings).
+# "Usable" requires the drive to be mounted *and* have at least
+# usb_storage.USB_MIN_FREE_GB free; below that we fall back automatically
+# to local storage so a near-full stick can't wedge the recorder.
+DEFAULT_STORAGE_PREFERENCE = "usb"
+VALID_STORAGE_PREFERENCES = ("usb", "local")
 
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
@@ -140,6 +151,7 @@ def load_config():
         "stream_protocol": DEFAULT_STREAM_PROTOCOL,
         "snapshot_url": DEFAULT_SNAPSHOT_URL,
         "transect_capture_type": DEFAULT_TRANSECT_CAPTURE_TYPE,
+        "storage_preference": DEFAULT_STORAGE_PREFERENCE,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -156,6 +168,8 @@ def load_config():
         defaults["snapshot_url"] = DEFAULT_SNAPSHOT_URL
     if defaults["transect_capture_type"] not in VALID_TRANSECT_CAPTURE_TYPES:
         defaults["transect_capture_type"] = DEFAULT_TRANSECT_CAPTURE_TYPE
+    if defaults["storage_preference"] not in VALID_STORAGE_PREFERENCES:
+        defaults["storage_preference"] = DEFAULT_STORAGE_PREFERENCE
     return defaults
 
 def save_config(cfg):
@@ -293,6 +307,24 @@ container_format = _cfg["container_format"]
 stream_protocol = _cfg["stream_protocol"]
 snapshot_url = _cfg["snapshot_url"]
 transect_capture_type = _cfg["transect_capture_type"]
+storage_preference = _cfg["storage_preference"]
+
+# Recording-storage state
+#
+# ``usb_recording`` is True when the *currently active* video or
+# timelapse session is writing to the USB mount. The video watchdog
+# and timelapse loop watch ``usb_storage.is_healthy()`` and trigger
+# a one-shot failover to local storage if the drive disappears
+# mid-recording. ``usb_failover_count`` is reset only at startup;
+# it surfaces in /status so the UI can warn the operator that a
+# session was forced onto the SD card.
+usb_recording = False
+usb_failover_count = 0
+
+# Local fallback root for recordings that don't (or no longer) live
+# on USB. Using a named constant lets every capture path call the
+# same resolver instead of hardcoding "/app/videorecordings".
+LOCAL_RECORDING_DIR = "/app/videorecordings"
 
 # Towfish (ArduSub) telemetry is read through the local BlueOS host the
 # extension runs on (host.docker.internal), same as depth/altitude/temp,
@@ -1091,13 +1123,206 @@ def log_event(event_type, detail=""):
     except Exception as e:
         logger.debug(f"Error writing event log: {e}")
 
-def _read_disk_free_mb():
-    """Read free disk space on /app/videorecordings in MB."""
+def _read_disk_free_mb(path=None):
+    """Read free disk space on a recording path in MB.
+
+    Defaults to the local extension volume to preserve the historical
+    behaviour of the /status endpoint; callers that record to USB can
+    pass the resolved path to get the *active* target's free space.
+    """
+    target = path or LOCAL_RECORDING_DIR
     try:
-        stat = os.statvfs("/app/videorecordings")
+        stat = os.statvfs(target)
         return round((stat.f_bavail * stat.f_frsize) / (1024 * 1024), 1)
     except Exception:
         return None
+
+
+def _resolve_recording_dir(subfolder=None, force_local=False):
+    """Decide where the next recording should be written.
+
+    Returns a tuple ``(dir_path, on_usb)``. When the user prefers USB
+    *and* the drive is currently usable (mounted with at least
+    ``USB_MIN_FREE_GB`` free) the path is on the USB mount; otherwise
+    we fall back to ``LOCAL_RECORDING_DIR``. The local fallback is
+    automatic so a near-full or unplugged stick can never wedge the
+    recorder.
+
+    ``subfolder`` is appended under the USB ``Towfish/`` root when
+    given (used for per-session timelapse folders); video recordings
+    that share one root pass ``None`` and get the Towfish root itself.
+
+    ``force_local`` is set by the failover path so a session that
+    just lost USB doesn't immediately re-pick USB on restart.
+    """
+    use_usb = (
+        not force_local
+        and storage_preference == "usb"
+        and usb_storage.is_usable()
+    )
+    if use_usb:
+        try:
+            if subfolder:
+                rec_dir = usb_storage.get_recording_dir(subfolder)
+            else:
+                rec_dir = usb_storage.get_recording_dir("")
+                # get_recording_dir always returns ``<root>/Towfish/<subfolder>``;
+                # an empty subfolder just gives us ``<root>/Towfish/`` which is
+                # exactly what we want for files that live at the session root.
+            return rec_dir, True
+        except Exception as e:
+            logger.warning(
+                f"USB resolve failed ({e}); falling back to local storage"
+            )
+
+    if storage_preference == "usb" and not force_local:
+        logger.info(
+            "USB preferred but not usable (mounted=%s, fstype=%s, free_mb=%s); "
+            "falling back to local storage at %s",
+            usb_storage.is_mounted(),
+            usb_storage.get_fstype() or None,
+            usb_storage.get_free_mb(),
+            LOCAL_RECORDING_DIR,
+        )
+
+    os.makedirs(LOCAL_RECORDING_DIR, exist_ok=True)
+    if subfolder:
+        local = os.path.join(LOCAL_RECORDING_DIR, subfolder)
+        os.makedirs(local, exist_ok=True)
+        return local, False
+    return LOCAL_RECORDING_DIR, False
+
+
+# ── Mid-recording USB failover ───────────────────────────────────────────
+# A background daemon polls usb_storage.is_healthy() while a session is
+# writing to USB.  On failure (drive yanked, FS error, etc.) we kill the
+# current session and immediately restart on local storage with
+# force_local=True so we don't bounce straight back to the broken USB.
+
+_USB_HEALTH_INTERVAL_S = 5.0
+_usb_health_thread = None
+_usb_health_stop = threading.Event()
+
+
+def _handle_usb_failover():
+    """Stop the active USB-backed session and restart it on local storage.
+
+    Runs from the USB health watcher thread; takes ``_mode_lock`` so it
+    can never race the Flask /start, /stop, /timelapse routes or the
+    TransectMonitor's own start/stop calls.
+    """
+    global usb_recording, usb_failover_count
+    with _mode_lock:
+        if not usb_recording:
+            return
+        active_mode = mode
+        logger.warning("USB failover: storage lost mid-recording (mode=%s)",
+                       active_mode)
+        log_event("usb_failover",
+                  f"USB storage lost during recording (mode={active_mode})")
+        usb_failover_count += 1
+
+        try:
+            if active_mode == MODE_VIDEO:
+                _stop_video_session()
+                _start_video_session(base_prefix="video_rtsp",
+                                     target_mode=MODE_VIDEO,
+                                     force_local=True)
+            elif active_mode == MODE_TIMELAPSE:
+                # Stop the manual timelapse session, then restart it on
+                # local storage. Mirrors the dropcam failover path.
+                global _timelapse
+                session = _timelapse
+                _timelapse = None
+                if session is not None:
+                    session.stop()
+                _set_mode(MODE_IDLE)
+                # Re-create on local storage.
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                subfolder = f"timelapse_{timestamp}"
+                out_dir, _ = _resolve_recording_dir(
+                    subfolder=subfolder, force_local=True,
+                )
+                new_session = TimelapseSession(snap_url=snapshot_url,
+                                               out_dir=out_dir)
+                new_session.on_usb = False
+                new_session.start()
+                _timelapse = new_session
+                _set_mode(MODE_TIMELAPSE)
+            elif active_mode == MODE_TRANSECT:
+                # Transect mode is owned by the TransectMonitor. We can't
+                # cleanly mid-mission swap a USB-backed session for a
+                # local one without confusing the monitor's state machine,
+                # so the safe path is to disable the monitor: it tears
+                # down the in-flight capture, surfaces a clear status,
+                # and lets the operator re-enable transect after the USB
+                # issue is resolved (the next /transect/enable will see
+                # is_usable()==False and start on local storage).
+                if _transect_monitor is not None:
+                    try:
+                        _transect_monitor.disable()
+                    except Exception:
+                        logger.exception("transect monitor disable failed")
+                # Belt-and-suspenders: if disable() didn't fully tear
+                # down (e.g. it raised), make sure no stale session
+                # keeps writing to the dead USB.
+                if _session is not None:
+                    try:
+                        _stop_video_session()
+                    except Exception:
+                        logger.exception("post-disable video stop failed")
+                if _timelapse is not None:
+                    try:
+                        _stop_transect_timelapse()
+                    except Exception:
+                        logger.exception("post-disable timelapse stop failed")
+                _set_mode(MODE_IDLE)
+            else:
+                logger.warning("USB failover: unexpected mode=%s, no-op",
+                               active_mode)
+                usb_recording = False
+                return
+        except Exception:
+            logger.exception("USB failover: restart on local storage failed")
+            usb_recording = False
+            return
+
+        # The mode-specific branches above either restarted on local
+        # storage (MODE_VIDEO / MODE_TIMELAPSE) and reset usb_recording
+        # via _start_*/_stop_*, or tore everything down (MODE_TRANSECT).
+        # Clear the flag explicitly to be safe.
+        if mode == MODE_IDLE:
+            usb_recording = False
+
+        logger.info("USB failover complete: now recording to local storage "
+                    "(mode=%s, failovers=%d)", mode, usb_failover_count)
+        log_event("usb_failover_complete",
+                  f"resumed mode={mode} on local storage")
+
+
+def _usb_health_loop():
+    """Background loop that triggers failover on USB loss during recording."""
+    while not _usb_health_stop.is_set():
+        try:
+            if usb_recording and not usb_storage.is_healthy():
+                _handle_usb_failover()
+        except Exception:
+            logger.exception("USB health watcher raised")
+        _usb_health_stop.wait(_USB_HEALTH_INTERVAL_S)
+
+
+def _start_usb_health_watcher():
+    """Start the USB health watcher thread (idempotent)."""
+    global _usb_health_thread
+    if _usb_health_thread and _usb_health_thread.is_alive():
+        return
+    _usb_health_stop.clear()
+    _usb_health_thread = threading.Thread(
+        target=_usb_health_loop, name="usb-health", daemon=True,
+    )
+    _usb_health_thread.start()
+    logger.info("USB health watcher started (interval=%.1fs)",
+                _USB_HEALTH_INTERVAL_S)
 
 # ---------------------------------------------------------------------------
 # In-process GStreamer recording with auto-restart watchdog.
@@ -1152,7 +1377,14 @@ def _ensure_gst_init():
             _gst_initialized = True
             logger.info("GStreamer initialized (version %s)", Gst.version_string())
 
-def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsink"):
+#: ``splitmuxsink max-size-bytes`` value used when recording to a vfat USB.
+#: FAT32 caps single files at 4 GiB; rolling at 3.5 GiB leaves headroom for
+#: muxer overhead so the active fragment can finalise before the cap hits.
+FAT32_MAX_PART_BYTES = int(3.5 * 1024 * 1024 * 1024)
+
+
+def _build_pipeline_description(rtsp_url, container_fmt, proto,
+                                mux_name="muxsink", max_size_bytes=0):
     """Build the gst-parse_launch description for one RTSP H.264 session.
 
     Mirrors the hauv-v2 branch's RTSP recording pipeline (UDP transport,
@@ -1171,6 +1403,11 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsin
     Per-fragment PTS reset by splitmuxsink also keeps VLC happy (the
     old single-mpegtsmux path produced a 1-hour PTS offset that broke
     playback until you scrubbed past it).
+
+    ``max_size_bytes`` (default 0 = unlimited) asks splitmuxsink to roll
+    a new part once the current file reaches the byte threshold. Used
+    when the resolved target lives on a vfat USB stick to stay under
+    the FAT32 4 GiB per-file cap.
     """
     if container_fmt == "mpegts":
         muxer_factory = "mpegtsmux"
@@ -1190,6 +1427,7 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto, mux_name="muxsin
         f"leaky=downstream silent=true "
         f"! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! splitmuxsink name={mux_name} max-size-time=0 "
+        f"max-size-bytes={int(max_size_bytes)} "
         f"muxer-factory={muxer_factory} send-keyframe-requests=true "
         f"async-finalize=false"
     )
@@ -1277,7 +1515,8 @@ class RecordingSession:
     """
 
     def __init__(self, rtsp_url, out_dir, base_filename, ext,
-                 container_fmt, proto, per_leg_sidecars=False):
+                 container_fmt, proto, per_leg_sidecars=False,
+                 fat_size_cap=False):
         self._rtsp_url = rtsp_url
         self._out_dir = out_dir
         self._base_filename = base_filename  # "video_rtsp_<TS>" or "transect_<TS>"
@@ -1290,6 +1529,13 @@ class RecordingSession:
         # False (manual recording), one sidecar set spans the whole
         # session and is rescaled over the sum of part durations at /stop.
         self.per_leg_sidecars = per_leg_sidecars
+        # When True, splitmuxsink will roll a new part at FAT32_MAX_PART_BYTES
+        # so a long recording on a vfat USB never trips the FAT 4 GiB cap.
+        self._fat_size_cap = fat_size_cap
+        # Set by the caller after start() to remember which storage tier
+        # this session is currently writing to. Read by the watchdog loop
+        # so a USB drive that disappears mid-recording can trigger failover.
+        self.on_usb = False
         # Counts fragments splitmuxsink has opened this session; the first
         # already has sidecars created at /start, so rotation only kicks
         # in from the second fragment onward.
@@ -1421,6 +1667,7 @@ class RecordingSession:
     def _build_pipeline(self):
         desc = _build_pipeline_description(
             self._rtsp_url, self._container_fmt, self._proto,
+            max_size_bytes=(FAT32_MAX_PART_BYTES if self._fat_size_cap else 0),
         )
         logger.info("RECORD building pipeline part=%d: %s",
                     self._current_part, desc)
@@ -2109,7 +2356,7 @@ def register_service():
 @app.route('/config', methods=['GET', 'POST'])
 def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
-    global transect_capture_type
+    global transect_capture_type, storage_preference
 
     if request.method == 'POST':
         if mode != MODE_IDLE:
@@ -2163,6 +2410,15 @@ def config():
             snapshot_url = new_snap
             changed = True
 
+        new_storage = data.get('storage_preference')
+        if new_storage is not None:
+            new_storage = str(new_storage).strip().lower()
+            if new_storage not in VALID_STORAGE_PREFERENCES:
+                return jsonify({"success": False,
+                                "message": f"storage_preference must be one of {VALID_STORAGE_PREFERENCES}"}), 400
+            storage_preference = new_storage
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
@@ -2170,19 +2426,22 @@ def config():
                       "container_format": container_format,
                       "stream_protocol": stream_protocol,
                       "snapshot_url": snapshot_url,
-                      "transect_capture_type": transect_capture_type})
+                      "transect_capture_type": transect_capture_type,
+                      "storage_preference": storage_preference})
         logger.info(
             "Config updated: tow_vehicle_ip=%s, container_format=%s, "
-            "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s",
+            "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s, "
+            "storage_preference=%s",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
-            transect_capture_type,
+            transect_capture_type, storage_preference,
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
                         "container_format": container_format,
                         "stream_protocol": stream_protocol,
                         "snapshot_url": snapshot_url,
-                        "transect_capture_type": transect_capture_type})
+                        "transect_capture_type": transect_capture_type,
+                        "storage_preference": storage_preference})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -2191,6 +2450,7 @@ def config():
         "stream_protocol": stream_protocol,
         "snapshot_url": snapshot_url,
         "transect_capture_type": transect_capture_type,
+        "storage_preference": storage_preference,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -2201,7 +2461,7 @@ def config():
 # holds ``_mode_lock`` so the transect monitor and HTTP routes can never
 # race each other into a half-open state.
 def _start_video_session(base_prefix, target_mode, initial_label=None,
-                         per_leg_sidecars=False):
+                         per_leg_sidecars=False, force_local=False):
     """Stand up a new RecordingSession + sidecars; flip ``mode`` to ``target_mode``.
 
     Returns the anchor path of the (yet-to-exist) first part. Raises on
@@ -2219,25 +2479,34 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
     ``per_leg_sidecars`` (transect only): when True each leg .ts gets its
     own matching .srt/.ass, rotated automatically when splitmuxsink opens
     each new fragment.
+
+    ``force_local`` is set by the failover path so a session that just
+    lost the USB drive doesn't immediately re-pick it on restart.
     """
     global recording, start_time, sidecar_epoch
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     global current_events_file
     global ass_thread, stop_ass_thread, current_ass_file, ass_subtitle_counter
-    global _session
+    global _session, usb_recording
 
-    os.makedirs("/app/videorecordings", exist_ok=True)
+    out_dir, on_usb = _resolve_recording_dir(force_local=force_local)
+    os.makedirs(out_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     ext = ".ts" if container_format == "mpegts" else ".mp4"
+
+    # FAT32 (vfat) caps single files at 4 GiB. When we land on a vfat
+    # USB stick, ask splitmuxsink to roll a new on-disk part well below
+    # that limit so a long manual recording can never trip the cap.
+    fat_cap = on_usb and usb_storage.is_fat_like()
 
     base_filename = f"{base_prefix}_{timestamp}"
     label_suffix = f"_{initial_label}" if initial_label else ""
     # Sidecars are named off the *first* part path so the existing
     # post-processing helpers (adjust_srt_timing, etc.) keep their
     # historical pair-by-name relationship.
-    anchor_path = os.path.join("/app/videorecordings",
+    anchor_path = os.path.join(out_dir,
                                f"{base_filename}_part00_00000{label_suffix}{ext}")
     current_video_file_rtsp = anchor_path
 
@@ -2250,17 +2519,21 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
 
     log_event("recording_starting",
               f"container={container_format} proto={stream_protocol} "
-              f"mode={target_mode} prefix={base_prefix}")
+              f"mode={target_mode} prefix={base_prefix} "
+              f"storage={'usb' if on_usb else 'local'}"
+              f"{' (fat_cap=3.5GiB)' if fat_cap else ''}")
 
     session = RecordingSession(
         rtsp_url=RTSP_ENDPOINT,
-        out_dir="/app/videorecordings",
+        out_dir=out_dir,
         base_filename=base_filename,
         ext=ext,
         container_fmt=container_format,
         proto=stream_protocol,
         per_leg_sidecars=per_leg_sidecars,
+        fat_size_cap=fat_cap,
     )
+    session.on_usb = on_usb
     # Pre-seed the first leg's label so the very first ``_on_format_location``
     # callback (which happens before the monitor sees its first state
     # transition) already names the file with the WP index.
@@ -2280,6 +2553,7 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
         raise
 
     _session = session
+    usb_recording = on_usb
     _set_mode(target_mode)
     recording = True
     start_time = datetime.now()
@@ -2299,8 +2573,11 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
     ass_thread = threading.Thread(target=update_ass_file, daemon=True)
     ass_thread.start()
 
-    log_event("recording_started", f"anchor={anchor_path}")
-    logger.info("Recording started: anchor=%s", anchor_path)
+    storage_label = "USB" if on_usb else "local"
+    log_event("recording_started",
+              f"anchor={anchor_path} storage={storage_label}")
+    logger.info("Recording started: anchor=%s storage=%s",
+                anchor_path, storage_label)
     return anchor_path
 
 def _stop_video_session():
@@ -2319,7 +2596,7 @@ def _stop_video_session():
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     global current_events_file
     global ass_thread, stop_ass_thread, current_ass_file
-    global _session
+    global _session, usb_recording
 
     log_event("recording_stopping", "Stop requested")
 
@@ -2352,6 +2629,7 @@ def _stop_video_session():
         last_leg_ts = session.last_pattern
 
     recording = False
+    usb_recording = False
     start_time = None
     current_srt_file_rtsp = None
     current_video_file_rtsp = None
@@ -2399,19 +2677,25 @@ def _stop_video_session():
 
     logger.info("Recording stopped successfully")
 
-def _start_transect_timelapse(initial_label):
+def _start_transect_timelapse(initial_label, force_local=False):
     """Stand up a per-leg TimelapseSession; flip ``mode`` to MODE_TRANSECT.
 
     Mirror of :func:`_start_video_session` for the image capture type.
     Returns the session root dir (``transect_<TS>/``), which doubles as
     the manifest's parent. Caller must hold ``_mode_lock``.
+
+    ``force_local`` is set by the failover path so a session that just
+    lost the USB drive doesn't immediately re-pick it on restart.
     """
-    global _timelapse
-    os.makedirs("/app/videorecordings", exist_ok=True)
+    global _timelapse, usb_recording
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join("/app/videorecordings", f"transect_{timestamp}")
+    subfolder = f"transect_{timestamp}"
+    out_dir, on_usb = _resolve_recording_dir(
+        subfolder=subfolder, force_local=force_local,
+    )
 
     session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir, per_leg=True)
+    session.on_usb = on_usb
     try:
         session.start()
         session.set_leg(initial_label)
@@ -2422,18 +2706,23 @@ def _start_transect_timelapse(initial_label):
         raise
 
     _timelapse = session
+    usb_recording = on_usb
     _set_mode(MODE_TRANSECT)
-    log_event("transect_timelapse_started", out_dir)
-    logger.info("Transect timelapse started: %s (snap_url=%s)", out_dir, snapshot_url)
+    storage_label = "USB" if on_usb else "local"
+    log_event("transect_timelapse_started",
+              f"{out_dir} storage={storage_label}")
+    logger.info("Transect timelapse started: %s (snap_url=%s, storage=%s)",
+                out_dir, snapshot_url, storage_label)
     return out_dir
 
 def _stop_transect_timelapse():
     """Tear down the transect TimelapseSession; flip ``mode`` to IDLE."""
-    global _timelapse
+    global _timelapse, usb_recording
     session = _timelapse
     _timelapse = None
     if session is not None:
         session.stop()
+    usb_recording = False
     _set_mode(MODE_IDLE)
     logger.info("Transect timelapse stopped")
 
@@ -3016,7 +3305,7 @@ def get_status():
     ``mode`` plus the video-specific or timelapse-specific blocks let
     the widget switch UI without juggling two separate endpoints.
     """
-    global recording, start_time
+    global recording, start_time, usb_recording
     try:
         # Auto-clean if the watchdog thread died unexpectedly while video mode
         # was supposed to be active (e.g. uncaught exception in _run_one).
@@ -3024,6 +3313,7 @@ def get_status():
             logger.warning("Recording session is no longer alive; clearing mode")
             log_event("session_died", "RecordingSession watchdog exited unexpectedly")
             recording = False
+            usb_recording = False
             start_time = None
             _set_mode(MODE_IDLE)
 
@@ -3082,8 +3372,19 @@ def get_status():
             "snapshot_url": snapshot_url,
         }
 
-        disk_free = _read_disk_free_mb()
+        # Disk-free for the *active* recording target so the UI shows
+        # the right number when writing to USB. Falls back to the local
+        # extension volume otherwise.
+        active_dir = None
+        if mode == MODE_VIDEO and sess is not None:
+            active_dir = sess._out_dir
+        elif mode in (MODE_TIMELAPSE, MODE_TRANSECT) and tl is not None:
+            active_dir = tl._base_dir
+        disk_free = _read_disk_free_mb(active_dir)
+        local_disk_free = _read_disk_free_mb(LOCAL_RECORDING_DIR)
         active_start = start_time if mode == MODE_VIDEO else (tl.start_time if (tl and mode == MODE_TIMELAPSE) else None)
+
+        usb_status = usb_storage.get_status()
 
         resp = jsonify({
             "mode": mode,
@@ -3097,7 +3398,12 @@ def get_status():
                               if current_part_path else None),
             "restarts": restarts,
             "last_exit": last_exit,
+            # disk_free_mb tracks the active recording target so the UI
+            # warns based on whichever drive the operator is actually
+            # filling. local_disk_free_mb is the local extension volume,
+            # always reported so the UI can compare both tiers.
             "disk_free_mb": disk_free,
+            "local_disk_free_mb": local_disk_free,
             "gst_errors": gst_errors,
             "gst_warnings": gst_warnings,
             "file_stalls": file_stalls,
@@ -3105,6 +3411,13 @@ def get_status():
             "container_format": container_format,
             "stream_protocol": stream_protocol,
             "timelapse": timelapse_block,
+            # Storage selection + USB drive state for the storage card.
+            "storage_preference": storage_preference,
+            "usb_storage": usb_status,
+            "usb_recording": usb_recording,
+            "usb_failover_count": usb_failover_count,
+            "active_storage": "usb" if usb_recording else (
+                "local" if mode != MODE_IDLE else None),
             # Per-poll snapshot of the automatic transect monitor. Null
             # when the monitor was never enabled; otherwise contains
             # the state machine state, last mission/nav telemetry, leg
@@ -3119,34 +3432,61 @@ def get_status():
         logger.error(f"Error in status endpoint: {str(e)}")
         return jsonify({"success": False, "message": str(e)}), 500
 
+def _recording_roots():
+    """Yield ``(label, root_path)`` for each storage tier that may hold
+    recordings. ``label`` is ``"local"`` or ``"usb"`` and matches the
+    optional ``?storage=`` selector on /download. The USB tier is only
+    yielded when the drive is currently mounted; an unmounted USB
+    contributes nothing to the listing.
+    """
+    yield "local", LOCAL_RECORDING_DIR
+    usb_root = usb_storage.get_base_dir()
+    if usb_root:
+        yield "usb", usb_root
+
+
 @app.route('/list', methods=['GET'])
 def list_videos():
-    """Return on-disk recordings, including timelapse session folders."""
+    """Return on-disk recordings across local + USB storage tiers.
+
+    Each entry carries a ``storage`` field (``"local"`` or ``"usb"``)
+    so the UI knows which drive it lives on; the download route reads
+    the same field from the ``?storage=`` query string.
+    """
     try:
-        video_dir = "/app/videorecordings"
-        if not os.path.exists(video_dir):
-            os.makedirs(video_dir)
+        os.makedirs(LOCAL_RECORDING_DIR, exist_ok=True)
 
         videos = []
         timelapses = []
-        for name in os.listdir(video_dir):
-            full = os.path.join(video_dir, name)
-            if os.path.isdir(full) and (name.startswith("timelapse_")
-                                        or name.startswith("transect_")):
-                # Count JPEGs recursively so transect image sessions
-                # (which nest one wpNN/ subfolder per leg) report their
-                # full frame total, not just the root folder.
-                jpgs = 0
-                try:
-                    for _root, _dirs, _files in os.walk(full):
-                        jpgs += sum(1 for f in _files if f.endswith('.jpg'))
-                except Exception:
+        for storage, root in _recording_roots():
+            if not os.path.isdir(root):
+                continue
+            try:
+                names = os.listdir(root)
+            except Exception:
+                continue
+            for name in names:
+                full = os.path.join(root, name)
+                if os.path.isdir(full) and (name.startswith("timelapse_")
+                                            or name.startswith("transect_")):
+                    # Count JPEGs recursively so transect image sessions
+                    # (which nest one wpNN/ subfolder per leg) report their
+                    # full frame total, not just the root folder.
                     jpgs = 0
-                if jpgs > 0 or name.startswith("timelapse_"):
-                    timelapses.append({"name": name, "snap_count": jpgs})
-            elif name.endswith(('.mp4', '.ts')):
-                videos.append(name)
-        videos.sort(reverse=True)
+                    try:
+                        for _root, _dirs, _files in os.walk(full):
+                            jpgs += sum(1 for f in _files if f.endswith('.jpg'))
+                    except Exception:
+                        jpgs = 0
+                    if jpgs > 0 or name.startswith("timelapse_"):
+                        timelapses.append({
+                            "name": name,
+                            "snap_count": jpgs,
+                            "storage": storage,
+                        })
+                elif name.endswith(('.mp4', '.ts')):
+                    videos.append({"name": name, "storage": storage})
+        videos.sort(key=lambda v: v["name"], reverse=True)
         timelapses.sort(key=lambda t: t["name"], reverse=True)
         return jsonify({"videos": videos, "timelapses": timelapses})
     except Exception as e:
@@ -3155,13 +3495,31 @@ def list_videos():
 
 @app.route('/download/<path:filename>')
 def download(filename):
-    """Download any file under /app/videorecordings (incl. timelapse_*/<jpg>)."""
+    """Download any file under the local extension volume *or* the USB
+    Towfish/ root (incl. ``timelapse_*/<jpg>``).
+
+    The optional ``?storage=`` query string picks which root to serve
+    from: ``"local"`` (default, preserves the historical behaviour) or
+    ``"usb"`` (the mounted USB drive's Towfish/ folder). Path-traversal
+    is guarded by realpath comparison against the chosen root.
+    """
     try:
-        full = os.path.realpath(os.path.join("/app/videorecordings", filename))
-        # Path-traversal guard: never serve outside the videorecordings root.
-        root = os.path.realpath("/app/videorecordings")
+        storage = request.args.get('storage', 'local').strip().lower()
+        if storage == 'usb':
+            usb_root = usb_storage.get_base_dir()
+            if not usb_root or not os.path.isdir(usb_root):
+                return jsonify({"success": False,
+                                "message": "USB storage not mounted"}), 404
+            root = os.path.realpath(usb_root)
+        else:
+            root = os.path.realpath(LOCAL_RECORDING_DIR)
+
+        full = os.path.realpath(os.path.join(root, filename))
+        # Path-traversal guard: never serve outside the chosen root.
         if not full.startswith(root + os.sep):
             return jsonify({"success": False, "message": "Invalid path"}), 400
+        if not os.path.exists(full):
+            return jsonify({"success": False, "message": "Not found"}), 404
         return send_file(full, as_attachment=True)
     except Exception as e:
         logger.error(f"Error in download endpoint: {str(e)}")
@@ -3175,7 +3533,7 @@ def get_filesize():
     active session folder, and the "filename" is the folder name.
     """
     try:
-        video_dir = "/app/videorecordings"
+        video_dir = LOCAL_RECORDING_DIR
 
         if mode == MODE_VIDEO:
             sess = _session
@@ -3295,7 +3653,7 @@ def timelapse_start():
     Mutually exclusive with video recording (HTTP 409 if a recording
     is already running).
     """
-    global _timelapse
+    global _timelapse, usb_recording
     with _mode_lock:
         if mode == MODE_TIMELAPSE:
             return jsonify({"success": False, "message": "Timelapse already running"}), 400
@@ -3304,20 +3662,26 @@ def timelapse_start():
                             "message": "Video recording is active; stop it first"}), 409
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = os.path.join("/app/videorecordings", f"timelapse_{timestamp}")
+            subfolder = f"timelapse_{timestamp}"
+            out_dir, on_usb = _resolve_recording_dir(subfolder=subfolder)
             session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir)
+            session.on_usb = on_usb
             try:
                 session.start()
             except Exception as e:
                 logger.exception("Failed to start TimelapseSession")
                 return jsonify({"success": False, "message": str(e)}), 500
             _timelapse = session
+            usb_recording = on_usb
             _set_mode(MODE_TIMELAPSE)
-            logger.info("Timelapse started: %s (snap_url=%s)", out_dir, snapshot_url)
+            storage_label = "USB" if on_usb else "local"
+            logger.info("Timelapse started: %s (snap_url=%s, storage=%s)",
+                        out_dir, snapshot_url, storage_label)
             return jsonify({
                 "success": True,
                 "folder": os.path.basename(out_dir),
                 "snapshot_url": snapshot_url,
+                "storage": "usb" if on_usb else "local",
             })
         except Exception as e:
             logger.exception("Error in /timelapse/start")
@@ -3326,7 +3690,7 @@ def timelapse_start():
 @app.route('/timelapse/stop', methods=['GET'])
 def timelapse_stop():
     """Stop the active timelapse loop and return final stats."""
-    global _timelapse
+    global _timelapse, usb_recording
     with _mode_lock:
         if mode != MODE_TIMELAPSE:
             return jsonify({"success": True, "message": "Not running"})
@@ -3340,6 +3704,7 @@ def timelapse_stop():
                 stats["miss_count"] = session.miss_count
                 if session.last_snap_path:
                     stats["folder"] = os.path.basename(os.path.dirname(session.last_snap_path))
+            usb_recording = False
             _set_mode(MODE_IDLE)
             logger.info("Timelapse stopped: snaps=%d misses=%d",
                         stats["snap_count"], stats["miss_count"])
@@ -3452,5 +3817,22 @@ def get_telemetry():
         return jsonify({"success": False, "message": str(e)}), 500
 
 if __name__ == '__main__':
+    # Kick off the USB probe before the Flask app starts so the first
+    # /status / /config request after boot already has accurate mount
+    # state.  The probe also handles drives that get hot-plugged after
+    # the container is running.
+    try:
+        os.makedirs(LOCAL_RECORDING_DIR, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Could not create local recording dir: {e}")
+    try:
+        usb_storage.start_probe()
+    except Exception as e:
+        logger.warning(f"USB probe failed to start: {e}")
+    try:
+        _start_usb_health_watcher()
+    except Exception as e:
+        logger.warning(f"USB health watcher failed to start: {e}")
+
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)

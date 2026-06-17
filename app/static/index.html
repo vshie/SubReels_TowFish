@@ -292,6 +292,26 @@
             <button onclick="saveSnapshotUrl()">Save</button>
             <span class="config-saved" id="snapshotSaved">Saved</span>
         </div>
+        <div class="config-row" style="margin-top: 8px;">
+            <label for="storagePreference">Recording Storage:</label>
+            <select id="storagePreference" autocomplete="off" onchange="saveStoragePreference()">
+                <option value="usb">USB drive (preferred)</option>
+                <option value="local">Local SD only</option>
+            </select>
+            <span class="config-saved" id="storageSaved">Saved</span>
+        </div>
+    </div>
+
+    <!-- Storage status card. Rendered from /status.usb_storage; tells the
+         operator whether the active recording is going to USB or to the
+         internal extension volume, and why. -->
+    <div class="config-section" id="storageCard" style="margin-top: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <strong id="storageLabel">Storage: --</strong>
+            <span class="mono" id="storageFree" style="color: #555; font-size: 0.9em;"></span>
+            <span class="mono" id="storageDevice" style="color: #888; font-size: 0.85em;"></span>
+        </div>
+        <div id="storageDetail" style="color: #555; font-size: 0.85em; margin-top: 4px;"></div>
     </div>
     <div class="status-container">
         <p>Status: <span id="recordingStatus">Stopped</span><span id="recordingTime" style="display: none;"></span></p>
@@ -428,6 +448,7 @@ function updateUIToRecording() {
     document.getElementById("stopButton").disabled = false;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
+    document.getElementById("storagePreference").disabled = true;
     // Mutually exclusive with timelapse and transect-auto.
     document.getElementById("timelapseStartBtn").disabled = true;
     document.getElementById("transectEnableBtn").disabled = true;
@@ -451,6 +472,7 @@ function updateUIToStopped() {
     document.getElementById("stopButton").disabled = true;
     document.getElementById("containerFormat").disabled = false;
     document.getElementById("streamProtocol").disabled = false;
+    document.getElementById("storagePreference").disabled = false;
     document.getElementById("timelapseStartBtn").disabled = false;
     document.getElementById("transectEnableBtn").disabled = false;
     document.getElementById("transectCaptureType").disabled = false;
@@ -504,6 +526,7 @@ function updateUIToTimelapse() {
     document.getElementById("transectCaptureType").disabled = true;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
+    document.getElementById("storagePreference").disabled = true;
 }
 
 function updateUIToIdle() {
@@ -518,6 +541,7 @@ function updateUIToIdle() {
     document.getElementById("transectCaptureType").disabled = false;
     document.getElementById("containerFormat").disabled = false;
     document.getElementById("streamProtocol").disabled = false;
+    document.getElementById("storagePreference").disabled = false;
     document.getElementById("timelapseStats").textContent = "Idle";
     clearInterval(recordingTimer);
     document.getElementById("recordingTime").style.display = "none";
@@ -572,6 +596,7 @@ function updateUIToTransectArmed() {
     document.getElementById("transectCaptureType").disabled = true;
     document.getElementById("containerFormat").disabled = true;
     document.getElementById("streamProtocol").disabled = true;
+    document.getElementById("storagePreference").disabled = true;
 }
 
 function updateRecordingTime() {
@@ -604,6 +629,14 @@ async function checkRecordingStatus() {
         if (response.data.stream_protocol && protoSelect !== document.activeElement) {
             protoSelect.value = response.data.stream_protocol;
         }
+        const storageSelect = document.getElementById("storagePreference");
+        if (response.data.storage_preference && storageSelect !== document.activeElement) {
+            storageSelect.value = response.data.storage_preference;
+        }
+
+        // Always refresh the storage card so the operator sees mount /
+        // free-space / failover state in real time.
+        try { renderStorageCard(response.data); } catch (e) { /* tolerate */ }
 
         const tx = response.data.transect;
         const transectOwned = !!(tx && tx.enabled);
@@ -721,19 +754,38 @@ async function fetchVideos() {
         const response = await axios.get('/list');
         const videoList = document.getElementById("videoList");
         videoList.innerHTML = '';
+        // /list now returns objects {name, storage}; fall back to plain
+        // strings for backwards-compatibility with older backends.
         (response.data.videos || []).forEach(video => {
+            const name = (typeof video === 'string') ? video : video.name;
+            const storage = (typeof video === 'string') ? 'local' : (video.storage || 'local');
             const li = document.createElement('li');
             const a = document.createElement('a');
-            a.href = `/download/${video}`;
-            a.textContent = video;
+            a.href = `/download/${encodeURIComponent(name)}?storage=${storage}`;
+            a.textContent = name;
             li.appendChild(a);
+            if (storage === 'usb') {
+                const tag = document.createElement('span');
+                tag.textContent = ' [USB]';
+                tag.style.color = '#1976d2';
+                tag.style.fontSize = '0.85em';
+                li.appendChild(tag);
+            }
             videoList.appendChild(li);
         });
         const tlList = document.getElementById("timelapseList");
         tlList.innerHTML = '';
         (response.data.timelapses || []).forEach(t => {
             const li = document.createElement('li');
+            const storage = t.storage || 'local';
             li.textContent = `${t.name} — ${t.snap_count} snapshot${t.snap_count === 1 ? '' : 's'}`;
+            if (storage === 'usb') {
+                const tag = document.createElement('span');
+                tag.textContent = ' [USB]';
+                tag.style.color = '#1976d2';
+                tag.style.fontSize = '0.85em';
+                li.appendChild(tag);
+            }
             tlList.appendChild(li);
         });
     } catch (error) {
@@ -759,8 +811,101 @@ async function loadConfig() {
         if (response.data.transect_capture_type) {
             document.getElementById("transectCaptureType").value = response.data.transect_capture_type;
         }
+        if (response.data.storage_preference) {
+            document.getElementById("storagePreference").value = response.data.storage_preference;
+        }
     } catch (error) {
         console.error("Error loading config:", error);
+    }
+}
+
+async function saveStoragePreference() {
+    const pref = document.getElementById("storagePreference").value;
+    try {
+        const response = await axios.post('/config', { storage_preference: pref });
+        if (response.data.success) {
+            const badge = document.getElementById("storageSaved");
+            badge.classList.add("visible");
+            setTimeout(() => badge.classList.remove("visible"), 2000);
+        } else {
+            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save storage preference";
+            document.getElementById("errorMessage").style.display = "block";
+            loadConfig();
+        }
+    } catch (error) {
+        const msg = error.response?.data?.message || "Failed to save storage preference";
+        document.getElementById("errorMessage").textContent = msg;
+        document.getElementById("errorMessage").style.display = "block";
+        loadConfig();
+    }
+}
+
+// Render the storage status card from a /status response. Reads
+// usb_storage{ mounted, fstype, free_mb, usable, min_free_gb },
+// storage_preference, usb_recording, usb_failover_count, active_storage.
+function renderStorageCard(d) {
+    const usb = d.usb_storage || {};
+    const pref = d.storage_preference || 'usb';
+    const isRecording = (d.mode && d.mode !== 'idle');
+    const recTo = d.active_storage; // "usb" | "local" | null
+    const failovers = d.usb_failover_count || 0;
+    const sLabel = document.getElementById('storageLabel');
+    const sFree = document.getElementById('storageFree');
+    const sDevice = document.getElementById('storageDevice');
+    const sDetail = document.getElementById('storageDetail');
+
+    // Free-space readout for whichever drive is most relevant.
+    const usbFreeText = (usb.free_mb != null)
+        ? `${(usb.free_mb / 1024).toFixed(1)} GB free`
+        : '';
+    const localFreeText = (d.local_disk_free_mb != null)
+        ? `${(d.local_disk_free_mb / 1024).toFixed(1)} GB free (local)`
+        : '';
+
+    if (isRecording && recTo === 'usb') {
+        sLabel.textContent = 'Recording to USB drive';
+        sFree.textContent = usbFreeText;
+        sDevice.textContent = usb.device || '';
+        sDetail.textContent = `Filesystem: ${usb.fstype || '?'}` +
+            (usb.fstype && /^(vfat|fat|msdos)$/i.test(usb.fstype)
+                ? ' (parts auto-roll at 3.5 GiB to stay under FAT32 4 GiB cap)'
+                : '');
+    } else if (isRecording && recTo === 'local' && failovers > 0) {
+        sLabel.textContent = 'Recording to local SD (USB failover)';
+        sFree.textContent = localFreeText;
+        sDevice.textContent = '';
+        sDetail.textContent = `USB drive lost mid-recording; continued on local storage. Failovers: ${failovers}.`;
+    } else if (isRecording) {
+        sLabel.textContent = 'Recording to local SD';
+        sFree.textContent = localFreeText;
+        sDevice.textContent = '';
+        sDetail.textContent = (pref === 'usb' && !usb.mounted)
+            ? 'USB preference set, but no USB drive detected.'
+            : (pref === 'usb' && usb.mounted && !usb.usable)
+                ? `USB detected but free space below ${usb.min_free_gb || 20} GB - using local.`
+                : 'Local SD selected.';
+    } else if (pref === 'local') {
+        sLabel.textContent = 'Storage: local SD (preferred)';
+        sFree.textContent = localFreeText;
+        sDevice.textContent = '';
+        sDetail.textContent = (usb.mounted && usb.usable)
+            ? 'USB drive detected, but local SD is selected.'
+            : '';
+    } else if (usb.mounted && usb.usable) {
+        sLabel.textContent = 'Storage: USB drive';
+        sFree.textContent = usbFreeText;
+        sDevice.textContent = usb.device || '';
+        sDetail.textContent = `Recordings will go to USB (${usb.fstype || '?'}).`;
+    } else if (usb.mounted && !usb.usable) {
+        sLabel.textContent = 'Storage: local SD (USB nearly full)';
+        sFree.textContent = `USB ${usbFreeText} - ${localFreeText}`;
+        sDevice.textContent = usb.device || '';
+        sDetail.textContent = `USB free space below ${usb.min_free_gb || 20} GB threshold; falling back to local SD.`;
+    } else {
+        sLabel.textContent = 'Storage: local SD';
+        sFree.textContent = localFreeText;
+        sDevice.textContent = '';
+        sDetail.textContent = 'No USB drive detected. Insert a drive to record there.';
     }
 }
 

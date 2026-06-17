@@ -34,6 +34,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends --no-install-su
     gir1.2-gstreamer-1.0 \
     && rm -rf /var/lib/apt/lists/*
 
+# USB filesystem support so the in-container ``mount`` can attach removable
+# drives the BlueOS host hot-plugs into the towfish.  vfat (FAT32) is built
+# into the kernel; exfat-utils + ntfs-3g cover the two other common formats
+# operators use on field USB sticks.  exfat-fuse is intentionally installed
+# alongside the userspace utilities even though usb_storage.py prefers the
+# kernel exfat driver -- it's harmless when the kernel module is in use.
+RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
+    exfat-fuse \
+    exfat-utils \
+    ntfs-3g \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create app directory
 WORKDIR /app
 
@@ -67,7 +79,9 @@ LABEL permissions='\
   "HostConfig": {\
     "Binds": [\
       "/usr/blueos/extensions/videorecorder:/app/videorecordings",\
-      "/dev/video2:/dev/video2"\
+      "/dev/video2:/dev/video2",\
+      "/dev:/dev",\
+      "/mnt:/mnt:rshared"\
     ],\
     "ExtraHosts": ["host.docker.internal:host-gateway"],\
     "PortBindings": {\
