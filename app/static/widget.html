@@ -3,413 +3,785 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Video Recorder Widget</title>
+    <title>Towfish MFD</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --panel: #0d1310;
+            --panel-edge: #1f2a25;
+            --panel-inset: #060a08;
+            --bezel: #1a1e1c;
+            --bezel-highlight: #2a2e2c;
+            --phosphor: #7cf29c;
+            --phosphor-dim: #3f8a53;
+            --phosphor-glow: rgba(124, 242, 156, 0.35);
+            --amber: #f2b34c;
+            --amber-glow: rgba(242, 179, 76, 0.4);
+            --red: #ef5350;
+            --red-glow: rgba(239, 83, 80, 0.45);
+            --sky: #6ec6ff;
+            --sky-glow: rgba(110, 198, 255, 0.35);
+            --off: #4a5852;
+            --ink: #d7e5df;
+            --ink-dim: #8fa89d;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
-
+        html, body { height: 100%; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #1e1e1e;
-            color: #e0e0e0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            font-family: 'Share Tech Mono', ui-monospace, Menlo, Consolas, monospace;
+            color: var(--ink);
+            background:
+                radial-gradient(1200px 800px at 30% -10%, #0a1a15 0%, #050807 60%, #030503 100%);
             min-height: 100vh;
-            padding: 8px;
-        }
-
-        .widget {
-            width: 100%;
-            max-width: 320px;
-            background: #2a2a2a;
-            border-radius: 10px;
-            padding: 16px;
-            box-shadow: 0 2px 12px rgba(0,0,0,0.4);
-        }
-
-        .mode-switch {
+            padding: 10px;
             display: flex;
-            background: #1c1c1c;
-            border-radius: 6px;
-            padding: 3px;
-            margin-bottom: 12px;
+            justify-content: center;
+            align-items: flex-start;
+            letter-spacing: 0.02em;
         }
 
-        .mode-switch button {
-            flex: 1;
+        .mfd {
+            width: 100%;
+            max-width: 360px;
+            border-radius: 14px;
+            padding: 12px;
+            background:
+                linear-gradient(180deg, var(--bezel-highlight) 0%, var(--bezel) 4%, #111512 96%, #0b0d0c 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.05),
+                inset 0 -1px 0 rgba(0,0,0,0.4),
+                0 12px 30px rgba(0,0,0,0.65),
+                0 0 0 1px #050807;
+        }
+
+        .brand {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            padding: 2px 4px 8px 4px;
+        }
+        .brand .name {
+            font-family: 'Orbitron', 'Share Tech Mono', monospace;
+            font-weight: 800;
+            font-size: 14px;
+            letter-spacing: 0.34em;
+            color: var(--ink);
+            text-shadow: 0 0 6px rgba(215,229,223,0.15);
+        }
+        .brand .sub {
+            font-size: 10px;
+            letter-spacing: 0.3em;
+            color: var(--ink-dim);
+        }
+
+        .screen {
+            background:
+                radial-gradient(120% 90% at 50% 0%, #0d1a15 0%, #060a08 55%, #040705 100%);
+            border-radius: 8px;
+            border: 1px solid var(--panel-edge);
+            padding: 10px;
+            box-shadow:
+                inset 0 0 24px rgba(0,0,0,0.7),
+                inset 0 0 0 1px rgba(255,255,255,0.02);
+            position: relative;
+            overflow: hidden;
+        }
+        /* Faint scanlines to sell the CRT look */
+        .screen::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                rgba(0,0,0,0.14) 0px,
+                rgba(0,0,0,0.14) 1px,
+                transparent 1px,
+                transparent 3px
+            );
+            pointer-events: none;
+        }
+        .screen > * { position: relative; z-index: 1; }
+
+        /* --- Tab strip -------------------------------------------------- */
+        .tabs {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 4px;
+            padding: 3px;
+            background: var(--panel-inset);
+            border-radius: 6px;
+            border: 1px solid #0a120e;
+            margin-bottom: 8px;
+        }
+        .tab {
             background: transparent;
-            color: #aaa;
-            border: none;
-            padding: 6px 0;
-            font-size: 12px;
-            font-weight: 600;
-            letter-spacing: 0.4px;
+            color: var(--phosphor-dim);
+            border: 1px solid transparent;
+            padding: 7px 0;
+            font: 700 11px 'Share Tech Mono', monospace;
+            letter-spacing: 0.28em;
             cursor: pointer;
             border-radius: 4px;
-            transition: background 0.15s, color 0.15s;
+            transition: color 0.15s, background 0.15s, box-shadow 0.15s;
         }
-
-        .mode-switch button.active {
-            background: #3a3a3a;
-            color: #fff;
+        .tab.active {
+            color: var(--phosphor);
+            background: linear-gradient(180deg, #10231a 0%, #0a1912 100%);
+            box-shadow:
+                inset 0 0 0 1px #1f4a34,
+                0 0 8px var(--phosphor-glow);
+            text-shadow: 0 0 5px var(--phosphor-glow);
         }
+        .tab:hover:not(.active) { color: var(--phosphor); }
 
-        .mode-switch button:disabled {
-            cursor: not-allowed;
-            opacity: 0.55;
-        }
-
-        .header {
-            display: flex;
-            align-items: center;
+        /* --- Persistent status strip ------------------------------------ */
+        .strip {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
             gap: 8px;
-            margin-bottom: 14px;
-        }
-
-        .rec-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: #555;
-            flex-shrink: 0;
-            transition: background 0.3s;
-        }
-
-        .rec-dot.active.video {
-            background: #e53935;
-            animation: pulse 1.2s infinite;
-        }
-
-        /* Transect monitor: blue while a leg is recording, slower-pulse
-           amber while the monitor is enabled but waiting for the boat
-           to start navigating (state == "waiting"). */
-        .rec-dot.active.transect {
-            background: #4fc3f7;
-            box-shadow: 0 0 8px #4fc3f7;
-        }
-        .rec-dot.armed-transect {
-            background: #ffd54f;
-            box-shadow: 0 0 8px #ffd54f;
-            animation: pulse 1.8s ease-in-out infinite;
-            display: inline-block;
-        }
-
-        .rec-dot.active.timelapse {
-            background: #fb8c00;
-            animation: pulse 1.2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
-        }
-
-        .title {
-            font-size: 13px;
-            font-weight: 600;
-            letter-spacing: 0.3px;
-        }
-
-        .duration {
-            margin-left: auto;
-            font-family: "SF Mono", "Fira Code", monospace;
-            font-size: 13px;
-            color: #999;
-        }
-
-        .duration.active { color: #ef9a9a; }
-        .duration.active.timelapse { color: #ffcc80; }
-        .duration.active.transect { color: #4fc3f7; }
-
-        .btn {
-            width: 100%;
-            padding: 10px;
-            border: none;
+            align-items: center;
+            padding: 6px 8px;
+            background: var(--panel-inset);
+            border: 1px solid #0a120e;
             border-radius: 6px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.2s, opacity 0.2s;
-            letter-spacing: 0.4px;
-        }
-
-        .btn:disabled {
-            opacity: 0.45;
-            cursor: not-allowed;
-        }
-
-        .btn-start {
-            background: #43a047;
-            color: #fff;
-        }
-        .btn-start:hover:not(:disabled) { background: #388e3c; }
-
-        .btn-stop {
-            background: #e53935;
-            color: #fff;
-        }
-        .btn-stop:hover:not(:disabled) { background: #c62828; }
-
-        .btn-stop.timelapse { background: #fb8c00; }
-        .btn-stop.timelapse:hover:not(:disabled) { background: #ef6c00; }
-        .btn-stop.transect { background: #0288d1; }
-        .btn-stop.transect:hover:not(:disabled) { background: #01579b; }
-
-        .file-info {
-            margin-top: 12px;
-            padding: 10px;
-            background: #222;
-            border-radius: 6px;
-            font-size: 12px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 8px;
-            min-height: 38px;
-        }
-
-        .file-name {
-            color: #aaa;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            min-width: 0;
-        }
-
-        .file-size {
-            font-family: "SF Mono", "Fira Code", monospace;
-            font-weight: 600;
-            color: #90caf9;
-            white-space: nowrap;
-            flex-shrink: 0;
-        }
-
-        .file-size.timelapse { color: #ffcc80; }
-        .file-size.transect  { color: #4fc3f7; }
-
-        .stats-row {
-            margin-top: 6px;
-            font-size: 11px;
-            color: #888;
-            display: flex;
-            justify-content: space-between;
-            gap: 8px;
-        }
-
-        .stats-row span.warn { color: #ef9a9a; }
-
-        .capture-row {
-            display: flex;
-            align-items: center;
-            gap: 6px;
             margin-bottom: 8px;
             font-size: 11px;
-            color: #b0bec5;
         }
+        .lamp {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 8px;
+            border-radius: 3px;
+            background: #050807;
+            border: 1px solid #0d1310;
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            color: var(--off);
+        }
+        .lamp .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--off);
+            box-shadow: none;
+        }
+        .lamp.armed { color: var(--red); }
+        .lamp.armed .dot {
+            background: var(--red);
+            box-shadow: 0 0 8px var(--red-glow);
+            animation: pulse 1.6s ease-in-out infinite;
+        }
+        .lamp.disarmed { color: var(--phosphor-dim); }
+        .lamp.disarmed .dot { background: var(--phosphor-dim); }
+
+        .mode-readout {
+            text-align: center;
+            font-weight: 700;
+            letter-spacing: 0.22em;
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            font-size: 12px;
+        }
+        .mode-readout.unknown { color: var(--ink-dim); text-shadow: none; }
+
+        .rec-lamp {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 8px;
+            border-radius: 3px;
+            background: #050807;
+            border: 1px solid #0d1310;
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            color: var(--off);
+        }
+        .rec-lamp .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--off);
+        }
+        .rec-lamp.video { color: var(--red); }
+        .rec-lamp.video .dot { background: var(--red); box-shadow: 0 0 8px var(--red-glow); animation: pulse 1.2s infinite; }
+        .rec-lamp.timelapse { color: var(--amber); }
+        .rec-lamp.timelapse .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber-glow); animation: pulse 1.2s infinite; }
+        .rec-lamp.transect { color: var(--sky); }
+        .rec-lamp.transect .dot { background: var(--sky); box-shadow: 0 0 8px var(--sky-glow); animation: pulse 1.2s infinite; }
+        .rec-lamp.armed-transect { color: var(--amber); }
+        .rec-lamp.armed-transect .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber-glow); animation: pulse 1.8s ease-in-out infinite; }
+
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+        /* Optics micro-readouts on the status strip */
+        .strip-mini {
+            grid-column: 1 / -1;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            padding-top: 6px;
+            border-top: 1px dashed #16221c;
+            margin-top: 6px;
+            font-size: 10px;
+        }
+        .strip-mini .cell {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+        }
+        .strip-mini .label {
+            color: var(--ink-dim);
+            letter-spacing: 0.24em;
+            font-size: 9px;
+        }
+        .strip-mini .value {
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            letter-spacing: 0.12em;
+        }
+        .strip-mini .value.dim {
+            color: var(--ink-dim);
+            text-shadow: none;
+        }
+
+        /* --- Panels & rows ---------------------------------------------- */
+        .panel {
+            display: none;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .panel.active { display: flex; }
+
+        .section {
+            background:
+                linear-gradient(180deg, #0a1611 0%, #06100c 100%);
+            border: 1px solid #16221c;
+            border-radius: 6px;
+            padding: 8px;
+        }
+        .section-title {
+            font-size: 10px;
+            letter-spacing: 0.28em;
+            color: var(--ink-dim);
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+        }
+        .section-title .aux {
+            color: var(--phosphor-dim);
+            letter-spacing: 0.14em;
+            font-size: 10px;
+        }
+
+        .row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+        }
+        .row.three  { grid-template-columns: repeat(3, 1fr); }
+        .row.four   { grid-template-columns: repeat(4, 1fr); }
+        .row + .row { margin-top: 6px; }
+
+        /* --- Hard buttons ----------------------------------------------- */
+        .btn {
+            border: 1px solid #1a2621;
+            background: linear-gradient(180deg, #10201a 0%, #081611 100%);
+            color: var(--phosphor);
+            font: 700 12px 'Share Tech Mono', monospace;
+            letter-spacing: 0.22em;
+            padding: 10px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            transition: background 0.1s, box-shadow 0.1s, transform 0.05s;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.03),
+                inset 0 -1px 0 rgba(0,0,0,0.4);
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+        }
+        .btn:hover:not(:disabled) {
+            background: linear-gradient(180deg, #14291f 0%, #0b1c15 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                0 0 8px var(--phosphor-glow);
+        }
+        .btn:active:not(:disabled),
+        .btn.held:not(:disabled) {
+            background: linear-gradient(180deg, #051009 0%, #030906 100%);
+            box-shadow:
+                inset 0 2px 4px rgba(0,0,0,0.6),
+                0 0 10px var(--phosphor-glow);
+            transform: translateY(1px);
+        }
+        .btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+            text-shadow: none;
+            box-shadow: inset 0 -1px 0 rgba(0,0,0,0.3);
+        }
+        .btn.amber { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
+        .btn.amber:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--amber-glow); }
+        .btn.amber:active:not(:disabled),
+        .btn.amber.held:not(:disabled) { box-shadow: inset 0 2px 4px rgba(0,0,0,0.6), 0 0 10px var(--amber-glow); }
+        .btn.red { color: var(--red); text-shadow: 0 0 4px var(--red-glow); border-color: #401414; }
+        .btn.red:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--red-glow); }
+        .btn.sky { color: var(--sky); text-shadow: 0 0 4px var(--sky-glow); border-color: #143047; }
+        .btn.sky:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--sky-glow); }
+        .btn.active {
+            background: linear-gradient(180deg, #1a3a29 0%, #0e2519 100%);
+            box-shadow:
+                inset 0 0 0 1px #26583d,
+                0 0 10px var(--phosphor-glow);
+        }
+        .btn.small { font-size: 11px; padding: 8px 4px; letter-spacing: 0.14em; }
+        .btn.wide { grid-column: 1 / -1; }
+
+        /* Toggle switch */
+        .toggle-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 4px;
+        }
+        .toggle-row .label {
+            font-size: 11px;
+            letter-spacing: 0.18em;
+            color: var(--ink);
+        }
+        .toggle-row .aux {
+            font-size: 10px;
+            color: var(--ink-dim);
+            letter-spacing: 0.14em;
+        }
+        .toggle {
+            width: 44px;
+            height: 22px;
+            border-radius: 12px;
+            background: #050807;
+            border: 1px solid #0d1310;
+            position: relative;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .toggle::after {
+            content: '';
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--off);
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            transition: left 0.15s, background 0.15s, box-shadow 0.15s;
+        }
+        .toggle.on::after {
+            left: 24px;
+            background: var(--phosphor);
+            box-shadow: 0 0 8px var(--phosphor-glow);
+        }
+
+        /* Big readouts (focus PWM, zoom PWM) */
+        .readout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .readout .box {
+            background: #050807;
+            border: 1px solid #0d1310;
+            border-radius: 4px;
+            padding: 6px 8px;
+            text-align: center;
+        }
+        .readout .label {
+            font-size: 9px;
+            letter-spacing: 0.3em;
+            color: var(--ink-dim);
+            margin-bottom: 4px;
+        }
+        .readout .value {
+            font: 700 18px 'Share Tech Mono', monospace;
+            letter-spacing: 0.12em;
+            color: var(--phosphor);
+            text-shadow: 0 0 6px var(--phosphor-glow);
+        }
+        .readout .value.dim { color: var(--ink-dim); text-shadow: none; }
+        .readout .sub {
+            font-size: 9px;
+            color: var(--ink-dim);
+            letter-spacing: 0.18em;
+            margin-top: 3px;
+        }
+
+        /* Mode select buttons (RECORD tab) */
+        .mode-switch {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 4px;
+            padding: 3px;
+            background: var(--panel-inset);
+            border-radius: 4px;
+            border: 1px solid #0a120e;
+            margin-bottom: 8px;
+        }
+        .mode-switch .btn {
+            padding: 6px 0;
+            font-size: 10px;
+            letter-spacing: 0.16em;
+            border: 1px solid transparent;
+            background: transparent;
+            color: var(--phosphor-dim);
+            text-shadow: none;
+        }
+        .mode-switch .btn.active {
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            background: linear-gradient(180deg, #10231a 0%, #0a1912 100%);
+            box-shadow: inset 0 0 0 1px #1f4a34, 0 0 6px var(--phosphor-glow);
+        }
+        .mode-switch .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+        /* Capture-type dropdown */
+        .capture-row {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+            letter-spacing: 0.2em;
+            color: var(--ink-dim);
+        }
+        .capture-row.visible { display: flex; }
         .capture-row select {
             flex: 1;
-            background: #2a2f3a;
-            color: #e0e0e0;
-            border: 1px solid #3a4150;
+            background: #050807;
+            color: var(--phosphor);
+            border: 1px solid #0d1310;
             border-radius: 4px;
-            padding: 3px 6px;
-            font-size: 11px;
+            padding: 4px 6px;
+            font: 700 11px 'Share Tech Mono', monospace;
+            letter-spacing: 0.12em;
         }
         .capture-row select:disabled { opacity: 0.5; }
 
-        .error-msg {
-            margin-top: 8px;
+        .file-info {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 8px;
+            align-items: center;
             padding: 6px 8px;
-            background: #4a1c1c;
+            background: #050807;
+            border: 1px solid #0d1310;
             border-radius: 4px;
             font-size: 11px;
-            color: #ef9a9a;
+            min-height: 34px;
+        }
+        .file-name {
+            color: var(--ink-dim);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            letter-spacing: 0.08em;
+        }
+        .file-size {
+            color: var(--phosphor);
+            font-weight: 700;
+            text-shadow: 0 0 4px var(--phosphor-glow);
+        }
+        .file-size.timelapse { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
+        .file-size.transect  { color: var(--sky);   text-shadow: 0 0 4px var(--sky-glow); }
+
+        .stats-row {
+            font-size: 10px;
+            color: var(--ink-dim);
+            letter-spacing: 0.1em;
+            padding: 0 2px;
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .stats-row .warn { color: var(--amber); }
+
+        .duration {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+            color: var(--ink-dim);
+            letter-spacing: 0.12em;
+        }
+        .duration.active { color: var(--red); }
+        .duration.active.timelapse { color: var(--amber); }
+        .duration.active.transect  { color: var(--sky); }
+
+        .error-msg {
+            padding: 6px 8px;
+            background: #2b0808;
+            border: 1px solid #501313;
+            border-radius: 4px;
+            font-size: 10px;
+            letter-spacing: 0.14em;
+            color: #ffb4b4;
             display: none;
+        }
+
+        .hint {
+            font-size: 9px;
+            color: var(--ink-dim);
+            letter-spacing: 0.18em;
+            padding: 2px 4px;
         }
     </style>
 </head>
 <body>
-    <div class="widget">
-        <div class="mode-switch" id="modeSwitch">
-            <button id="modeVideoBtn" class="active" onclick="setMode('video')">VIDEO</button>
-            <button id="modeTimelapseBtn" onclick="setMode('timelapse')">TIMELAPSE 2 Hz</button>
-            <button id="modeTransectBtn"  onclick="setMode('transect')">TRANSECT AUTO</button>
-        </div>
-
-        <div class="capture-row" id="captureRow" style="display:none;">
-            <label for="transectCapture">Capture:</label>
-            <select id="transectCapture" onchange="saveCaptureType()">
-                <option value="video">Video (.ts/leg)</option>
-                <option value="timelapse">Images 2 Hz/leg</option>
-            </select>
-        </div>
-
-        <div class="header">
-            <div class="rec-dot" id="recDot"></div>
-            <span class="title" id="modeTitle">Video Recorder</span>
-            <span class="duration" id="duration">00:00:00</span>
-        </div>
-
-        <button class="btn btn-start" id="actionBtn" onclick="toggleActive()">
-            Start Recording
-        </button>
-
-        <div class="file-info">
-            <span class="file-name" id="fileName">No files yet</span>
-            <span class="file-size" id="fileSize"></span>
-        </div>
-
-        <div class="stats-row" id="statsRow"></div>
-
-        <div class="error-msg" id="errorMsg"></div>
+<div class="mfd">
+    <div class="brand">
+        <div class="name">TOWFISH MFD</div>
+        <div class="sub">V0.9</div>
     </div>
 
-<script>
-const actionBtn       = document.getElementById('actionBtn');
-const recDot          = document.getElementById('recDot');
-const durationEl      = document.getElementById('duration');
-const fileNameEl      = document.getElementById('fileName');
-const fileSizeEl      = document.getElementById('fileSize');
-const errorMsg        = document.getElementById('errorMsg');
-const modeVideoBtn    = document.getElementById('modeVideoBtn');
-const modeTimelapseBtn= document.getElementById('modeTimelapseBtn');
-const modeTransectBtn = document.getElementById('modeTransectBtn');
-const modeTitle       = document.getElementById('modeTitle');
-const statsRow        = document.getElementById('statsRow');
-const captureRow      = document.getElementById('captureRow');
-const transectCapture = document.getElementById('transectCapture');
+    <div class="screen">
+        <!-- Tab strip -->
+        <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="record">RECORD</button>
+            <button class="tab" data-tab="vehicle">VEHICLE</button>
+            <button class="tab" data-tab="optics">OPTICS</button>
+        </div>
 
-// Local mode selection (what the user has *picked*); the active mode
-// reported by the server is in serverMode and overrides UI when active.
+        <!-- Persistent status strip -->
+        <div class="strip">
+            <div class="lamp disarmed" id="armLamp"><span class="dot"></span><span id="armLabel">SAFE</span></div>
+            <div class="mode-readout unknown" id="modeReadout">--</div>
+            <div class="rec-lamp" id="recLamp"><span class="dot"></span><span id="recLabel">IDLE</span></div>
+            <div class="strip-mini">
+                <div class="cell"><div class="label">TILT</div><div class="value dim" id="miniTilt">--</div></div>
+                <div class="cell"><div class="label">ZOOM</div><div class="value dim" id="miniZoom">--</div></div>
+                <div class="cell"><div class="label">FOCUS</div><div class="value dim" id="miniFocus">--</div></div>
+                <div class="cell"><div class="label">DUR</div><div class="value duration dim" id="duration">00:00:00</div></div>
+            </div>
+        </div>
+
+        <!-- RECORD -->
+        <section class="panel active" id="panel-record">
+            <div class="mode-switch" id="modeSwitch">
+                <button class="btn small" id="modeVideoBtn" data-mode="video">VIDEO</button>
+                <button class="btn small" id="modeTimelapseBtn" data-mode="timelapse">TIMELAPSE</button>
+                <button class="btn small" id="modeTransectBtn" data-mode="transect">TRANSECT</button>
+            </div>
+            <div class="capture-row" id="captureRow">
+                <span>CAPTURE</span>
+                <select id="transectCapture">
+                    <option value="video">Video (.ts / leg)</option>
+                    <option value="timelapse">Images 2 Hz / leg</option>
+                </select>
+            </div>
+            <button class="btn wide" id="actionBtn">START RECORDING</button>
+            <div class="file-info">
+                <span class="file-name" id="fileName">No files yet</span>
+                <span class="file-size" id="fileSize"></span>
+            </div>
+            <div class="stats-row" id="statsRow"></div>
+        </section>
+
+        <!-- VEHICLE -->
+        <section class="panel" id="panel-vehicle">
+            <div class="section">
+                <div class="section-title">ARMING</div>
+                <div class="row">
+                    <button class="btn red"   id="vehArmBtn">ARM</button>
+                    <button class="btn amber" id="vehDisarmBtn">DISARM</button>
+                </div>
+            </div>
+            <div class="section">
+                <div class="section-title">FLIGHT MODE</div>
+                <div class="row">
+                    <button class="btn" id="vehStabilizeBtn">STABILIZE</button>
+                    <button class="btn" id="vehAltHoldBtn">ALT_HOLD</button>
+                </div>
+            </div>
+            <div class="section">
+                <div class="section-title">DEPTH JOG <span class="aux">RC3 - hold</span></div>
+                <div class="row">
+                    <button class="btn amber" id="thrustUpBtn">▲ UP</button>
+                    <button class="btn amber" id="thrustDownBtn">▼ DOWN</button>
+                </div>
+                <div class="hint">RELEASE TO HAND OFF TO ALT_HOLD</div>
+            </div>
+            <div class="section">
+                <div class="section-title">CAMERA MOUNT</div>
+                <div class="row">
+                    <button class="btn wide" id="tiltDownBtn">TILT DOWN (-70°)</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- OPTICS -->
+        <section class="panel" id="panel-optics">
+            <div class="section">
+                <div class="section-title">ZOOM</div>
+                <div class="row three">
+                    <button class="btn" data-zoom="out">OUT</button>
+                    <button class="btn" data-zoom="half">HALF</button>
+                    <button class="btn" data-zoom="full">FULL</button>
+                </div>
+            </div>
+            <div class="section">
+                <div class="section-title">FOCUS <span class="aux" id="focusTrimLabel">TRIM 61.0%</span></div>
+                <div class="readout">
+                    <div class="box"><div class="label">PWM</div><div class="value" id="focusPwmBig">----</div><div class="sub" id="focusPctSub">--%</div></div>
+                    <div class="box"><div class="label">SET</div><div class="value" id="focusTargetBig">----</div><div class="sub">RANGE</div></div>
+                </div>
+                <div class="row four" style="margin-top:8px;">
+                    <button class="btn small" data-focus-delta="-2.0">◀◀</button>
+                    <button class="btn small" data-focus-delta="-0.4">◀</button>
+                    <button class="btn small" data-focus-delta="0.4">▶</button>
+                    <button class="btn small" data-focus-delta="2.0">▶▶</button>
+                </div>
+                <div class="row" style="margin-top:6px;">
+                    <button class="btn amber small" id="focusTrimBtn">SNAP TO TRIM</button>
+                    <button class="btn small" id="focusRefreshBtn">REFRESH</button>
+                </div>
+            </div>
+            <div class="section">
+                <div class="section-title">WHITE BALANCE</div>
+                <div class="row">
+                    <button class="btn sky"   id="awbOnceBtn">ONE-PUSH AWB</button>
+                    <div class="toggle-row">
+                        <div>
+                            <div class="label">LOOP (2 MIN)</div>
+                            <div class="aux" id="awbLoopStatus">off in transect</div>
+                        </div>
+                        <div class="toggle" id="awbLoopToggle" role="switch" aria-checked="false"></div>
+                    </div>
+                </div>
+                <div class="hint" id="awbLastHint">no AWB triggered yet</div>
+            </div>
+        </section>
+
+        <div class="error-msg" id="errorMsg" style="margin-top:8px;"></div>
+    </div>
+</div>
+
+<script>
+// ============================================================================
+// Cockpit MFD widget logic.
+//
+// Talks to the Flask backend (`app/main.py`) on the same origin. Every write
+// (arm, mode, tilt, focus, zoom, AWB, thrust) routes through a POST endpoint
+// so the server keeps the source of truth for state. Status polling at 2 Hz
+// (matches previous widget cadence) reconciles UI with server state.
+// ============================================================================
+
+const $ = (id) => document.getElementById(id);
+
+// -- Tab management ----------------------------------------------------------
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const target = tab.dataset.tab;
+        document.querySelectorAll('.panel').forEach(p =>
+            p.classList.toggle('active', p.id === `panel-${target}`));
+    });
+});
+
+// -- RECORD tab state (preserved from previous widget) -----------------------
+const actionBtn        = $('actionBtn');
+const durationEl       = $('duration');
+const fileNameEl       = $('fileName');
+const fileSizeEl       = $('fileSize');
+const errorMsg         = $('errorMsg');
+const modeVideoBtn     = $('modeVideoBtn');
+const modeTimelapseBtn = $('modeTimelapseBtn');
+const modeTransectBtn  = $('modeTransectBtn');
+const statsRow         = $('statsRow');
+const captureRow       = $('captureRow');
+const transectCapture  = $('transectCapture');
+
 let selectedMode = 'video';
-let serverMode   = 'idle';
-// Transect monitor state: 'disabled' | 'waiting' | 'recording'. The
-// monitor can be enabled (waiting) while serverMode is still 'idle';
-// we keep this separate so the action button correctly reads "Disable
-// Transect Auto" even before the boat starts navigating.
+let serverMode = 'idle';
 let transectMonState = 'disabled';
-let startTime    = null;
-let durationTimer= null;
+let startTime = null;
+let durationTimer = null;
 
 function isActive() {
-    return serverMode === 'video'
-        || serverMode === 'timelapse'
-        || serverMode === 'transect';
+    return serverMode === 'video' || serverMode === 'timelapse' || serverMode === 'transect';
 }
-
 function isTransectOwned() {
-    // True whenever the transect monitor is in charge -- either
-    // currently recording a leg or just waiting for the mission to
-    // start. Used so the mode-switch buttons lock to TRANSECT AUTO
-    // while the monitor is engaged.
     return serverMode === 'transect' || transectMonState !== 'disabled';
 }
-
 function activeMode() {
     if (isTransectOwned()) return 'transect';
     return isActive() ? serverMode : selectedMode;
 }
-
 function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
+    if (!bytes) return '';
     const units = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(1024));
     return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
 }
-
 function formatDuration(ms) {
-    const s  = Math.floor(ms / 1000) % 60;
-    const m  = Math.floor(ms / 60000) % 60;
-    const h  = Math.floor(ms / 3600000);
+    const s = Math.floor(ms / 1000) % 60;
+    const m = Math.floor(ms / 60000) % 60;
+    const h = Math.floor(ms / 3600000);
     return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
 }
-
 function showError(msg) {
     errorMsg.textContent = msg;
     errorMsg.style.display = 'block';
-    setTimeout(() => { errorMsg.style.display = 'none'; }, 5000);
+    clearTimeout(showError._t);
+    showError._t = setTimeout(() => { errorMsg.style.display = 'none'; }, 5000);
 }
 
-function setMode(m) {
-    // Block mode changes while ANY mode is engaged (manual recording,
-    // timelapse, or transect monitor enabled).
-    if (isActive() || isTransectOwned()) return;
-    selectedMode = m;
-    modeVideoBtn.classList.toggle('active',     m === 'video');
-    modeTimelapseBtn.classList.toggle('active', m === 'timelapse');
-    modeTransectBtn.classList.toggle('active',  m === 'transect');
-    renderUI();
-}
+document.querySelectorAll('.mode-switch .btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        if (isActive() || isTransectOwned()) return;
+        selectedMode = btn.dataset.mode;
+        modeVideoBtn.classList.toggle('active',     selectedMode === 'video');
+        modeTimelapseBtn.classList.toggle('active', selectedMode === 'timelapse');
+        modeTransectBtn.classList.toggle('active',  selectedMode === 'transect');
+        renderRecordUI();
+    });
+});
 
-function renderUI() {
+modeVideoBtn.classList.add('active');
+
+function renderRecordUI() {
     const m = activeMode();
     const active = isActive();
     const transectOwned = isTransectOwned();
 
     if (m === 'video') {
-        modeTitle.textContent = 'Video Recorder';
-        actionBtn.textContent = active ? 'Stop Recording' : 'Start Recording';
+        actionBtn.textContent = active ? 'STOP RECORDING' : 'START RECORDING';
+        actionBtn.className = 'btn wide' + (active ? ' red' : '');
     } else if (m === 'timelapse') {
-        modeTitle.textContent = 'Timelapse Snapshots';
-        actionBtn.textContent = active ? 'Stop Timelapse' : 'Start Timelapse';
+        actionBtn.textContent = active ? 'STOP TIMELAPSE' : 'START TIMELAPSE';
+        actionBtn.className = 'btn wide amber' + (active ? ' active' : '');
     } else {
-        // Transect: action toggles the monitor, not the recording.
-        // Title shows the underlying sub-state so the operator can
-        // tell the difference between "armed but waiting" and "recording".
         if (transectMonState === 'recording') {
-            modeTitle.textContent = 'Transect Auto -- Recording';
+            actionBtn.textContent = 'DISABLE TRANSECT (REC)';
         } else if (transectMonState === 'waiting') {
-            modeTitle.textContent = 'Transect Auto -- Waiting for AUTO';
+            actionBtn.textContent = 'DISABLE TRANSECT (WAIT)';
         } else {
-            modeTitle.textContent = 'Transect Auto';
+            actionBtn.textContent = transectOwned ? 'DISABLE TRANSECT' : 'ENABLE TRANSECT';
         }
-        actionBtn.textContent = transectOwned
-            ? 'Disable Transect Auto'
-            : 'Enable Transect Auto';
+        actionBtn.className = 'btn wide sky' + (transectOwned ? ' active' : '');
     }
+    actionBtn.disabled = false;
 
-    actionBtn.className = 'btn ' + ((active || transectOwned) ? 'btn-stop' : 'btn-start');
-    if (active && m === 'timelapse') actionBtn.classList.add('timelapse');
-    if (transectOwned)               actionBtn.classList.add('transect');
-
-    recDot.className = 'rec-dot';
-    durationEl.className = 'duration';
-    if (active) {
-        recDot.classList.add('active', m);
-        durationEl.classList.add('active');
-        if (m === 'timelapse') durationEl.classList.add('timelapse');
-        if (m === 'transect')  durationEl.classList.add('transect');
-    } else if (transectOwned && transectMonState === 'waiting') {
-        // Distinct "armed but not yet recording" indicator.
-        recDot.classList.add('armed-transect');
-    }
-
-    // Lock mode buttons while anything is engaged so the operator
-    // can't accidentally switch tracks mid-mission.
     const lock = active || transectOwned;
     modeVideoBtn.disabled = lock;
     modeTimelapseBtn.disabled = lock;
     modeTransectBtn.disabled = lock;
-    actionBtn.disabled = false;
 
-    // Capture-type selector only matters for transect; lock it once the
-    // monitor is engaged (capture type is fixed for the session).
-    captureRow.style.display = (m === 'transect') ? 'flex' : 'none';
+    captureRow.classList.toggle('visible', m === 'transect');
     transectCapture.disabled = transectOwned;
-}
-
-async function saveCaptureType() {
-    try {
-        const res = await fetch('/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ transect_capture_type: transectCapture.value }),
-        });
-        const data = await res.json();
-        if (!data.success) showError(data.message || 'Failed to set capture type');
-    } catch (e) {
-        showError('Connection error');
-    }
 }
 
 function startDurationTimer(serverDurationSec) {
@@ -424,7 +796,6 @@ function startDurationTimer(serverDurationSec) {
         }, 500);
     }
 }
-
 function stopDurationTimer() {
     clearInterval(durationTimer);
     durationTimer = null;
@@ -432,14 +803,9 @@ function stopDurationTimer() {
     durationEl.textContent = '00:00:00';
 }
 
-async function toggleActive() {
+actionBtn.addEventListener('click', async () => {
     actionBtn.disabled = true;
     errorMsg.style.display = 'none';
-
-    // Pick endpoint based on what's *currently* engaged. Transect has
-    // its own enable/disable pair because the recording start is
-    // delegated to the monitor (it spins up a RecordingSession when
-    // the boat starts navigating, not when the user clicks).
     let endpoint;
     const transectOwned = isTransectOwned();
     if (transectOwned) {
@@ -453,16 +819,14 @@ async function toggleActive() {
     } else {
         endpoint = '/start';
     }
-
     try {
-        const res  = await fetch(endpoint);
+        const res = await fetch(endpoint);
         const data = await res.json();
         if (!data.success) {
             showError(data.message || 'Request failed');
             actionBtn.disabled = false;
             return;
         }
-        // Optimistic UI update; pollStatus will reconcile within ~2 s.
         if (endpoint === '/transect/enable') {
             transectMonState = 'waiting';
         } else if (endpoint === '/transect/disable') {
@@ -476,36 +840,157 @@ async function toggleActive() {
             serverMode = 'idle';
             stopDurationTimer();
         }
-        renderUI();
+        renderRecordUI();
     } catch (e) {
         showError('Connection error');
         actionBtn.disabled = false;
     }
+});
+
+transectCapture.addEventListener('change', async () => {
+    try {
+        const res = await fetch('/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transect_capture_type: transectCapture.value }),
+        });
+        const data = await res.json();
+        if (!data.success) showError(data.message || 'Failed to set capture type');
+    } catch (e) { showError('Connection error'); }
+});
+
+// -- VEHICLE tab -------------------------------------------------------------
+async function postJson(url, body) {
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json();
+        if (!data.success) showError(data.message || `${url} failed`);
+        return data;
+    } catch (e) {
+        showError('Connection error');
+        return null;
+    }
 }
 
+$('vehArmBtn').addEventListener('click',    () => postJson('/vehicle/arm',  { armed: true }));
+$('vehDisarmBtn').addEventListener('click', () => postJson('/vehicle/arm',  { armed: false }));
+$('vehStabilizeBtn').addEventListener('click', () => postJson('/vehicle/mode', { mode: 'stabilize' }));
+$('vehAltHoldBtn').addEventListener('click',   () => postJson('/vehicle/mode', { mode: 'althold' }));
+$('tiltDownBtn').addEventListener('click',     () => postJson('/vehicle/tilt-down', {}));
+
+// Hold-to-thrust: while pointer is down we ping /vehicle/thrust every
+// 200 ms with a keep-alive; on release we send /vehicle/thrust/stop.
+// The backend also times out on its own if the ping stops arriving.
+function bindHold(el, direction) {
+    let active = false;
+    let iv = null;
+    const start = (e) => {
+        e.preventDefault();
+        if (active) return;
+        active = true;
+        el.classList.add('held');
+        postJson('/vehicle/thrust', { direction });
+        iv = setInterval(() => postJson('/vehicle/thrust', { direction }), 200);
+    };
+    const stop = () => {
+        if (!active) return;
+        active = false;
+        el.classList.remove('held');
+        clearInterval(iv);
+        iv = null;
+        postJson('/vehicle/thrust/stop', {});
+    };
+    el.addEventListener('pointerdown', start);
+    el.addEventListener('pointerup', stop);
+    el.addEventListener('pointerleave', stop);
+    el.addEventListener('pointercancel', stop);
+    // Safety: release if the tab hides (user swipes away).
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
+}
+bindHold($('thrustUpBtn'), 'up');
+bindHold($('thrustDownBtn'), 'down');
+
+// -- OPTICS tab --------------------------------------------------------------
+//
+// The frontend caches the most recently commanded focus PWM (from the
+// /optics/focus response) so the SET readout has something to show even
+// while the servo is still moving toward that target.
+let focusTargetPwm = null;
+async function focusPost(body) {
+    const data = await postJson('/optics/focus', body);
+    if (data && data.success && data.expected_pwm != null) {
+        focusTargetPwm = data.expected_pwm;
+    }
+    return data;
+}
+
+document.querySelectorAll('[data-zoom]').forEach(btn => {
+    btn.addEventListener('click', () => postJson('/optics/zoom', { preset: btn.dataset.zoom }));
+});
+document.querySelectorAll('[data-focus-delta]').forEach(btn => {
+    let iv = null;
+    const step = () => focusPost({ delta_pct: parseFloat(btn.dataset.focusDelta) });
+    const start = (e) => {
+        e.preventDefault();
+        step();
+        // Hold-repeat at ~8 Hz so a long press nudges smoothly without
+        // saturating mavlink2rest with duplicate ACCEPTED cmds.
+        iv = setInterval(step, 130);
+        btn.classList.add('held');
+    };
+    const stop = () => { clearInterval(iv); iv = null; btn.classList.remove('held'); };
+    btn.addEventListener('pointerdown', start);
+    btn.addEventListener('pointerup', stop);
+    btn.addEventListener('pointerleave', stop);
+    btn.addEventListener('pointercancel', stop);
+});
+$('focusTrimBtn').addEventListener('click', () => focusPost({ trim: true }));
+$('focusRefreshBtn').addEventListener('click', () => {
+    focusTargetPwm = null;
+    pollStatus();
+});
+$('awbOnceBtn').addEventListener('click', async () => {
+    const data = await postJson('/optics/awb', {});
+    if (data && data.success) {
+        $('awbLastHint').textContent = 'AWB triggered ' + new Date().toLocaleTimeString();
+    }
+});
+$('awbLoopToggle').addEventListener('click', async () => {
+    const wanted = !$('awbLoopToggle').classList.contains('on');
+    const data = await postJson('/config', { awb_loop_enabled: wanted });
+    if (data && data.success) {
+        setAwbToggle(!!data.awb_loop_enabled);
+    }
+});
+
+function setAwbToggle(on) {
+    $('awbLoopToggle').classList.toggle('on', on);
+    $('awbLoopToggle').setAttribute('aria-checked', on ? 'true' : 'false');
+    $('awbLoopStatus').textContent = on
+        ? 'fires in transect mode'
+        : 'off (manual only)';
+}
+
+// -- Poller ------------------------------------------------------------------
 async function pollStatus() {
     try {
-        const res  = await fetch('/status');
+        const res = await fetch('/status');
         const data = await res.json();
+        // Record state
         const newMode = data.mode || (data.recording ? 'video' : 'idle');
         const wasActive = isActive() || isTransectOwned();
         serverMode = newMode;
-        // Capture monitor state separately so we know "monitor enabled
-        // but waiting" -- the recorder mode goes back to 'idle' between
-        // legs but the monitor is still in charge.
         const tx = data.transect || null;
         transectMonState = tx && tx.enabled ? (tx.state || 'waiting') : 'disabled';
-        // Keep the capture-type selector in sync with the server's
-        // configured default, unless the operator is actively choosing.
         if (tx && transectCapture !== document.activeElement && !isTransectOwned()) {
             const cfg = tx.configured_capture_type || tx.capture_type;
             if (cfg) transectCapture.value = cfg;
         }
-
         if (isActive()) {
-            // Sync the selected mode to whatever the server is doing so
-            // the UI doesn't flip mid-recording on external start. The
-            // transect mode also locks selectedMode below.
             if (selectedMode !== serverMode && !isTransectOwned()) {
                 selectedMode = serverMode;
                 modeVideoBtn.classList.toggle('active',     serverMode === 'video');
@@ -516,71 +1001,134 @@ async function pollStatus() {
         } else if (wasActive && !isTransectOwned()) {
             stopDurationTimer();
         }
-
-        // While the monitor is engaged, the UI should always show
-        // TRANSECT AUTO as the selected mode so the button labels and
-        // colours line up.
         if (isTransectOwned()) {
             selectedMode = 'transect';
-            modeVideoBtn.classList.toggle('active',     false);
+            modeVideoBtn.classList.toggle('active', false);
             modeTimelapseBtn.classList.toggle('active', false);
-            modeTransectBtn.classList.toggle('active',  true);
+            modeTransectBtn.classList.toggle('active', true);
         }
 
-        // Stats line
+        // Status strip: armed lamp
+        const veh = data.vehicle || {};
+        const armLamp  = $('armLamp');
+        const armLabel = $('armLabel');
+        armLamp.className = 'lamp';
+        if (veh.armed === true) {
+            armLamp.classList.add('armed');
+            armLabel.textContent = 'ARMED';
+        } else if (veh.armed === false) {
+            armLamp.classList.add('disarmed');
+            armLabel.textContent = 'SAFE';
+        } else {
+            armLabel.textContent = '???';
+        }
+
+        // Mode readout
+        const modeReadout = $('modeReadout');
+        if (veh.mode_label) {
+            modeReadout.textContent = veh.mode_label;
+            modeReadout.className = 'mode-readout';
+        } else {
+            modeReadout.textContent = veh.custom_mode != null ? `MODE ${veh.custom_mode}` : '--';
+            modeReadout.className = 'mode-readout unknown';
+        }
+
+        // Rec lamp
+        const recLamp = $('recLamp');
+        const recLabel = $('recLabel');
+        recLamp.className = 'rec-lamp';
+        if (serverMode === 'video') { recLamp.classList.add('video'); recLabel.textContent = 'REC'; }
+        else if (serverMode === 'timelapse') { recLamp.classList.add('timelapse'); recLabel.textContent = 'TL'; }
+        else if (serverMode === 'transect')  { recLamp.classList.add('transect');  recLabel.textContent = 'XT'; }
+        else if (isTransectOwned() && transectMonState === 'waiting') { recLamp.classList.add('armed-transect'); recLabel.textContent = 'STBY'; }
+        else { recLabel.textContent = 'IDLE'; }
+
+        // Optics mini
+        const opt = data.optics || {};
+        setMini('miniTilt',  opt.tilt_pwm,  opt.tilt_deg != null ? `${opt.tilt_pwm} / ${opt.tilt_deg.toFixed(0)}°` : (opt.tilt_pwm != null ? String(opt.tilt_pwm) : '--'));
+        setMini('miniZoom',  opt.zoom_pwm,  opt.zoom_pwm != null ? String(opt.zoom_pwm) : '--');
+        setMini('miniFocus', opt.focus_pwm, opt.focus_pwm != null ? String(opt.focus_pwm) : '--');
+        durationEl.classList.toggle('active', isActive());
+        durationEl.classList.toggle('timelapse', serverMode === 'timelapse');
+        durationEl.classList.toggle('transect',  serverMode === 'transect');
+        durationEl.classList.toggle('dim', !isActive());
+
+        // OPTICS panel readout
+        $('focusPwmBig').textContent  = opt.focus_pwm != null ? opt.focus_pwm : '----';
+        $('focusPwmBig').className    = 'value' + (opt.focus_pwm == null ? ' dim' : '');
+        $('focusPctSub').textContent  = opt.focus_pct != null ? `${opt.focus_pct.toFixed(1)}%` : '--%';
+        // "SET" tile is the expected PWM after the last successful focus
+        // POST. Server tells us via /optics/focus's response, but as a
+        // useful passive display we just mirror the live PWM here when
+        // no in-flight target is known.
+        $('focusTargetBig').textContent = focusTargetPwm != null ? focusTargetPwm : (opt.focus_pwm != null ? opt.focus_pwm : '----');
+        $('focusTrimLabel').textContent = opt.focus_trim_pct != null
+            ? `TRIM ${opt.focus_trim_pct.toFixed(1)}%`
+            : 'TRIM 61.0%';
+
+        // AWB toggle + hint
+        setAwbToggle(!!data.awb_loop_enabled);
+        if (data.awb_last_success_at) {
+            const at = new Date(data.awb_last_success_at);
+            $('awbLastHint').textContent =
+                `last AWB ${at.toLocaleTimeString()}` +
+                (data.awb_loop_active ? ' (loop active)' : '');
+        } else if (data.awb_last_error) {
+            $('awbLastHint').textContent = `error: ${data.awb_last_error}`;
+        }
+
+        // Record stats
         if (serverMode === 'video' && !isTransectOwned()) {
             const restarts = data.restarts || 0;
             const errs = data.gst_errors || 0;
             const stalls = data.file_stalls || 0;
             const parts = [];
-            if (restarts > 0) parts.push(`<span class="warn">restarts: ${restarts}</span>`);
-            if (errs > 0)     parts.push(`<span class="warn">errs: ${errs}</span>`);
-            if (stalls > 0)   parts.push(`<span class="warn">stalls: ${stalls}</span>`);
-            parts.push(`free: ${data.disk_free_mb || 0} MB`);
+            if (restarts > 0) parts.push(`<span class="warn">restarts ${restarts}</span>`);
+            if (errs > 0)     parts.push(`<span class="warn">errs ${errs}</span>`);
+            if (stalls > 0)   parts.push(`<span class="warn">stalls ${stalls}</span>`);
+            parts.push(`free ${data.disk_free_mb || 0}MB`);
             statsRow.innerHTML = parts.join(' &middot; ');
         } else if (serverMode === 'timelapse') {
             const tl = data.timelapse || {};
-            const parts = [`snaps: ${tl.snap_count || 0}`];
-            if (tl.miss_count > 0) parts.push(`<span class="warn">misses: ${tl.miss_count}</span>`);
-            // Sync skew = ms between snap & GPS sample landing.
-            // Highlight in yellow if either GPS lagged the snap by
-            // more than half a snap period (250 ms @ 2 Hz).
+            const parts = [`snaps ${tl.snap_count || 0}`];
+            if (tl.miss_count > 0) parts.push(`<span class="warn">miss ${tl.miss_count}</span>`);
             const skew = tl.last_sync_skew_ms;
             if (typeof skew === 'number' && skew >= 0) {
                 const cls = skew > 250 ? 'warn' : '';
-                parts.push(`<span class="${cls}">sync: ${skew.toFixed(0)} ms</span>`);
+                parts.push(`<span class="${cls}">sync ${skew.toFixed(0)}ms</span>`);
             }
-            parts.push(`free: ${data.disk_free_mb || 0} MB`);
+            parts.push(`free ${data.disk_free_mb || 0}MB`);
             statsRow.innerHTML = parts.join(' &middot; ');
         } else if (isTransectOwned()) {
-            // Transect status line: state, current seq + leg count,
-            // wp_dist when navigating, AUTO/armed flags, and the most
-            // recent event so the operator can see what just happened.
-            const parts = [`state: <strong>${tx.state}</strong>`];
-            if (tx.mission_seq !== null && tx.mission_seq !== undefined) {
-                parts.push(`seq: ${tx.mission_seq}`);
-            }
-            if (tx.leg_count > 0) parts.push(`legs: ${tx.leg_count}`);
+            const parts = [`state <strong>${tx.state}</strong>`];
+            if (tx.mission_seq != null) parts.push(`seq ${tx.mission_seq}`);
+            if (tx.leg_count > 0) parts.push(`legs ${tx.leg_count}`);
             if (typeof tx.wp_dist === 'number' && tx.wp_dist > 0) {
-                parts.push(`wp_dist: ${tx.wp_dist.toFixed(1)} m`);
+                parts.push(`wp ${tx.wp_dist.toFixed(1)}m`);
             }
             const flags = [];
             if (tx.mode_num !== 10) flags.push(`mode=${tx.mode_num}`);
             if (tx.armed === false) flags.push('disarmed');
             if (flags.length) parts.push(`<span class="warn">${flags.join(' ')}</span>`);
-            parts.push(`free: ${data.disk_free_mb || 0} MB`);
+            parts.push(`free ${data.disk_free_mb || 0}MB`);
             statsRow.innerHTML = parts.join(' &middot; ');
         } else {
             statsRow.innerHTML = '';
         }
 
-        renderUI();
+        renderRecordUI();
     } catch (_) {}
+}
+
+function setMini(id, pwm, text) {
+    const el = $(id);
+    el.textContent = text;
+    el.classList.toggle('dim', pwm == null);
 }
 
 async function pollFileSize() {
     try {
-        const res  = await fetch('/filesize');
+        const res = await fetch('/filesize');
         const data = await res.json();
         if (data.success && data.filename) {
             let label = data.filename;
@@ -594,18 +1142,16 @@ async function pollFileSize() {
         } else {
             fileNameEl.textContent = 'No files yet';
             fileSizeEl.textContent = '';
-            fileSizeEl.classList.remove('timelapse');
-            fileSizeEl.classList.remove('transect');
+            fileSizeEl.classList.remove('timelapse', 'transect');
         }
     } catch (_) {}
 }
 
-renderUI();
+renderRecordUI();
 pollStatus();
 pollFileSize();
-
-setInterval(pollStatus,   2000);
-setInterval(pollFileSize,  1000);
+setInterval(pollStatus,  2000);
+setInterval(pollFileSize, 1000);
 </script>
 </body>
 </html>

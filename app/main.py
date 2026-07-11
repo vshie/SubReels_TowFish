@@ -23,6 +23,21 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402  (after require_version)
 
 import usb_storage
+from mavlink_writer import (
+    MavlinkWriter,
+    get_default_writer,
+    MODE_STABILIZE,
+    MODE_ALT_HOLD,
+    MODE_MANUAL,
+    Z_CHANNEL,
+    Z_PWM_ASCEND,
+    Z_PWM_DESCEND,
+    Z_PWM_NEUTRAL,
+    focus_pwm_to_pct,
+    focus_pct_to_pwm,
+    FOCUS_PWM_MIN as MAV_FOCUS_PWM_MIN,
+    FOCUS_PWM_MAX as MAV_FOCUS_PWM_MAX,
+)
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
@@ -143,6 +158,20 @@ VALID_TRANSECT_CAPTURE_TYPES = ("video", "timelapse")
 DEFAULT_STORAGE_PREFERENCE = "usb"
 VALID_STORAGE_PREFERENCES = ("usb", "local")
 
+# One-push white-balance loop that runs while the transect monitor is
+# enabled. The operator can flip this off from the widget for scenes
+# where re-triggering AWB every 2 minutes would produce a visible
+# colour jump (e.g. crossing shadow boundaries). Default on.
+DEFAULT_AWB_LOOP_ENABLED = True
+AWB_LOOP_INTERVAL_S = 120.0
+# Direct-camera one-push AWB endpoint. This is the same POST that
+# radcam-manager proxies internally (setImageAdjustmentEx with
+# ``onceAWB=1``). The older HAUV.lua ``cgi_action`` GET path now returns
+# "error user/pwd" on current RadCam firmware -- verified against the
+# camera on 2026-07-11 -- so we use the POST path instead.
+RADCAM_AWB_URL = 'http://192.168.2.10/action/setImageAdjustmentEx'
+RADCAM_AWB_BODY = {"onceAWB": 1}
+
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
@@ -152,6 +181,7 @@ def load_config():
         "snapshot_url": DEFAULT_SNAPSHOT_URL,
         "transect_capture_type": DEFAULT_TRANSECT_CAPTURE_TYPE,
         "storage_preference": DEFAULT_STORAGE_PREFERENCE,
+        "awb_loop_enabled": DEFAULT_AWB_LOOP_ENABLED,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -170,6 +200,8 @@ def load_config():
         defaults["transect_capture_type"] = DEFAULT_TRANSECT_CAPTURE_TYPE
     if defaults["storage_preference"] not in VALID_STORAGE_PREFERENCES:
         defaults["storage_preference"] = DEFAULT_STORAGE_PREFERENCE
+    defaults["awb_loop_enabled"] = bool(defaults.get("awb_loop_enabled",
+                                                     DEFAULT_AWB_LOOP_ENABLED))
     return defaults
 
 def save_config(cfg):
@@ -308,6 +340,19 @@ stream_protocol = _cfg["stream_protocol"]
 snapshot_url = _cfg["snapshot_url"]
 transect_capture_type = _cfg["transect_capture_type"]
 storage_preference = _cfg["storage_preference"]
+awb_loop_enabled = _cfg["awb_loop_enabled"]
+
+def _persist_config():
+    """Snapshot the currently-live config globals to disk."""
+    save_config({
+        "tow_vehicle_ip": tow_vehicle_ip,
+        "container_format": container_format,
+        "stream_protocol": stream_protocol,
+        "snapshot_url": snapshot_url,
+        "transect_capture_type": transect_capture_type,
+        "storage_preference": storage_preference,
+        "awb_loop_enabled": awb_loop_enabled,
+    })
 
 # Recording-storage state
 #
@@ -2356,19 +2401,26 @@ def register_service():
 @app.route('/config', methods=['GET', 'POST'])
 def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
-    global transect_capture_type, storage_preference
+    global transect_capture_type, storage_preference, awb_loop_enabled
 
     if request.method == 'POST':
-        if mode != MODE_IDLE:
-            return jsonify({"success": False,
-                            "message": f"Cannot change config while {mode} active"}), 400
-        # The transect monitor owns the recorder even while sitting in
-        # its "waiting" state, so block capture-type changes then too.
-        if _transect_monitor is not None and _transect_monitor.state != "disabled":
-            return jsonify({"success": False,
-                            "message": "Cannot change config while transect monitor is enabled"}), 400
-
+        # The AWB-loop toggle is safe to change while a mode is active
+        # (it only affects a 2-min background HTTP timer). Everything
+        # else still needs an idle/disabled monitor.
         data = request.get_json(silent=True) or {}
+        touches_only_awb = (
+            set(data.keys()) <= {"awb_loop_enabled"} and "awb_loop_enabled" in data
+        )
+        if not touches_only_awb:
+            if mode != MODE_IDLE:
+                return jsonify({"success": False,
+                                "message": f"Cannot change config while {mode} active"}), 400
+            # The transect monitor owns the recorder even while sitting in
+            # its "waiting" state, so block capture-type changes then too.
+            if _transect_monitor is not None and _transect_monitor.state != "disabled":
+                return jsonify({"success": False,
+                                "message": "Cannot change config while transect monitor is enabled"}), 400
+
         changed = False
 
         new_ip = data.get('tow_vehicle_ip', '').strip()
@@ -2384,6 +2436,14 @@ def config():
                                 "message": f"transect_capture_type must be one of {VALID_TRANSECT_CAPTURE_TYPES}"}), 400
             transect_capture_type = new_capture
             changed = True
+
+        new_awb = data.get('awb_loop_enabled')
+        if new_awb is not None:
+            new_awb_bool = bool(new_awb) if isinstance(new_awb, bool) else str(new_awb).lower() in ("1", "true", "yes", "on")
+            if new_awb_bool != awb_loop_enabled:
+                awb_loop_enabled = new_awb_bool
+                changed = True
+                _apply_awb_loop_state_change()
 
         new_fmt = data.get('container_format', '').strip().lower()
         if new_fmt:
@@ -2422,18 +2482,13 @@ def config():
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
-        save_config({"tow_vehicle_ip": tow_vehicle_ip,
-                      "container_format": container_format,
-                      "stream_protocol": stream_protocol,
-                      "snapshot_url": snapshot_url,
-                      "transect_capture_type": transect_capture_type,
-                      "storage_preference": storage_preference})
+        _persist_config()
         logger.info(
             "Config updated: tow_vehicle_ip=%s, container_format=%s, "
             "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s, "
-            "storage_preference=%s",
+            "storage_preference=%s, awb_loop_enabled=%s",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
-            transect_capture_type, storage_preference,
+            transect_capture_type, storage_preference, awb_loop_enabled,
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
@@ -2441,7 +2496,8 @@ def config():
                         "stream_protocol": stream_protocol,
                         "snapshot_url": snapshot_url,
                         "transect_capture_type": transect_capture_type,
-                        "storage_preference": storage_preference})
+                        "storage_preference": storage_preference,
+                        "awb_loop_enabled": awb_loop_enabled})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -2451,6 +2507,7 @@ def config():
         "snapshot_url": snapshot_url,
         "transect_capture_type": transect_capture_type,
         "storage_preference": storage_preference,
+        "awb_loop_enabled": awb_loop_enabled,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -3245,6 +3302,436 @@ class TransectMonitor:
 # Singleton handle, populated by /transect/enable.
 _transect_monitor = None
 
+# ---------------------------------------------------------------------------
+# Vehicle / optics helpers
+# ---------------------------------------------------------------------------
+#
+# ArduSub custom_mode enum (see ``MODE_STABILIZE`` etc. imported at the
+# top of the file). Only stabilize/althold are wired through the widget;
+# manual is exposed as a special case for the "restore" button used
+# during testing.
+_ALLOWED_MODE_NAMES = {
+    "stabilize": MODE_STABILIZE,
+    "althold": MODE_ALT_HOLD,
+    "alt_hold": MODE_ALT_HOLD,
+    "manual": MODE_MANUAL,
+}
+
+# Optics survey defaults verified against the RadCam on this vehicle:
+#   Zoom  -> RANGE 0   -> SERVO11 = 935  (fully out)
+#   Zoom  -> RANGE 50  -> SERVO11 ~ 1392 (half)
+#   Zoom  -> RANGE 100 -> SERVO11 = 1850 (full)
+# Focus  -> RANGE 61.03 -> SERVO12 = 1639 (survey trim)
+ZOOM_PRESETS_PCT = {"out": 0.0, "half": 50.0, "full": 100.0}
+FOCUS_TRIM_PCT = 61.03  # matches SERVO12_TRIM=1639 the operator set
+
+
+def _current_servo_pwm(channel: int) -> int | None:
+    """Read ``SERVO_OUTPUT_RAW.servo{ch}_raw`` from local mavlink2rest.
+
+    Same URL the tilt reader uses. Returns None on error or when the
+    channel is not driven (mavlink2rest reports 0 while disarmed for
+    motor outputs -- for the optics/mount channels this stays populated).
+    """
+    try:
+        response = requests.get(servo_output_url, timeout=1)
+        if response.status_code == 200:
+            message = response.json().get('message', {})
+            pwm = message.get(f'servo{int(channel)}_raw', None)
+            if pwm is None:
+                return None
+            return int(pwm)
+    except Exception as e:
+        logger.debug("servo%s read failed: %s", channel, e)
+    return None
+
+
+def get_optics_snapshot() -> dict:
+    """Return the raw PWM for the tilt / focus / zoom outputs.
+
+    Cheap enough to call from /status without saturating mavlink2rest.
+    Missing channels come back as None.
+    """
+    tilt_pwm = _current_servo_pwm(TILT_SERVO_CHANNEL)
+    focus_pwm = _current_servo_pwm(12)
+    zoom_pwm = _current_servo_pwm(11)
+    focus_pct = focus_pwm_to_pct(focus_pwm) if focus_pwm else None
+    return {
+        "tilt_pwm": tilt_pwm,
+        "tilt_deg": get_towfish_camera_tilt(),
+        "focus_pwm": focus_pwm,
+        "focus_pct": (round(focus_pct, 2) if focus_pct is not None else None),
+        "focus_pwm_min": MAV_FOCUS_PWM_MIN,
+        "focus_pwm_max": MAV_FOCUS_PWM_MAX,
+        "focus_trim_pct": FOCUS_TRIM_PCT,
+        "zoom_pwm": zoom_pwm,
+    }
+
+
+def get_vehicle_status_snapshot() -> dict:
+    """Return current ArduSub custom_mode + armed bit for the widget."""
+    try:
+        r = requests.get(
+            'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/HEARTBEAT',
+            timeout=1,
+        )
+        if r.status_code == 200:
+            msg = r.json().get('message') or {}
+            base_bits = ((msg.get('base_mode') or {}).get('bits')) or 0
+            custom_mode = msg.get('custom_mode')
+            armed = bool(base_bits & MAV_MODE_FLAG_SAFETY_ARMED)
+            mode_label = None
+            if custom_mode == MODE_STABILIZE:
+                mode_label = "STABILIZE"
+            elif custom_mode == MODE_ALT_HOLD:
+                mode_label = "ALT_HOLD"
+            elif custom_mode == MODE_MANUAL:
+                mode_label = "MANUAL"
+            return {
+                "armed": armed,
+                "custom_mode": custom_mode,
+                "mode_label": mode_label,
+            }
+    except Exception as e:
+        logger.debug("HEARTBEAT read failed: %s", e)
+    return {"armed": None, "custom_mode": None, "mode_label": None}
+
+
+# --- one-push AWB (RadCam) -------------------------------------------
+_awb_last_success_at: datetime | None = None
+_awb_last_error: str | None = None
+
+
+def trigger_awb_once() -> bool:
+    """Fire one 'onceAWB=1' at the RadCam via setImageAdjustmentEx.
+
+    Runs in whatever thread called us -- both the manual /optics/awb
+    route and the AWB loop take advantage of that: they intentionally
+    block for the full HTTP round-trip so a failure surfaces in the
+    caller's log/http response. Never raises.
+
+    The camera returns 200 with a JSON body containing ``code``; 0 is
+    OK, non-zero (e.g. bad auth) is surfaced as an error string.
+    """
+    global _awb_last_success_at, _awb_last_error
+    try:
+        r = requests.post(RADCAM_AWB_URL, json=RADCAM_AWB_BODY, timeout=3)
+        if r.status_code == 200:
+            # Firmware always returns 200; look at the JSON body's code.
+            body_text = (r.text or "").strip()
+            code = None
+            try:
+                code = (r.json() or {}).get("code")
+            except Exception:
+                pass
+            if code is None or code == 0:
+                _awb_last_success_at = datetime.now()
+                _awb_last_error = None
+                logger.info("RadCam AWB (onceAWB=1) OK")
+                return True
+            _awb_last_error = f"code {code}: {body_text[:120]}"
+        else:
+            _awb_last_error = f"HTTP {r.status_code}"
+    except Exception as e:
+        _awb_last_error = str(e)
+    logger.warning("RadCam AWB failed: %s", _awb_last_error)
+    return False
+
+
+# Background 2-minute AWB loop that only runs while the transect
+# monitor is enabled AND awb_loop_enabled is true.
+_awb_thread: threading.Thread | None = None
+_awb_stop_event = threading.Event()
+
+
+def _awb_loop_worker() -> None:
+    """Fire AWB once now, then every AWB_LOOP_INTERVAL_S until stopped."""
+    logger.info("AWB loop started (interval %.0fs)", AWB_LOOP_INTERVAL_S)
+    trigger_awb_once()
+    while not _awb_stop_event.wait(AWB_LOOP_INTERVAL_S):
+        # Re-check the toggle + monitor state each tick so a config
+        # change immediately halts the timer.
+        if not awb_loop_enabled:
+            break
+        if _transect_monitor is None or _transect_monitor.state == "disabled":
+            break
+        trigger_awb_once()
+    logger.info("AWB loop stopped")
+
+
+def _start_awb_loop_if_wanted() -> None:
+    """Spin up the AWB loop iff transect is enabled + toggle is on."""
+    global _awb_thread
+    if not awb_loop_enabled:
+        return
+    if _transect_monitor is None or _transect_monitor.state == "disabled":
+        return
+    if _awb_thread is not None and _awb_thread.is_alive():
+        return
+    _awb_stop_event.clear()
+    _awb_thread = threading.Thread(
+        target=_awb_loop_worker, name="radcam-awb-loop", daemon=True,
+    )
+    _awb_thread.start()
+
+
+def _stop_awb_loop() -> None:
+    """Signal the AWB loop to exit. Idempotent."""
+    global _awb_thread
+    if _awb_thread is None:
+        return
+    _awb_stop_event.set()
+    _awb_thread.join(timeout=3.0)
+    _awb_thread = None
+
+
+def _apply_awb_loop_state_change() -> None:
+    """React to a config change or transect state change.
+
+    Called from three places: /config POST, /transect/enable, /transect/
+    disable. Starts or stops the background timer to match the new
+    (awb_loop_enabled, transect state) tuple.
+    """
+    if awb_loop_enabled and (
+        _transect_monitor is not None and _transect_monitor.state != "disabled"
+    ):
+        _start_awb_loop_if_wanted()
+    else:
+        _stop_awb_loop()
+
+
+# --- depth-jog thrust hold thread ------------------------------------
+#
+# ArduSub's RC3 override needs to be refreshed at ~5 Hz or the autopilot
+# considers the override stale. We front the widget's button holds with a
+# backend thread so a dropped browser event still times out (i.e. the
+# thrust stops even if the client goes away).
+_thrust_thread: threading.Thread | None = None
+_thrust_stop_event = threading.Event()
+_thrust_direction: str | None = None
+_thrust_deadline: float | None = None
+_thrust_pwm: int = Z_PWM_NEUTRAL
+_thrust_lock = threading.Lock()
+# Each /vehicle/thrust POST extends this many seconds into the future.
+# The frontend re-hits the route every ~200 ms while a button is held,
+# so a value slightly larger than the frontend cadence keeps the
+# override alive without letting a lost client run away.
+_THRUST_KEEPALIVE_S = 0.5
+_THRUST_REFRESH_HZ = 5.0
+
+
+def _thrust_worker() -> None:
+    """Push RC3 override at ~5 Hz until the deadline lapses or stop is set."""
+    writer = get_default_writer()
+    period = 1.0 / _THRUST_REFRESH_HZ
+    logger.info("Thrust jog thread started")
+    while not _thrust_stop_event.is_set():
+        with _thrust_lock:
+            deadline = _thrust_deadline
+            pwm = _thrust_pwm
+        if deadline is None or time.monotonic() >= deadline:
+            break
+        writer.rc_channels_override({Z_CHANNEL: pwm})
+        _thrust_stop_event.wait(period)
+    # Release the override on exit so AltHold's inner loop takes over.
+    try:
+        writer.rc_channels_override({})
+    except Exception:
+        logger.debug("rc release on thrust exit failed", exc_info=True)
+    logger.info("Thrust jog thread exited")
+
+
+def _start_thrust_thread_if_needed() -> None:
+    global _thrust_thread
+    if _thrust_thread is not None and _thrust_thread.is_alive():
+        return
+    _thrust_stop_event.clear()
+    _thrust_thread = threading.Thread(
+        target=_thrust_worker, name="vehicle-thrust-jog", daemon=True,
+    )
+    _thrust_thread.start()
+
+
+def _stop_thrust_thread() -> None:
+    global _thrust_thread, _thrust_direction, _thrust_deadline
+    _thrust_stop_event.set()
+    with _thrust_lock:
+        _thrust_direction = None
+        _thrust_deadline = None
+    if _thrust_thread is not None:
+        _thrust_thread.join(timeout=1.0)
+    _thrust_thread = None
+
+
+# --- Startup optics preset -------------------------------------------
+_STARTUP_OPTICS_MAX_ATTEMPTS = 20
+_STARTUP_OPTICS_RETRY_S = 3.0
+
+
+def _startup_optics_worker() -> None:
+    """After Flask boots, drive tilt down + zoom Out once.
+
+    mavlink2rest may not be ready the instant the container starts, so
+    retry a bounded number of times with a short sleep between tries.
+    Focus is intentionally left at the vehicle-configured trim.
+    """
+    writer = get_default_writer()
+    logger.info("Startup optics init: tilt=DOWN, zoom=OUT")
+    for attempt in range(1, _STARTUP_OPTICS_MAX_ATTEMPTS + 1):
+        ok_tilt = writer.tilt_down()
+        ok_zoom = writer.set_camera_zoom_range(ZOOM_PRESETS_PCT["out"])
+        if ok_tilt and ok_zoom:
+            logger.info("Startup optics init succeeded on attempt %d", attempt)
+            return
+        logger.debug("Startup optics attempt %d: tilt=%s zoom=%s",
+                     attempt, ok_tilt, ok_zoom)
+        time.sleep(_STARTUP_OPTICS_RETRY_S)
+    logger.warning("Startup optics init gave up after %d attempts",
+                   _STARTUP_OPTICS_MAX_ATTEMPTS)
+
+
+def _kick_off_startup_optics() -> None:
+    threading.Thread(
+        target=_startup_optics_worker, name="startup-optics", daemon=True,
+    ).start()
+
+
+# ---------------------------------------------------------------------------
+# Vehicle + optics Flask routes
+# ---------------------------------------------------------------------------
+@app.route('/vehicle/arm', methods=['POST'])
+def vehicle_arm():
+    """Arm or disarm the towfish (ArduSub).
+
+    Body: ``{"armed": true|false}``. No safeguards beyond what ArduSub
+    itself enforces -- widget is the primary control surface for the
+    field operator and needs to be able to disarm mid-run.
+    """
+    data = request.get_json(silent=True) or {}
+    if 'armed' not in data:
+        return jsonify({"success": False, "message": "armed required"}), 400
+    want_armed = bool(data['armed'])
+    ok = get_default_writer().arm(want_armed)
+    return jsonify({"success": ok, "armed": want_armed}), (200 if ok else 502)
+
+
+@app.route('/vehicle/mode', methods=['POST'])
+def vehicle_mode():
+    """Set ArduSub flight mode via COMMAND_LONG DO_SET_MODE."""
+    data = request.get_json(silent=True) or {}
+    mode_name = str(data.get('mode', '')).strip().lower()
+    if mode_name not in _ALLOWED_MODE_NAMES:
+        return jsonify({
+            "success": False,
+            "message": f"mode must be one of {sorted(_ALLOWED_MODE_NAMES)}",
+        }), 400
+    ok = get_default_writer().set_mode(_ALLOWED_MODE_NAMES[mode_name])
+    return jsonify({"success": ok, "mode": mode_name}), (200 if ok else 502)
+
+
+@app.route('/vehicle/tilt-down', methods=['POST'])
+def vehicle_tilt_down():
+    ok = get_default_writer().tilt_down()
+    return jsonify({"success": ok, "pitch_deg": -70.0}), (200 if ok else 502)
+
+
+@app.route('/vehicle/thrust', methods=['POST'])
+def vehicle_thrust():
+    """Start / keep-alive a Z-axis RC override (depth jog).
+
+    Body: ``{"direction": "up"|"down"|"stop"}``. Each POST extends the
+    override lifetime by ``_THRUST_KEEPALIVE_S`` so if the frontend
+    stops sending (tab close, network glitch, released button), the
+    backend releases the override on its own within a short window and
+    AltHold takes back over.
+    """
+    global _thrust_direction, _thrust_deadline, _thrust_pwm
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get('direction', '')).strip().lower()
+    if direction in ('', 'stop'):
+        _stop_thrust_thread()
+        return jsonify({"success": True, "direction": "stop"})
+    if direction not in ('up', 'down'):
+        return jsonify({"success": False,
+                        "message": "direction must be up/down/stop"}), 400
+
+    pwm = Z_PWM_ASCEND if direction == 'up' else Z_PWM_DESCEND
+    with _thrust_lock:
+        _thrust_direction = direction
+        _thrust_pwm = pwm
+        _thrust_deadline = time.monotonic() + _THRUST_KEEPALIVE_S
+    _start_thrust_thread_if_needed()
+    return jsonify({"success": True, "direction": direction, "pwm": pwm})
+
+
+@app.route('/vehicle/thrust/stop', methods=['POST'])
+def vehicle_thrust_stop():
+    _stop_thrust_thread()
+    return jsonify({"success": True, "direction": "stop"})
+
+
+@app.route('/optics/focus', methods=['POST'])
+def optics_focus():
+    """Absolute or relative focus RANGE.
+
+    Body accepts either ``{"pct": <0..100>}`` for an absolute focus
+    RANGE, or ``{"delta_pct": <±float>}`` for a relative nudge from the
+    live SERVO12 PWM. ``{"trim": true}`` snaps back to the survey trim
+    (61.03% ≈ SERVO12=1639).
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get('trim'):
+        pct = FOCUS_TRIM_PCT
+    elif 'pct' in data:
+        try:
+            pct = float(data['pct'])
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "pct must be a number"}), 400
+    elif 'delta_pct' in data:
+        try:
+            delta = float(data['delta_pct'])
+        except (TypeError, ValueError):
+            return jsonify({"success": False,
+                            "message": "delta_pct must be a number"}), 400
+        cur_pwm = _current_servo_pwm(12)
+        cur_pct = focus_pwm_to_pct(cur_pwm) if cur_pwm else FOCUS_TRIM_PCT
+        pct = cur_pct + delta
+    else:
+        return jsonify({"success": False,
+                        "message": "pct, delta_pct, or trim required"}), 400
+    pct = max(0.0, min(100.0, pct))
+    ok = get_default_writer().set_camera_focus_range(pct)
+    return jsonify({
+        "success": ok, "pct": round(pct, 2),
+        "expected_pwm": focus_pct_to_pwm(pct),
+    }), (200 if ok else 502)
+
+
+@app.route('/optics/zoom', methods=['POST'])
+def optics_zoom():
+    """One of the three verified zoom presets (out / half / full)."""
+    data = request.get_json(silent=True) or {}
+    preset = str(data.get('preset', '')).strip().lower()
+    if preset not in ZOOM_PRESETS_PCT:
+        return jsonify({
+            "success": False,
+            "message": f"preset must be one of {sorted(ZOOM_PRESETS_PCT)}",
+        }), 400
+    pct = ZOOM_PRESETS_PCT[preset]
+    ok = get_default_writer().set_camera_zoom_range(pct)
+    return jsonify({"success": ok, "preset": preset, "pct": pct}), (200 if ok else 502)
+
+
+@app.route('/optics/awb', methods=['POST'])
+def optics_awb():
+    """Manual one-shot RadCam auto white-balance."""
+    ok = trigger_awb_once()
+    return jsonify({
+        "success": ok,
+        "last_error": _awb_last_error if not ok else None,
+    }), (200 if ok else 502)
+
+
 @app.route('/start', methods=['GET'])
 def start():
     """Start an H.264 recording session.
@@ -3425,6 +3912,19 @@ def get_status():
             # TransectMonitor.snapshot for the schema).
             "transect": (_transect_monitor.snapshot()
                          if _transect_monitor is not None else None),
+            # Vehicle state -- armed bit + custom_mode string for the
+            # cockpit widget's persistent status strip.
+            "vehicle": get_vehicle_status_snapshot(),
+            # Live tilt / focus / zoom PWM readouts so the OPTICS tab
+            # can render a phosphor readout without a separate call.
+            "optics": get_optics_snapshot(),
+            # AWB timer state so the toggle UI can show whether the
+            # 2-min loop is actively running.
+            "awb_loop_enabled": awb_loop_enabled,
+            "awb_loop_active": (_awb_thread is not None and _awb_thread.is_alive()),
+            "awb_last_success_at": (_awb_last_success_at.isoformat()
+                                     if _awb_last_success_at else None),
+            "awb_last_error": _awb_last_error,
         })
         resp.headers['Cache-Control'] = 'no-store'
         return resp
@@ -3738,9 +4238,14 @@ def transect_enable():
                 _transect_monitor = TransectMonitor()
             _transect_monitor.enable()
             logger.info("Transect monitor enabled (tow_vehicle=%s)", tow_vehicle_ip)
+            # Kick the AWB loop only if the operator's toggle is on;
+            # the timer immediately fires one AWB, then rearms itself
+            # every AWB_LOOP_INTERVAL_S until transect is disabled.
+            _apply_awb_loop_state_change()
             return jsonify({"success": True,
                             "state": _transect_monitor.state,
-                            "tow_vehicle_ip": tow_vehicle_ip})
+                            "tow_vehicle_ip": tow_vehicle_ip,
+                            "awb_loop_enabled": awb_loop_enabled})
         except Exception as e:
             logger.exception("Error in /transect/enable")
             return jsonify({"success": False, "message": str(e)}), 500
@@ -3758,6 +4263,9 @@ def transect_disable():
         return jsonify({"success": True, "message": "Not enabled"})
     try:
         _transect_monitor.disable()
+        # Always stop the AWB timer when transect is disabled -- the loop
+        # is intentionally scoped to survey time.
+        _stop_awb_loop()
         snap = _transect_monitor.snapshot()
         logger.info("Transect monitor disabled (legs=%d)", snap.get("leg_count", 0))
         return jsonify({"success": True, **snap})
@@ -3833,6 +4341,15 @@ if __name__ == '__main__':
         _start_usb_health_watcher()
     except Exception as e:
         logger.warning(f"USB health watcher failed to start: {e}")
+
+    # Fire tilt-down + zoom-Out once as soon as the extension is up so
+    # the operator doesn't have to touch the widget just to prep the
+    # camera. Runs in a background thread with bounded retries in case
+    # mavlink2rest is still coming up.
+    try:
+        _kick_off_startup_optics()
+    except Exception as e:
+        logger.warning(f"Startup optics init failed to start: {e}")
 
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)
