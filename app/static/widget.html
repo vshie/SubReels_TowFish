@@ -570,15 +570,15 @@
         <!-- RECORD -->
         <section class="panel active" id="panel-record">
             <div class="mode-switch" id="modeSwitch">
+                <button class="btn small active" id="modeTransectBtn" data-mode="transect">TRANSECT</button>
                 <button class="btn small" id="modeVideoBtn" data-mode="video">VIDEO</button>
                 <button class="btn small" id="modeTimelapseBtn" data-mode="timelapse">TIMELAPSE</button>
-                <button class="btn small" id="modeTransectBtn" data-mode="transect">TRANSECT</button>
             </div>
-            <div class="capture-row" id="captureRow">
+            <div class="capture-row visible" id="captureRow">
                 <span>CAPTURE</span>
                 <select id="transectCapture">
-                    <option value="video">Video (.ts / leg)</option>
                     <option value="timelapse">Images 2 Hz / leg</option>
+                    <option value="video">Video (.ts / leg)</option>
                 </select>
             </div>
             <button class="btn wide" id="actionBtn">START RECORDING</button>
@@ -704,7 +704,7 @@ const statsRow         = $('statsRow');
 const captureRow       = $('captureRow');
 const transectCapture  = $('transectCapture');
 
-let selectedMode = 'video';
+let selectedMode = 'transect';
 let serverMode = 'idle';
 let transectMonState = 'disabled';
 let startTime = null;
@@ -750,7 +750,7 @@ document.querySelectorAll('.mode-switch .btn').forEach(btn => {
     });
 });
 
-modeVideoBtn.classList.add('active');
+modeTransectBtn.classList.add('active');
 
 function renderRecordUI() {
     const m = activeMode();

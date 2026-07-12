@@ -148,7 +148,11 @@ DEFAULT_SNAPSHOT_URL = "http://192.168.2.10/cgi-bin/onesnap.cgi"
 # What the automatic transect monitor captures per leg:
 #   "video"     -> one RTSP .ts file per waypoint leg (+ per-leg SRT/ASS)
 #   "timelapse" -> 2 Hz geotagged JPEGs into one subfolder per leg
-DEFAULT_TRANSECT_CAPTURE_TYPE = "video"
+# Default is 2 Hz still images -- the towfish survey workflow this
+# extension exists for produces stills, not video, and defaulting to
+# timelapse means a fresh install is immediately usable without the
+# operator having to open the config drawer to flip the capture type.
+DEFAULT_TRANSECT_CAPTURE_TYPE = "timelapse"
 VALID_TRANSECT_CAPTURE_TYPES = ("video", "timelapse")
 # Where to put new recordings:
 #   "usb"   -> attached USB drive (mounted at /mnt/usb) when usable, else
