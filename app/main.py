@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from flask import Flask, jsonify, request, send_file
 import asyncio
 import json
