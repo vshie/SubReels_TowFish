@@ -249,6 +249,57 @@
             text-shadow: none;
         }
 
+        /* Always-visible depth band (autopilot baro estimate) */
+        .strip-depth {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: baseline;
+            justify-content: center;
+            gap: 8px;
+            padding: 6px 8px 2px;
+            margin-top: 6px;
+            border-top: 1px dashed #16221c;
+        }
+        .strip-depth .dlabel {
+            font-size: 10px;
+            letter-spacing: 0.3em;
+            color: var(--ink-dim);
+        }
+        .strip-depth .dvalue {
+            font: 800 26px 'Orbitron', 'Share Tech Mono', monospace;
+            line-height: 1;
+            color: var(--sky);
+            text-shadow: 0 0 8px var(--sky-glow);
+            letter-spacing: 0.04em;
+        }
+        .strip-depth .dvalue.dim { color: var(--ink-dim); text-shadow: none; }
+        .strip-depth .dunit {
+            font-size: 11px;
+            letter-spacing: 0.2em;
+            color: var(--ink-dim);
+        }
+        /* Depth-jog activity flag -- always visible so the operator sees
+           the simulated pilot input regardless of which tab is open. */
+        .jog-flag {
+            margin-left: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            padding: 2px 7px;
+            border-radius: 3px;
+            border: 1px solid transparent;
+            color: var(--off);
+            visibility: hidden;
+        }
+        .jog-flag.up, .jog-flag.down {
+            visibility: visible;
+            color: var(--amber);
+            border-color: #4a3a16;
+            background: #191207;
+            text-shadow: 0 0 6px var(--amber-glow);
+            animation: pulse 0.9s ease-in-out infinite;
+        }
+
         /* --- Panels & rows ---------------------------------------------- */
         .panel {
             display: none;
@@ -559,6 +610,12 @@
             <div class="lamp disarmed" id="armLamp"><span class="dot"></span><span id="armLabel">SAFE</span></div>
             <div class="mode-readout unknown" id="modeReadout">--</div>
             <div class="rec-lamp" id="recLamp"><span class="dot"></span><span id="recLabel">IDLE</span></div>
+            <div class="strip-depth">
+                <span class="dlabel">DEPTH</span>
+                <span class="dvalue dim" id="depthValue">--</span>
+                <span class="dunit">m</span>
+                <span class="jog-flag" id="jogFlag">JOG</span>
+            </div>
             <div class="strip-mini">
                 <div class="cell"><div class="label">TILT</div><div class="value dim" id="miniTilt">--</div></div>
                 <div class="cell"><div class="label">ZOOM</div><div class="value dim" id="miniZoom">--</div></div>
@@ -606,12 +663,12 @@
                 </div>
             </div>
             <div class="section">
-                <div class="section-title">DEPTH JOG <span class="aux">RC3 - hold</span></div>
+                <div class="section-title">DEPTH JOG <span class="aux" id="jogState">RC3 NEUTRAL · 1500</span></div>
                 <div class="row">
                     <button class="btn amber" id="thrustUpBtn">▲ UP</button>
                     <button class="btn amber" id="thrustDownBtn">▼ DOWN</button>
                 </div>
-                <div class="hint">RELEASE TO HAND OFF TO ALT_HOLD</div>
+                <div class="hint" id="jogHint">RELEASE TO HAND OFF TO ALT_HOLD</div>
             </div>
             <div class="section">
                 <div class="section-title">CAMERA MOUNT</div>
@@ -1031,6 +1088,46 @@ async function pollStatus() {
         } else {
             modeReadout.textContent = veh.custom_mode != null ? `MODE ${veh.custom_mode}` : '--';
             modeReadout.className = 'mode-readout unknown';
+        }
+
+        // Depth readout -- ArduSub's baro/pressure depth estimate, always
+        // visible on the strip regardless of which tab is open.
+        const depthValue = $('depthValue');
+        if (typeof veh.depth_m === 'number') {
+            depthValue.textContent = veh.depth_m.toFixed(1);
+            depthValue.classList.remove('dim');
+        } else {
+            depthValue.textContent = '--';
+            depthValue.classList.add('dim');
+        }
+
+        // Simulated pilot input (RC3 depth-jog) feedback. `thr` reflects
+        // what the backend is actually pushing to the autopilot, so the
+        // flag/readout stay honest even if the button is held elsewhere.
+        const thr = data.thrust || {};
+        const dir = thr.active ? thr.direction : null;
+        const jogPwm = thr.pwm != null ? thr.pwm : 1500;
+        const jogFlag = $('jogFlag');
+        jogFlag.className = 'jog-flag' + (dir ? ' ' + dir : '');
+        jogFlag.textContent = dir === 'up' ? '\u25B2 JOG UP'
+                            : dir === 'down' ? '\u25BC JOG DOWN' : 'JOG';
+        const jogState = $('jogState');
+        if (jogState) {
+            jogState.textContent = dir
+                ? `RC3 ${dir.toUpperCase()} \u00B7 ${jogPwm}`
+                : `RC3 NEUTRAL \u00B7 ${jogPwm}`;
+        }
+        // Mode-aware hint: only ALT_HOLD latches the new depth on release;
+        // STABILIZE/MANUAL are direct thrust and just stop when released.
+        const jogHint = $('jogHint');
+        if (jogHint) {
+            if (veh.mode_label === 'ALT_HOLD') {
+                jogHint.textContent = 'RELEASE HANDS OFF TO ALT_HOLD (HOLDS DEPTH)';
+            } else if (veh.mode_label === 'STABILIZE' || veh.mode_label === 'MANUAL') {
+                jogHint.textContent = `${veh.mode_label}: DIRECT THRUST \u2014 NO AUTO-HOLD ON RELEASE`;
+            } else {
+                jogHint.textContent = 'RC3 OVERRIDE \u2014 RELEASE RETURNS STICK TO AUTOPILOT';
+            }
         }
 
         // Rec lamp

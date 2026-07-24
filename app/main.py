@@ -3374,8 +3374,33 @@ def get_optics_snapshot() -> dict:
     }
 
 
+def _get_towfish_depth_m():
+    """Depth (metres, positive-down) the ArduSub autopilot estimates from
+    the barometer/pressure sensor -- i.e. the same value ALT_HOLD closes
+    the loop on and QGroundControl shows as "Depth".
+
+    Sourced from ``VFR_HUD.alt`` (negative underwater). NOTE: AHRS2.altitude
+    is *not* populated on this towfish (reads a constant 0.0), so VFR_HUD is
+    the reliable baro-depth feed even though the SRT overlay path still uses
+    AHRS2.
+
+    Returns ``None`` when mavlink2rest is unreachable so the widget can
+    show ``--`` rather than a misleading 0.0 m.
+    """
+    try:
+        r = requests.get(vfr_hud_url, timeout=1)
+        if r.status_code == 200:
+            alt = r.json().get('message', {}).get('alt', None)
+            if alt is not None:
+                return round(-alt, 2) if alt < 0 else 0.0
+    except Exception as e:
+        logger.debug("depth read failed: %s", e)
+    return None
+
+
 def get_vehicle_status_snapshot() -> dict:
-    """Return current ArduSub custom_mode + armed bit for the widget."""
+    """Return current ArduSub custom_mode + armed bit + depth for the widget."""
+    depth_m = _get_towfish_depth_m()
     try:
         r = requests.get(
             'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/HEARTBEAT',
@@ -3397,10 +3422,12 @@ def get_vehicle_status_snapshot() -> dict:
                 "armed": armed,
                 "custom_mode": custom_mode,
                 "mode_label": mode_label,
+                "depth_m": depth_m,
             }
     except Exception as e:
         logger.debug("HEARTBEAT read failed: %s", e)
-    return {"armed": None, "custom_mode": None, "mode_label": None}
+    return {"armed": None, "custom_mode": None, "mode_label": None,
+            "depth_m": depth_m}
 
 
 # --- one-push AWB (RadCam) -------------------------------------------
@@ -3567,6 +3594,29 @@ def _stop_thrust_thread() -> None:
     if _thrust_thread is not None:
         _thrust_thread.join(timeout=1.0)
     _thrust_thread = None
+
+
+def get_thrust_status_snapshot() -> dict:
+    """Report the depth-jog RC3 override the backend is currently pushing.
+
+    The widget uses this for *live* feedback on the simulated pilot input
+    -- it reflects what the autopilot is actually being told, so it stays
+    honest even if the button press came from another client or the
+    keep-alive is one poll away from timing out. ``direction``/``pwm`` are
+    null whenever no override is live (autopilot has the stick back).
+    """
+    with _thrust_lock:
+        direction = _thrust_direction
+        deadline = _thrust_deadline
+        pwm = _thrust_pwm
+    active = bool(direction and deadline is not None
+                  and time.monotonic() < deadline)
+    return {
+        "active": active,
+        "direction": direction if active else None,
+        "pwm": pwm if active else Z_PWM_NEUTRAL,
+        "channel": Z_CHANNEL,
+    }
 
 
 # --- Startup optics preset -------------------------------------------
@@ -3918,9 +3968,12 @@ def get_status():
             # TransectMonitor.snapshot for the schema).
             "transect": (_transect_monitor.snapshot()
                          if _transect_monitor is not None else None),
-            # Vehicle state -- armed bit + custom_mode string for the
-            # cockpit widget's persistent status strip.
+            # Vehicle state -- armed bit + custom_mode string + baro depth
+            # for the cockpit widget's persistent status strip.
             "vehicle": get_vehicle_status_snapshot(),
+            # Live depth-jog RC3 override so the widget can show the
+            # simulated pilot input the autopilot is actually receiving.
+            "thrust": get_thrust_status_snapshot(),
             # Live tilt / focus / zoom PWM readouts so the OPTICS tab
             # can render a phosphor readout without a separate call.
             "optics": get_optics_snapshot(),
