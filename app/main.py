@@ -549,7 +549,12 @@ def get_towfish_heading():
         return None
 
 def get_towfish_attitude():
-    """Get yaw and roll from towfish ATTITUDE message. Returns dict with degrees."""
+    """Get yaw, roll and pitch from towfish ATTITUDE message.
+
+    Returns a dict with degrees. ``yaw`` is normalised to a 0..360 true
+    heading; ``roll``/``pitch`` are signed (+roll = right-down, +pitch =
+    nose-up per the ArduPilot/MAVLink body frame).
+    """
     try:
         response = requests.get(towfish_attitude_url, timeout=1)
         if response.status_code == 200:
@@ -564,6 +569,9 @@ def get_towfish_attitude():
             roll = message.get('roll')
             if roll is not None:
                 result['roll'] = math.degrees(roll)
+            pitch = message.get('pitch')
+            if pitch is not None:
+                result['pitch'] = math.degrees(pitch)
             return result
     except Exception as e:
         logger.debug(f"Error fetching towfish attitude: {str(e)}")
@@ -1337,14 +1345,17 @@ def _handle_usb_failover():
                 if session is not None:
                     session.stop()
                 _set_mode(MODE_IDLE)
-                # Re-create on local storage.
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                subfolder = f"timelapse_{timestamp}"
+                # Re-create on local storage, continuing the day's folder
+                # and global sequence (start() re-scans it) under a fresh
+                # source_tag so the failover frames stay attributable.
+                subfolder = _survey_day_subfolder()
+                source_tag = _make_source_tag("tl")
                 out_dir, _ = _resolve_recording_dir(
                     subfolder=subfolder, force_local=True,
                 )
                 new_session = TimelapseSession(snap_url=snapshot_url,
-                                               out_dir=out_dir)
+                                               out_dir=out_dir,
+                                               source_tag=source_tag)
                 new_session.on_usb = False
                 new_session.start()
                 _timelapse = new_session
@@ -2006,7 +2017,8 @@ def _decimal_deg_to_dms_rationals(deg):
     return ((d, 1), (m, 1), (int(round(s * 10000)), 10000))
 
 def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
-                          tilt_deg=None, depth_m=None, temp_c=None):
+                          tilt_deg=None, depth_m=None, temp_c=None,
+                          roll_deg=None, pitch_deg=None):
     """Build piexif-encoded EXIF bytes embedding the towfish position.
 
     Mirrors what ``update_srt_file`` writes into the .srt:
@@ -2031,7 +2043,9 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
     """
     have_gps = lat is not None and lon is not None
     have_heading = heading_deg is not None
-    have_extra = tilt_deg is not None or depth_m is not None or temp_c is not None
+    have_extra = (tilt_deg is not None or depth_m is not None
+                  or temp_c is not None or roll_deg is not None
+                  or pitch_deg is not None)
     if not (have_gps or have_heading or have_extra):
         return None
 
@@ -2080,6 +2094,10 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
         comment_parts.append(f"alt={alt_m:.2f}m")
     if have_heading:
         comment_parts.append(f"hdg={heading_deg:.1f}deg")
+    if roll_deg is not None:
+        comment_parts.append(f"roll={roll_deg:+.1f}deg")
+    if pitch_deg is not None:
+        comment_parts.append(f"pitch={pitch_deg:+.1f}deg")
     if tilt_deg is not None:
         comment_parts.append(f"tilt={tilt_deg:+.1f}deg")
     if depth_m is not None:
@@ -2100,38 +2118,146 @@ def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
         logger.exception("EXIF dump failed")
         return None
 
+
+def _build_camera_xmp(yaw_deg=None, pitch_deg=None, roll_deg=None):
+    """Build an XMP packet carrying camera orientation for photogrammetry.
+
+    Uses the Pix4D ``Camera`` namespace (``Camera:Yaw/Pitch/Roll``), which
+    is the de-facto standard read by Pix4D, Agisoft Metashape and
+    OpenDroneMap/WebODM. Values are the *camera* orientation in the earth
+    frame: yaw is the towfish true heading (0..360); for the fixed
+    straight-down camera the caller passes a nadir-based pitch (-90 deg
+    when level, offset by body pitch) and the towfish body roll. The raw
+    body pitch/roll are preserved separately in the CSV + UserComment.
+
+    Returns the XMP string, or ``None`` when no orientation is available.
+    """
+    tags = []
+    if yaw_deg is not None:
+        tags.append(f"    <Camera:Yaw>{yaw_deg:.2f}</Camera:Yaw>")
+    if pitch_deg is not None:
+        tags.append(f"    <Camera:Pitch>{pitch_deg:.2f}</Camera:Pitch>")
+    if roll_deg is not None:
+        tags.append(f"    <Camera:Roll>{roll_deg:.2f}</Camera:Roll>")
+    if not tags:
+        return None
+    body = "\n".join(tags)
+    return (
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" '
+        'xmlns:Camera="http://pix4d.com/camera/1.0/">\n'
+        f'{body}\n'
+        '  </rdf:Description>'
+        '</rdf:RDF>'
+        '</x:xmpmeta>'
+        '<?xpacket end="w"?>'
+    )
+
+
+def _insert_xmp_app1(jpeg_bytes, xmp_packet):
+    """Splice an APP1 XMP segment in just after the JPEG SOI marker.
+
+    Raw byte insertion so the image is never re-encoded (no quality loss).
+    A second APP1 alongside piexif's Exif APP1 is valid -- readers key off
+    each segment's namespace header. Returns the input unchanged on any
+    structural surprise or if the packet won't fit a single APP1.
+    """
+    try:
+        if jpeg_bytes[0:2] != b"\xff\xd8":
+            return jpeg_bytes
+        payload = b"http://ns.adobe.com/xap/1.0/\x00" + xmp_packet.encode("utf-8")
+        seg_len = len(payload) + 2
+        if seg_len > 0xFFFF:
+            return jpeg_bytes
+        app1 = b"\xff\xe1" + seg_len.to_bytes(2, "big") + payload
+        return jpeg_bytes[:2] + app1 + jpeg_bytes[2:]
+    except Exception:
+        logger.exception("XMP insert failed")
+        return jpeg_bytes
+
 _TIMELAPSE_CSV_HEADER = [
-    'timestamp', 'seq', 'jpg', 'size_bytes',
+    'timestamp', 'seq', 'filename', 'source_tag', 'wp', 'frame', 'size_bytes',
     'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
+    'towfish_roll_deg', 'towfish_pitch_deg',
     'depth_m', 'temperature_c', 'camera_tilt_deg',
     'snap_ms', 'telem_ms', 'sync_skew_ms',
 ]
 
 
+def _survey_day_subfolder():
+    """One folder per survey day: ``survey_YYYYMMDD`` (local date).
+
+    All timelapse/transect image captures for the day land here, so the
+    photogrammetry workflow gets a single folder of uniquely-named,
+    chronologically-sortable JPEGs instead of nested per-leg subfolders.
+    """
+    return f"survey_{datetime.now():%Y%m%d}"
+
+
+def _make_source_tag(prefix):
+    """Short per-session tag: ``tr``/``tl`` + ``HHMMSS`` of session start.
+
+    Embedded in every filename so frames from different capture runs on
+    the same day never collide and stay attributable to their session.
+    """
+    return f"{prefix}{datetime.now():%H%M%S}"
+
+
 class TimelapseSession:
     """Background thread that GETs JPEGs from the camera's snap CGI.
 
-    Two layouts:
-      * Manual timelapse (``per_leg=False``): all JPEGs + one
-        ``telemetry.csv`` land directly in ``out_dir`` with sequential
-        ``00001.jpg`` names.
-      * Transect timelapse (``per_leg=True``): ``out_dir`` is the
-        session root and each waypoint leg gets its own subfolder
-        (``out_dir/wpNN/``) with its own ``telemetry.csv`` and a
-        per-leg sequence counter. The monitor calls :meth:`set_leg`
-        at entry and at every leg boundary. Until the first leg is
-        set the loop captures nothing.
+    Single-folder survey layout (see ``SURVEY_IMAGE_NAMING.md``): every
+    frame lands directly in ``out_dir`` (the ``survey_YYYYMMDD`` day
+    folder) with a globally-unique, chronologically-sortable name:
+
+      * Transect (``per_leg=True``):
+        ``{seq:06d}_{source_tag}_{wp}_{frame:05d}.jpg``
+      * Manual timelapse (``per_leg=False``):
+        ``{seq:06d}_{source_tag}_{frame:05d}.jpg``
+
+    ``seq`` is a global counter across the whole survey day (continued
+    from any images already in the folder, so multiple sessions and
+    extension restarts keep climbing). ``frame`` is per-waypoint (or
+    per-session) and resets on each :meth:`set_leg`. One shared
+    ``telemetry.csv`` in the day folder gets a row per frame, keyed by
+    the final filename. For ``per_leg`` the loop captures nothing until
+    the monitor calls :meth:`set_leg`.
     """
 
-    def __init__(self, snap_url, out_dir, per_leg=False):
+    @staticmethod
+    def _scan_max_seq(folder):
+        """Highest existing ``NNNNNN_`` filename prefix in ``folder`` (0 if none).
+
+        Lets a new session continue the day's global sequence rather than
+        clobbering earlier captures, and survives extension restarts.
+        """
+        mx = 0
+        try:
+            for name in os.listdir(folder):
+                if (name.endswith('.jpg') and len(name) >= 6
+                        and name[:6].isdigit()):
+                    mx = max(mx, int(name[:6]))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("TIMELAPSE seq scan failed: %s", folder)
+        return mx
+
+    def __init__(self, snap_url, out_dir, per_leg=False, source_tag=None):
         self._snap_url = snap_url
-        self._base_dir = out_dir
+        self._survey_dir = out_dir
+        self._csv_path = os.path.join(out_dir, "telemetry.csv")
         self._per_leg = per_leg
+        # Fallback tag if a caller forgets one, so filenames stay valid.
+        self.source_tag = source_tag or _make_source_tag("tl")
         self._stop_event = threading.Event()
         self._thread = None
         self.start_time = None
-        self.snap_count = 0          # session-wide total (all legs)
+        self.snap_count = 0          # frames this session
         self.miss_count = 0
+        self.bytes_written = 0       # cumulative JPEG bytes this session
         self.last_snap_size_bytes = 0
         self.last_snap_path = None
         self.last_snap_at = None
@@ -2141,17 +2267,14 @@ class TimelapseSession:
         # can spot mavlink2rest going slow without scraping the CSV.
         self.last_sync_skew_ms = -1.0
 
-        # Current output target (swapped per leg under the lock). For
-        # manual mode it is fixed to out_dir for the session lifetime.
         self._leg_lock = threading.Lock()
-        self._leg_label = None
-        if per_leg:
-            self._leg_dir = None
-            self._leg_csv = None
-        else:
-            self._leg_dir = out_dir
-            self._leg_csv = os.path.join(out_dir, "telemetry.csv")
-        self._leg_seq = 0            # per-leg (or per-session) counter
+        # Global day sequence (seeded from the folder in start()), the
+        # current waypoint label, and the per-waypoint frame counter.
+        self._global_seq = 0
+        # Manual timelapse has no waypoint and is ready immediately;
+        # transect waits for the first set_leg() before capturing.
+        self._wp_label = None
+        self._frame = 0
         self.leg_count = 0
 
     def _write_csv_header(self, csv_path):
@@ -2164,11 +2287,14 @@ class TimelapseSession:
     def start(self):
         if self._thread is not None:
             raise RuntimeError("TimelapseSession already started")
-        os.makedirs(self._base_dir, exist_ok=True)
-        # Manual mode writes its single CSV header up front; per-leg mode
-        # defers until set_leg() opens the first leg subfolder.
-        if not self._per_leg:
-            self._write_csv_header(self._leg_csv)
+        os.makedirs(self._survey_dir, exist_ok=True)
+        # Continue the day's global sequence from whatever's already on
+        # disk in the survey folder.
+        self._global_seq = self._scan_max_seq(self._survey_dir)
+        # One shared telemetry.csv for the whole day: write the header
+        # only when creating the file, then append across sessions.
+        if not os.path.exists(self._csv_path):
+            self._write_csv_header(self._csv_path)
         self.start_time = datetime.now()
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -2177,26 +2303,20 @@ class TimelapseSession:
         self._thread.start()
 
     def set_leg(self, label):
-        """Switch capture output to a new per-leg subfolder (per_leg only).
+        """Begin a new waypoint leg (per_leg only) within the same folder.
 
-        Creates ``<base>/<label>/`` with a fresh ``telemetry.csv`` and
-        resets the per-leg sequence counter so each leg's JPEGs start at
-        ``00001.jpg``. Safe to call from the monitor thread while the
-        capture loop runs.
+        Only flips the current waypoint label and resets the per-waypoint
+        ``frame`` counter -- no new subfolder, no new CSV. The global day
+        sequence keeps climbing. Safe to call from the monitor thread
+        while the capture loop runs.
         """
         if not self._per_leg:
             return None
-        leg_dir = os.path.join(self._base_dir, label)
-        os.makedirs(leg_dir, exist_ok=True)
-        csv_path = os.path.join(leg_dir, "telemetry.csv")
-        self._write_csv_header(csv_path)
         with self._leg_lock:
-            self._leg_dir = leg_dir
-            self._leg_csv = csv_path
-            self._leg_seq = 0
-            self._leg_label = label
+            self._wp_label = label
+            self._frame = 0
             self.leg_count += 1
-        return leg_dir
+        return self._survey_dir
 
     def is_alive(self):
         return self._thread is not None and self._thread.is_alive()
@@ -2237,7 +2357,13 @@ class TimelapseSession:
         t0 = time.monotonic()
         try:
             bb_lat, bb_lon, bb_alt = get_blueboat_gps_position()
-            heading = get_towfish_heading()
+            # One ATTITUDE read gives heading (yaw), roll and pitch, so we
+            # geotag and record the full towfish orientation per frame
+            # without extra mavlink2rest round-trips.
+            att = get_towfish_attitude()
+            heading = att.get('yaw')
+            roll = att.get('roll')
+            pitch = att.get('pitch')
             if bb_lat is not None and bb_lon is not None and heading is not None:
                 gps_lat, gps_lon = calculate_offset_position(
                     bb_lat, bb_lon, heading, 4.0,
@@ -2253,6 +2379,8 @@ class TimelapseSession:
             bb_lat = bb_lon = bb_alt = None
             gps_lat = gps_lon = None
             heading = None
+            roll = None
+            pitch = None
             tow_alt = None
             depth = None
             temp = None
@@ -2260,7 +2388,8 @@ class TimelapseSession:
         return {
             'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
             'gps_lat': gps_lat, 'gps_lon': gps_lon,
-            'heading': heading, 'tow_alt': tow_alt,
+            'heading': heading, 'roll': roll, 'pitch': pitch,
+            'tow_alt': tow_alt,
             'depth': depth, 'temp': temp, 'tilt': tilt,
             'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
         }
@@ -2274,10 +2403,11 @@ class TimelapseSession:
                     break
             next_fire = max(next_fire + _TIMELAPSE_PERIOD_S, time.monotonic())
 
-            # Per-leg mode: until the monitor opens the first leg there's
-            # nowhere to write, so idle without burning the snap budget.
+            # Per-leg mode: until the monitor sets the first waypoint
+            # there's nothing to tag frames with, so idle without burning
+            # the snap budget.
             with self._leg_lock:
-                leg_ready = self._leg_dir is not None
+                leg_ready = self._wp_label is not None
             if self._per_leg and not leg_ready:
                 continue
 
@@ -2338,6 +2468,8 @@ class TimelapseSession:
                 bb_lat = bb_lon = bb_alt = None
                 gps_lat = gps_lon = None
                 heading = None
+                roll = None
+                pitch = None
                 tow_alt = None
                 depth = None
                 temp = None
@@ -2349,6 +2481,8 @@ class TimelapseSession:
                 gps_lat = telemetry['gps_lat']
                 gps_lon = telemetry['gps_lon']
                 heading = telemetry['heading']
+                roll = telemetry.get('roll')
+                pitch = telemetry.get('pitch')
                 tow_alt = telemetry['tow_alt']
                 depth = telemetry['depth']
                 temp = telemetry['temp']
@@ -2362,6 +2496,7 @@ class TimelapseSession:
                 exif_bytes = _build_gps_exif_bytes(
                     gps_lat, gps_lon, tow_alt, heading, ts_local, ts_utc,
                     tilt_deg=tilt, depth_m=depth, temp_c=temp,
+                    roll_deg=roll, pitch_deg=pitch,
                 )
                 if exif_bytes is not None:
                     # piexif.insert with raw bytes requires either a
@@ -2371,23 +2506,41 @@ class TimelapseSession:
                     out_buf = io.BytesIO()
                     piexif.insert(exif_bytes, jpeg, out_buf)
                     jpeg = out_buf.getvalue()
+                # XMP camera orientation (yaw/pitch/roll) for photogrammetry
+                # importers -- pitch/roll have no standard EXIF tags.
+                #
+                # The camera is fixed looking straight down, so the
+                # earth-frame camera pitch is nadir (-90 deg) when the
+                # towfish is level, offset by the body pitch. We therefore
+                # write the *camera* pitch here (not the raw body pitch);
+                # the raw body pitch/roll stay in the CSV + UserComment.
+                camera_pitch = -90.0 + (pitch if pitch is not None else 0.0)
+                xmp = _build_camera_xmp(yaw_deg=heading,
+                                        pitch_deg=camera_pitch, roll_deg=roll)
+                if xmp is not None:
+                    jpeg = _insert_xmp_app1(jpeg, xmp)
             except Exception:
                 logger.exception("TIMELAPSE EXIF insert failed; saving raw JPEG")
 
-            # Capture the active leg target + claim a per-leg sequence
-            # number atomically so a concurrent set_leg() can't split a
-            # frame across two folders.
+            # Claim the global day sequence + per-waypoint frame number
+            # atomically so a concurrent set_leg() can't reuse a frame
+            # index or straddle a leg boundary.
             with self._leg_lock:
-                leg_dir = self._leg_dir
-                leg_csv = self._leg_csv
-                self._leg_seq += 1
-                seq = self._leg_seq
-            if leg_dir is None:
-                self.miss_count += 1
-                continue
+                wp = self._wp_label
+                if self._per_leg and wp is None:
+                    self.miss_count += 1
+                    continue
+                self._global_seq += 1
+                seq = self._global_seq
+                self._frame += 1
+                frame = self._frame
             self.snap_count += 1
-            filename = f"{seq:05d}.jpg"
-            path = os.path.join(leg_dir, filename)
+            if wp:
+                filename = f"{seq:06d}_{self.source_tag}_{wp}_{frame:05d}.jpg"
+            else:
+                filename = f"{seq:06d}_{self.source_tag}_{frame:05d}.jpg"
+            path = os.path.join(self._survey_dir, filename)
+            csv_path = self._csv_path
             try:
                 with open(path, 'wb') as f:
                     f.write(jpeg)
@@ -2395,6 +2548,7 @@ class TimelapseSession:
                 logger.exception("TIMELAPSE write failed: %s", path)
                 self.miss_count += 1
                 continue
+            self.bytes_written += len(jpeg)
             self.last_snap_path = path
             self.last_snap_size_bytes = len(jpeg)
             self.last_snap_at = ts_local
@@ -2410,15 +2564,18 @@ class TimelapseSession:
             #   sync_skew_ms  = wall-clock gap between snap done /
             #                   telemetry done (small = tight sync)
             try:
-                with open(leg_csv, 'a', newline='') as f:
+                with open(csv_path, 'a', newline='') as f:
                     w = csv.writer(f)
                     w.writerow([
                         ts_local.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-                        seq, filename, len(jpeg),
+                        seq, filename, self.source_tag, wp or "", frame,
+                        len(jpeg),
                         f"{gps_lat:.6f}" if gps_lat is not None else "",
                         f"{gps_lon:.6f}" if gps_lon is not None else "",
                         f"{bb_alt:.2f}" if bb_alt is not None else "",
                         f"{heading:.1f}" if heading is not None else "",
+                        f"{roll:.1f}" if roll is not None else "",
+                        f"{pitch:.1f}" if pitch is not None else "",
                         f"{depth:.2f}" if depth is not None else "",
                         f"{temp:.2f}" if temp is not None else "",
                         f"{tilt:.1f}" if tilt is not None else "",
@@ -2793,20 +2950,21 @@ def _start_transect_timelapse(initial_label, force_local=False):
     """Stand up a per-leg TimelapseSession; flip ``mode`` to MODE_TRANSECT.
 
     Mirror of :func:`_start_video_session` for the image capture type.
-    Returns the session root dir (``transect_<TS>/``), which doubles as
-    the manifest's parent. Caller must hold ``_mode_lock``.
+    Returns the survey-day folder (``survey_YYYYMMDD/``), which doubles
+    as the manifest's parent. Caller must hold ``_mode_lock``.
 
     ``force_local`` is set by the failover path so a session that just
     lost the USB drive doesn't immediately re-pick it on restart.
     """
     global _timelapse, usb_recording
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    subfolder = f"transect_{timestamp}"
+    subfolder = _survey_day_subfolder()
+    source_tag = _make_source_tag("tr")
     out_dir, on_usb = _resolve_recording_dir(
         subfolder=subfolder, force_local=force_local,
     )
 
-    session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir, per_leg=True)
+    session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir,
+                               per_leg=True, source_tag=source_tag)
     session.on_usb = on_usb
     try:
         session.start()
@@ -3161,9 +3319,13 @@ class TransectMonitor:
             return
 
         # Manifest lives beside the session: a sibling .ndjson for video
-        # parts, or manifest.ndjson inside the image session folder.
+        # parts, or a per-session ``<source_tag>_manifest.ndjson`` inside
+        # the shared survey-day image folder (keyed by source_tag so two
+        # runs on the same day don't overwrite each other's manifest).
         if capture == "timelapse":
-            self._manifest_path = os.path.join(anchor, "manifest.ndjson")
+            tl = _timelapse
+            tag = tl.source_tag if tl is not None else _make_source_tag("tr")
+            self._manifest_path = os.path.join(anchor, f"{tag}_manifest.ndjson")
         else:
             self._manifest_path = _transect_manifest_path(anchor)
         try:
@@ -3290,11 +3452,10 @@ class TransectMonitor:
         }
         if self._capture_type == "timelapse":
             tl = _timelapse
-            # For images the "leg file" is the per-leg subfolder, and we
-            # also record how many JPEGs landed in it.
-            row["leg_dir"] = (os.path.basename(tl._leg_dir)
-                              if tl is not None and tl._leg_dir else None)
-            row["leg_images"] = tl._leg_seq if tl is not None else None
+            # Single-folder layout: identify the leg by its waypoint label
+            # and record how many frames it captured (per-waypoint count).
+            row["leg_wp"] = tl._wp_label if tl is not None else None
+            row["leg_images"] = tl._frame if tl is not None else None
         else:
             # ``last_pattern`` is the most recent path splitmuxsink
             # opened; for the closing row this is the file the leg
@@ -3323,9 +3484,9 @@ class TransectMonitor:
         leg_images = None
         if self._capture_type == "timelapse":
             tl = _timelapse
-            if tl is not None and tl._leg_dir:
-                current_leg_file = os.path.basename(tl._leg_dir)
-                leg_images = tl._leg_seq
+            if tl is not None and tl._wp_label:
+                current_leg_file = tl._wp_label
+                leg_images = tl._frame
         else:
             if _session and _session.last_pattern:
                 current_leg_file = os.path.basename(_session.last_pattern)
@@ -3971,7 +4132,7 @@ def get_status():
         if mode == MODE_VIDEO and sess is not None:
             active_dir = sess._out_dir
         elif mode in (MODE_TIMELAPSE, MODE_TRANSECT) and tl is not None:
-            active_dir = tl._base_dir
+            active_dir = tl._survey_dir
         disk_free = _read_disk_free_mb(active_dir)
         local_disk_free = _read_disk_free_mb(LOCAL_RECORDING_DIR)
         active_start = start_time if mode == MODE_VIDEO else (tl.start_time if (tl and mode == MODE_TIMELAPSE) else None)
@@ -4078,18 +4239,19 @@ def list_videos():
                 continue
             for name in names:
                 full = os.path.join(root, name)
-                if os.path.isdir(full) and (name.startswith("timelapse_")
+                if os.path.isdir(full) and (name.startswith("survey_")
+                                            or name.startswith("timelapse_")
                                             or name.startswith("transect_")):
-                    # Count JPEGs recursively so transect image sessions
-                    # (which nest one wpNN/ subfolder per leg) report their
-                    # full frame total, not just the root folder.
+                    # Count JPEGs recursively. survey_* folders are flat
+                    # (single-folder layout); legacy transect_* nested one
+                    # wpNN/ subfolder per leg -- os.walk covers both.
                     jpgs = 0
                     try:
                         for _root, _dirs, _files in os.walk(full):
                             jpgs += sum(1 for f in _files if f.endswith('.jpg'))
                     except Exception:
                         jpgs = 0
-                    if jpgs > 0 or name.startswith("timelapse_"):
+                    if jpgs > 0 or name.startswith(("survey_", "timelapse_")):
                         timelapses.append({
                             "name": name,
                             "snap_count": jpgs,
@@ -4180,22 +4342,15 @@ def get_filesize():
                     "recording": True,
                     "mode": mode,
                 })
-            # Image transect: current leg subfolder name + frame count.
+            # Image transect: survey-day folder name + cumulative bytes
+            # written this session (tracked incrementally so we don't
+            # re-stat a whole day of files every poll).
             tl = _timelapse
             if tl is not None and tl.last_snap_path:
-                leg_dir = os.path.dirname(tl.last_snap_path)
-                size = 0
-                try:
-                    for f in os.listdir(leg_dir):
-                        full = os.path.join(leg_dir, f)
-                        if os.path.isfile(full):
-                            size += os.path.getsize(full)
-                except Exception:
-                    pass
                 return jsonify({
                     "success": True,
-                    "filename": os.path.basename(leg_dir),
-                    "size_bytes": size,
+                    "filename": os.path.basename(tl._survey_dir),
+                    "size_bytes": tl.bytes_written,
                     "recording": True,
                     "mode": mode,
                     "snap_count": tl.snap_count,
@@ -4204,21 +4359,10 @@ def get_filesize():
         if mode == MODE_TIMELAPSE:
             tl = _timelapse
             if tl is not None:
-                folder = os.path.basename(os.path.dirname(tl.last_snap_path)) if tl.last_snap_path else None
-                size = 0
-                if tl.last_snap_path:
-                    parent = os.path.dirname(tl.last_snap_path)
-                    try:
-                        for f in os.listdir(parent):
-                            full = os.path.join(parent, f)
-                            if os.path.isfile(full):
-                                size += os.path.getsize(full)
-                    except Exception:
-                        pass
                 return jsonify({
                     "success": True,
-                    "filename": folder,
-                    "size_bytes": size,
+                    "filename": os.path.basename(tl._survey_dir),
+                    "size_bytes": tl.bytes_written,
                     "recording": True,
                     "mode": mode,
                     "snap_count": tl.snap_count,
@@ -4272,10 +4416,11 @@ def timelapse_start():
             return jsonify({"success": False,
                             "message": "Video recording is active; stop it first"}), 409
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            subfolder = f"timelapse_{timestamp}"
+            subfolder = _survey_day_subfolder()
+            source_tag = _make_source_tag("tl")
             out_dir, on_usb = _resolve_recording_dir(subfolder=subfolder)
-            session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir)
+            session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir,
+                                       source_tag=source_tag)
             session.on_usb = on_usb
             try:
                 session.start()
