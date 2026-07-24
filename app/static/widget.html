@@ -249,30 +249,44 @@
             text-shadow: none;
         }
 
-        /* Always-visible depth band (autopilot baro estimate) */
+        /* Always-visible depth band: towfish baro depth + boat Ping sonar */
         .strip-depth {
             grid-column: 1 / -1;
             display: flex;
-            align-items: baseline;
-            justify-content: center;
+            align-items: stretch;
+            justify-content: space-around;
             gap: 8px;
-            padding: 6px 8px 2px;
+            padding: 6px 4px 2px;
             margin-top: 6px;
             border-top: 1px dashed #16221c;
         }
+        .depth-cell {
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
+            flex: 1;
+            justify-content: center;
+        }
+        .depth-cell + .depth-cell {
+            border-left: 1px dashed #16221c;
+        }
         .strip-depth .dlabel {
             font-size: 10px;
-            letter-spacing: 0.3em;
+            letter-spacing: 0.24em;
             color: var(--ink-dim);
         }
         .strip-depth .dvalue {
-            font: 800 26px 'Orbitron', 'Share Tech Mono', monospace;
+            font: 800 22px 'Orbitron', 'Share Tech Mono', monospace;
             line-height: 1;
             color: var(--sky);
             text-shadow: 0 0 8px var(--sky-glow);
             letter-spacing: 0.04em;
         }
+        /* Ping sonar reads in phosphor green to set it apart from the
+           sky-blue towfish depth. */
+        .depth-cell.ping .dvalue { color: var(--phosphor); text-shadow: 0 0 8px var(--phosphor-glow); }
         .strip-depth .dvalue.dim { color: var(--ink-dim); text-shadow: none; }
+        .strip-depth .dvalue.warn { color: var(--amber); text-shadow: 0 0 8px var(--amber-glow); }
         .strip-depth .dunit {
             font-size: 11px;
             letter-spacing: 0.2em;
@@ -611,10 +625,17 @@
             <div class="mode-readout unknown" id="modeReadout">--</div>
             <div class="rec-lamp" id="recLamp"><span class="dot"></span><span id="recLabel">IDLE</span></div>
             <div class="strip-depth">
-                <span class="dlabel">DEPTH</span>
-                <span class="dvalue dim" id="depthValue">--</span>
-                <span class="dunit">m</span>
-                <span class="jog-flag" id="jogFlag">JOG</span>
+                <div class="depth-cell">
+                    <span class="dlabel">DEPTH</span>
+                    <span class="dvalue dim" id="depthValue">--</span>
+                    <span class="dunit">m</span>
+                    <span class="jog-flag" id="jogFlag">JOG</span>
+                </div>
+                <div class="depth-cell ping">
+                    <span class="dlabel">PING</span>
+                    <span class="dvalue dim" id="pingValue">--</span>
+                    <span class="dunit">m</span>
+                </div>
             </div>
             <div class="strip-mini">
                 <div class="cell"><div class="label">TILT</div><div class="value dim" id="miniTilt">--</div></div>
@@ -1099,6 +1120,24 @@ async function pollStatus() {
         } else {
             depthValue.textContent = '--';
             depthValue.classList.add('dim');
+        }
+
+        // BlueBoat Ping sonar -- water depth under the surface craft.
+        // Shown only when the sonar has a bottom lock (reading within the
+        // sensor's [min,max] range); out-of-range / no-lock and an offline
+        // boat both fall back to --. A reported signal_quality below 30 is
+        // flagged amber as a low-confidence hit.
+        const ping = data.ping_sonar || {};
+        const pingValue = $('pingValue');
+        pingValue.classList.remove('dim', 'warn');
+        if (typeof ping.distance_m === 'number' && ping.in_range) {
+            pingValue.textContent = ping.distance_m.toFixed(1);
+            if (typeof ping.signal_quality === 'number' && ping.signal_quality < 30) {
+                pingValue.classList.add('warn');
+            }
+        } else {
+            pingValue.textContent = '--';
+            pingValue.classList.add('dim');
         }
 
         // Simulated pilot input (RC3 depth-jog) feedback. `thr` reflects

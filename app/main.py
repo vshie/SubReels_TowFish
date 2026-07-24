@@ -280,6 +280,55 @@ def _mav_get_message(url):
         logger.debug("mavlink2rest GET %s failed: %s", url, e)
         return None
 
+def get_ping_sonar_snapshot():
+    """Read the BlueBoat's Ping sonar (published as DISTANCE_SENSOR) from
+    the tow vehicle's mavlink2rest.
+
+    Returns metres of water below the surface craft plus the sensor's
+    range envelope and confidence, or ``None`` when the boat is
+    unreachable / not publishing a distance sensor. Because the tow
+    vehicle's mavlink2rest runs *on the boat*, an offline boat makes the
+    GET time out and yields None (no risk of a stale cached reading).
+
+    ``current_distance``/min/max are centimetres per the MAVLink spec.
+    Ping1D reports downward (orientation PITCH_270), so this is the depth
+    of water under the boat -- independent of the towfish's own baro depth.
+    """
+    msg = _mav_get_message(_tow_mavlink_url('DISTANCE_SENSOR'))
+    if not msg:
+        return None
+    cur = msg.get('current_distance')
+    if not isinstance(cur, (int, float)):
+        return None
+
+    def _cm_to_m(v):
+        return round(v / 100.0, 2) if isinstance(v, (int, float)) else None
+
+    mn = msg.get('min_distance')
+    mx = msg.get('max_distance')
+    # Ping1D reports current_distance well beyond max_distance when it has
+    # no bottom lock (e.g. in air, or water deeper than its range). Treat a
+    # reading outside [min, max] as "no lock" so the widget shows -- rather
+    # than a bogus range like 90 m.
+    in_range = (isinstance(mn, (int, float)) and isinstance(mx, (int, float))
+                and mn <= cur <= mx)
+    quality = msg.get('signal_quality')
+    orientation = msg.get('orientation')
+    if isinstance(orientation, dict):
+        orientation = orientation.get('type')
+    return {
+        "distance_m": _cm_to_m(cur),
+        "min_m": _cm_to_m(mn),
+        "max_m": _cm_to_m(mx),
+        "in_range": in_range,
+        # DISTANCE_SENSOR.signal_quality: 0..100, 0 == "unknown". Absent on
+        # older Ping firmware, so pass through only when it's a real number.
+        "signal_quality": (quality if isinstance(quality, (int, float)) and quality > 0
+                           else None),
+        "orientation": orientation,
+    }
+
+
 def _decode_statustext(msg):
     """Assemble the array-of-chars STATUSTEXT payload into a Python string.
 
@@ -3974,6 +4023,9 @@ def get_status():
             # Live depth-jog RC3 override so the widget can show the
             # simulated pilot input the autopilot is actually receiving.
             "thrust": get_thrust_status_snapshot(),
+            # BlueBoat Ping sonar (DISTANCE_SENSOR) -- water depth under
+            # the surface craft. Null when the boat is unreachable.
+            "ping_sonar": get_ping_sonar_snapshot(),
             # Live tilt / focus / zoom PWM readouts so the OPTICS tab
             # can render a phosphor readout without a separate call.
             "optics": get_optics_snapshot(),
