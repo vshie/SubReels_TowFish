@@ -217,7 +217,14 @@ class MavlinkWriter:
         return self._post(msg)
 
     def rc_release_all(self) -> bool:
-        """Clear every RC override (all channels back to autopilot)."""
+        """Clear every RC override.
+
+        This hands the channels back to *real RC input*, which is not the
+        same as returning them to neutral. On a vehicle with no receiver
+        (RC_CHANNELS reports chancount 0, as the towfish does) there is
+        nothing to hand back to, so each channel keeps the last value the
+        override wrote. Write the neutral you want before releasing.
+        """
         return self.rc_channels_override({})
 
 

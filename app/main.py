@@ -4318,6 +4318,11 @@ _thrust_lock = threading.Lock()
 # towfish 00000061 log did.
 _THRUST_KEEPALIVE_S = 3.0
 _THRUST_REFRESH_HZ = 5.0
+# How many neutral frames to send before releasing the override. See
+# _thrust_worker for why a bare release is not enough on this vehicle. More
+# than one purely so a dropped packet can't leave the jog latched.
+_THRUST_NEUTRAL_FRAMES = 3
+_THRUST_NEUTRAL_GAP_S = 0.1
 
 
 def _thrust_worker() -> None:
@@ -4333,8 +4338,20 @@ def _thrust_worker() -> None:
             break
         writer.rc_channels_override({Z_CHANNEL: pwm})
         _thrust_stop_event.wait(period)
-    # Release the override on exit so AltHold's inner loop takes over.
+    # Centre the stick *before* letting go of it. A bare release asks
+    # ArduPilot to fall back to real RC input, but the towfish flies with no
+    # receiver -- RC_CHANNELS reports chancount 0 -- so there is nothing to
+    # fall back to and the channel just keeps whatever the override last
+    # wrote. Releasing straight out of a jog therefore latched RC3 at the jog
+    # PWM indefinitely: one button tap left the dive planes deflected and the
+    # autopilot holding a descend command that outlived the button, the tab
+    # and the keep-alive. Writing neutral first means the value left latched
+    # is a centred stick; the release afterwards keeps us from owning the
+    # channel forever.
     try:
+        for _ in range(_THRUST_NEUTRAL_FRAMES):
+            writer.rc_channels_override({Z_CHANNEL: Z_PWM_NEUTRAL})
+            time.sleep(_THRUST_NEUTRAL_GAP_S)
         writer.rc_channels_override({})
     except Exception:
         logger.debug("rc release on thrust exit failed", exc_info=True)
@@ -4359,7 +4376,9 @@ def _stop_thrust_thread() -> None:
         _thrust_direction = None
         _thrust_deadline = None
     if _thrust_thread is not None:
-        _thrust_thread.join(timeout=1.0)
+        # Long enough to cover the worker's neutral-then-release tail, so a
+        # caller that returns from here knows the stick is actually centred.
+        _thrust_thread.join(timeout=2.0)
     _thrust_thread = None
 
 
