@@ -3037,7 +3037,7 @@ def register_service():
     {
         "name": "SubReels: TowFish",
         "description": "Towed-body video survey: RTSP recording, geotagged 2 Hz stills, and mission-triggered transect capture",
-        "icon": "mdi-video",
+        "icon": "mdi-fish",
         "company": "Blue Robotics",
         "version": "1.0.0",
         "webpage": "https://github.com/vshie/SubReels_TowFish",
