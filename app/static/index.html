@@ -1281,9 +1281,9 @@ function tickClock() {
     setInterval(tickClock, 1000);
 
     const host = window.location.hostname;
-    const browserUrl = `http://${host}:7777/files/extensions/videorecorder`;
+    const browserUrl = `http://${host}:7777/files/extensions/subreels_towfish`;
     $('fileBrowser').src = browserUrl;
-    $('browserPath').textContent = '/extensions/videorecorder';
+    $('browserPath').textContent = '/extensions/subreels_towfish';
 
     await loadConfig();
     refreshStatus();

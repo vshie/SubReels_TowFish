@@ -145,7 +145,7 @@ baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/componen
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
 
 # Persisted configuration — survives restarts
-CONFIG_FILE = "/app/videorecordings/videorecorder_config.json"
+CONFIG_FILE = "/app/videorecordings/subreels_towfish_config.json"
 DEFAULT_TOW_VEHICLE_IP = "192.168.2.12"
 DEFAULT_CONTAINER_FORMAT = "mp4"
 VALID_CONTAINER_FORMATS = ("mp4", "mpegts")
@@ -2783,12 +2783,12 @@ def index():
 def register_service():
     return '''
     {
-        "name": "Video Recorder",
-        "description": "Record video from connected cameras with telemetry subtitles",
+        "name": "SubReels: TowFish",
+        "description": "Towed-body video survey: RTSP recording, geotagged 2 Hz stills, and mission-triggered transect capture",
         "icon": "mdi-video",
         "company": "Blue Robotics",
-        "version": "0.5",
-        "webpage": "https://github.com/bluerobotics/blueos-video-recorder",
+        "version": "1.0.0",
+        "webpage": "https://github.com/vshie/SubReels_TowFish",
         "api": "https://github.com/bluerobotics/BlueOS-docker"
     }
     '''

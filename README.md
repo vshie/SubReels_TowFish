@@ -1,132 +1,142 @@
-# BlueOS Video Recorder Extension
+# SubReels: TowFish
 
-Onboard video recording extension for use with hovering AUV running BlueOS / ArduSub, featuring automated dive mission control with external switch triggering.
+Towed-body video survey extension for BlueOS. Second in the
+[SubReels](https://github.com/vshie/SubReels) series.
 
-## Components
+SubReels: TowFish runs on the towed camera body (ArduSub) and coordinates with
+an ArduRover tow boat on the surface. It records the towfish camera's RTSP
+H.264 stream or captures geotagged 2 Hz stills, and can drive both
+automatically from the boat's mission state so one file or image folder is
+produced per waypoint leg.
 
-### 1. BlueOS Video Recorder Extension
-A Python-based web service that provides HTTP endpoints for starting and stopping video recording from USB and IP camera video devices.
+## Features
 
-**Features:**
-- HTTP API for remote recording control
-- H.264 video recording with configurable quality settings
-- Integration with ArduPilot Lua scripts via HTTP requests
+- **Transect auto capture** — watches the tow boat's mission over `mavlink2rest`
+  and rolls a new file or image folder at every `MISSION_CURRENT.seq` change,
+  keeping the RTSP pipeline alive across leg boundaries.
+- **Geotagged stills** — 2 Hz JPEGs with GPS position, altitude and full towfish
+  attitude written into EXIF/XMP, plus a `telemetry.csv` sidecar per session.
+- **Telemetry subtitles** — SRT and ASS sidecars burned from live depth,
+  heading, altitude and camera tilt.
+- **USB storage with failover** — records to an attached USB drive when one is
+  usable and falls back to the local SD mid-session if the drive disappears.
+- **Cockpit MFD widget** — a compact black/green panel for field use with
+  record, vehicle and optics control.
+- **Survey parameter checker** — reads and writes the autopilot parameters that
+  a tow survey depends on, on both vehicles, from the setup page.
 
-### 2. HAUV Lua Script
-An ArduPilot Lua script that controls automated dive missions for a hovering AUV with external switch-based triggering.
+## Interfaces
 
-**Features:**
-- External switch-based mission initiation (GPIO pin 27 Navigator Leak sensor input)
-- Automated dive sequence: countdown → descent → hover → ascent → surface
-- Configurable parameters for depth, timing, and throttle settings
-- Water sampling integration with relay control
-- Light control synchronized with dive phases
-- Safety abort functionality via switch opening
-- Video recording start/stop synchronized with dive phases
+The extension serves two separate UIs.
 
-## Installation
+### Setup console (`/`)
+
+Pre-survey configuration only, at full page width:
+
+- tow vehicle IP, recording storage, stream transport and camera snapshot URL
+- recorder status, storage state and live telemetry
+- the survey parameter checker
+- a file browser over the recordings folder
+
+### Cockpit MFD widget (`/widget`)
+
+Everything used while a survey is running — record/timelapse/transect mode
+selection, arm/disarm, flight mode, depth jog, camera tilt, zoom, focus and
+white balance. Add it to Cockpit as a custom widget pointing at
+`http://<vehicle>/extensionv2/subreels-towfish/widget`.
+
+## Survey parameters
+
+The setup console can check and correct the parameters a tow survey depends on.
+Each target is editable and persisted, so the values below are a starting point
+rather than a requirement — the right numbers shift with hull, tow point and sea
+state.
+
+**Tow boat (ArduRover)**
+
+| Parameter | Default | Why |
+| --- | --- | --- |
+| `TURN_RADIUS` | 2.50 m | Round waypoints tightly enough that the towfish is not dragged across its own track. |
+| `WP_PIVOT_ANGLE` | 0 deg | Disables pivot turns so the boat keeps way on through every corner. |
+| `WP_SPEED` | 0.8–1.1 m/s | Target speed on an AUTO mission leg. |
+| `CRUISE_SPEED` | 0.8–1.1 m/s | Kept equal to `WP_SPEED` so the boat does not fight its own mission. |
+
+**Towfish (ArduSub)**
+
+| Parameter | Default | Why |
+| --- | --- | --- |
+| `ATC_ANG_RLL_P` | 0.00 | Leaves roll passive so the tow cable sets the fish attitude. |
+| `ATC_RAT_RLL_D` | 0.0072 | Damps the roll oscillation the cable induces. |
+| `ATC_RAT_RLL_FLTE` | 3 Hz | Roll rate error filter cutoff. |
+| `ATC_RAT_RLL_FLTD` | 4 Hz | Roll rate derivative filter cutoff. |
+
+Reads and writes go over `mavlink2rest` on each vehicle — the towfish through
+`host.docker.internal`, the boat through the configured tow vehicle IP. A write
+is only reported as successful once the autopilot echoes back a fresh
+`PARAM_VALUE`, so a value that never reached the vehicle cannot look applied.
+
+## Setup
 
 ### Prerequisites
-- BlueOS running on compatible hardware ([Installation Guide](https://blueos.cloud/docs/latest/usage/installation/))
-- ArduSub firmware with Lua scripting enabled
-- USB video device providing H.264 stream on `/dev/video2`
 
-### BlueOS Video Recorder Extension Setup
+- BlueOS on the towfish ([installation guide](https://blueos.cloud/docs/latest/usage/installation/))
+- An ArduRover tow boat reachable on the same network, running `mavlink2rest`
+- A camera publishing an RTSP H.264 stream
 
+### First run
 
-1. **Configure video device access:**
-   - Navigate to BlueOS Video Streams page
-   - **Disable any existing `/dev/video2` camera streams**
-   - This ensures the extension has exclusive access to the video device
+1. Install the extension and open its page from the BlueOS sidebar.
+2. Set **Tow Vehicle IP** to the boat's address (default `192.168.2.12`).
+3. Set the camera to maximum quality. On a RadCam at `192.168.2.10`
+   (`admin` / `blue`): Configuration → Video & Audio → resolution `3840x2160`,
+   coding quality at maximum.
+4. Choose a recording storage preference. USB is used when a drive with enough
+   free space is mounted, otherwise recordings fall back to the local SD.
+5. Run **Check All** in the survey parameters panel, adjust any targets, then
+   **Apply Mismatched**.
 
-### HAUV Lua Script Setup
+### Branding
 
-1. **Enable ArduPilot Lua scripting:**
-   - Set parameter `SCR_ENABLE` to `1` (true)
-   - **Restart the autopilot** - this is required for the scripts directory to appear
-   - The scripts directory will be created at: `configs/ardupilot/firmware/scripts`
+Drop a square logo into `app/static/` as `logo.png`, `.svg`, `.jpg` or `.webp`
+and it fills the bay at the top left of the setup console.
 
-2. **Upload the script:**
-   - Copy `HAUV.lua` to the ArduPilot scripts directory: `configs/ardupilot/firmware/scripts/`
-   - The script will automatically execute on autopilot startup
-   - **Note:** The scripts directory only appears after setting `SCR_ENABLE=1` and restarting the autopilot
+## Storage layout
 
-3. **Hardware connections:**
-   - Connect external switch to GPIO pin 27 (PWM0/RGB port on Navigator)
-   - Switch should connect to 3.3V and signal pin
-   - Close switch to initiate dive mission
-   - Open switch during mission to abort
+Recordings live on the host at `/usr/blueos/extensions/subreels_towfish`, mounted
+into the container at `/app/videorecordings`, or under `Towfish/` on an attached
+USB drive. Configuration persists in `subreels_towfish_config.json` alongside the
+recordings.
 
-## Configuration
+## HTTP API
 
-### HAUV Script Parameters
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/status` | Mode, health, storage, vehicle and optics state |
+| GET | `/telemetry` | Depth, climb, temperature, lights, GPS, heading |
+| GET/POST | `/config` | Read or update persisted configuration |
+| GET | `/start`, `/stop` | Manual video recording |
+| GET | `/timelapse/start`, `/timelapse/stop` | 2 Hz snapshot capture |
+| GET/POST | `/transect/enable`, `/transect/disable` | Mission-triggered capture |
+| GET | `/params` | Parameter specs, targets, last readings and job state |
+| POST | `/params/check` | Read parameters from the vehicles |
+| POST | `/params/apply` | Write saved targets to the vehicles |
+| POST | `/params/targets` | Persist edited target values |
+| GET | `/list`, `/download/<file>` | Browse and fetch recordings |
 
-The script includes configurable parameters accessible through Mission Planner or similar GCS:
-
-- `HOVER_DELAY_S`: Countdown delay before dive (default: 30 seconds)
-- `HOVER_LIGHT_D`: Depth to turn on lights (default: 7.0m)
-- `HOVER_HOVER_M`: Hover duration in minutes (default: 1.0)
-- `HOVER_SURF_D`: Surface threshold depth (default: 2.0m)
-- `HOVER_MAX_AH`: Maximum amp-hours before abort (default: 12.0)
-- `HOVER_MIN_V`: Minimum battery voltage (default: 13.0V)
-- `HOVER_REC_DEPTH`: Depth to start video recording (default: 5.0m)
-- `HOVER_T_DEPTH`: Target maximum depth (default: 60m)
-- `HOVER_D_THRTL`: Descent throttle setting (default: 1750)
-- `HOVER_A_THRTL`: Ascent throttle setting (default: 1460)
-- `HOVER_SIM_MODE`: Simulation mode (0=normal, 1=simulation)
-
-### Video Recorder Configuration
-
-The extension uses HTTP endpoints:
-- `GET /start` - Start video recording
-- `GET /stop` - Stop video recording
-- Default port: 5423
-
-## Mission Flow
-
-1. **Standby**: Vehicle waits with switch open
-2. **Countdown**: Switch closed triggers countdown period
-3. **Descent**: Vehicle descends to target depth with video recording
-4. **Hover**: Vehicle hovers at target depth for specified duration
-5. **Ascent**: Vehicle ascends to surface with lights controlled by depth
-6. **Surface**: Vehicle completes mission and disarms
-
-## Safety Features
-
-- **External switch abort**: Opening switch during mission triggers immediate abort
-- **Battery monitoring**: Mission aborts if voltage or amp-hours exceed limits
-- **Timeout protection**: Missions have configurable time limits
-- **Depth collision detection**: Automatic hover depth adjustment on impact detection
-- **Automatic disarm**: Vehicle disarms on mission completion or abort
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Script not executing:**
-   - Verify `SCR_ENABLE` parameter is set to `1`
-   - Restart autopilot after parameter change
-   - Check script file is in correct directory
-
-2. **Video recording fails:**
-   - Ensure `/dev/video2` streams are disabled in BlueOS Video Streams
-   - Verify video device provides H.264 stream
-   - Check extension web service is running on port 5423
-
-3. **Switch not responding:**
-   - Verify GPIO pin 27 connection
-   - Check switch wiring to 3.3V and signal pin
-   - Monitor GCS messages for switch state updates
-
-## Hardware
-
-CAD files for the Profiling AUVE is available:
-- [Onshape CAD Document](https://cad.onshape.com/documents/e4693243722d954d549cf47c/w/2125e0004d02499999f2c26f/e/567b98a997673cb9745957bb?renderMode=0&uiState=68d9aa5e71f48e4fab9e347f)
+The service listens on port 5423, with a WebSocket on 8765 publishing recording
+state to the Cockpit data lake.
 
 ## Development
 
-This project is in active development. For issues, feature requests, or contributions, please refer to the project repository.
+```bash
+docker compose up --build
+```
+
+CI builds and publishes the extension image on every push via
+`.github/workflows/deploy.yml`, which needs `DOCKER_USERNAME` and
+`DOCKER_PASSWORD` secrets plus the `MY_NAME`, `MY_EMAIL`, `ORG_NAME` and
+`ORG_EMAIL` repository variables.
 
 ## License
 
-See LICENSE file for details.
+See [LICENSE](LICENSE).

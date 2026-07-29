@@ -67,7 +67,7 @@ ENV FLASK_APP=main.py
 # Expose ports
 EXPOSE 5423 8765
 
-LABEL version="0.9"
+LABEL version="1.0.0"
 
 ARG IMAGE_NAME
 LABEL permissions='\
@@ -78,7 +78,7 @@ LABEL permissions='\
   },\
   "HostConfig": {\
     "Binds": [\
-      "/usr/blueos/extensions/videorecorder:/app/videorecordings",\
+      "/usr/blueos/extensions/subreels_towfish:/app/videorecordings",\
       "/dev/video2:/dev/video2",\
       "/dev:/dev",\
       "/mnt:/mnt:rshared"\
@@ -114,18 +114,28 @@ ARG MAINTAINER
 ARG MAINTAINER_EMAIL
 LABEL company='\
 {\
-        "about": "",\
+        "about": "Towed-body video survey for BlueOS: RTSP recording, geotagged 2 Hz stills, and mission-triggered transect capture driven by an ArduRover tow boat.",\
         "name": "Blue Robotics",\
         "email": "support@bluerobotics.com"\
     }'
 LABEL type="tool"
+LABEL tags='[\
+    "video",\
+    "recording",\
+    "survey",\
+    "towfish",\
+    "ardusub",\
+    "ardurover"\
+]'
 
 ARG REPO
 ARG OWNER
-LABEL readme=''
+LABEL readme='https://raw.githubusercontent.com/vshie/SubReels_TowFish/{tag}/README.md'
 LABEL links='\
 {\
-        "source": ""\
+        "source": "https://github.com/vshie/SubReels_TowFish",\
+        "website": "https://bluerobotics.com",\
+        "support": "mailto:support@bluerobotics.com"\
     }'
 LABEL requirements="core >= 1.1"
 

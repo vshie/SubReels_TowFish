@@ -1,14 +1,14 @@
 version: '3.7'
 
 services:
-  video-recorder:
+  subreels-towfish:
     build: .
-    container_name: blueos-videorecorder
+    container_name: subreels-towfish
     network_mode: host  # Required for BlueOS
     ports:
       - "5423:5423"  # Fixed host:container port mapping
     volumes:
-      - /usr/blueos/extensions/videorecorder:/app/videorecordings
+      - /usr/blueos/extensions/subreels_towfish:/app/videorecordings
       - /dev/video2:/dev/video2
       # Expose host /dev so USB block devices (e.g. /dev/sda1) appear in the
       # container when hot-plugged. Without this, USB storage only works if a

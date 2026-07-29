@@ -1,7 +1,7 @@
 [project]
-name = "BlueOS_video_recorder"
-version = "0.9.0"
-description = "BlueOS Video Recorder"
+name = "subreels_towfish"
+version = "1.0.0"
+description = "SubReels: TowFish -- towed-body video survey extension for BlueOS"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
