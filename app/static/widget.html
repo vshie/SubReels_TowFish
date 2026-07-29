@@ -6,9 +6,11 @@
     <title>Towfish MFD</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
     <style>
         :root {
+            --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular,
+                    Menlo, Consolas, 'DejaVu Sans Mono', monospace;
             --panel: #0d1310;
             --panel-edge: #1f2a25;
             --panel-inset: #060a08;
@@ -23,15 +25,23 @@
             --red-glow: rgba(239, 83, 80, 0.45);
             --sky: #6ec6ff;
             --sky-glow: rgba(110, 198, 255, 0.35);
-            --off: #4a5852;
-            --ink: #d7e5df;
-            --ink-dim: #8fa89d;
+            --off: #6b7d76;
+            --ink: #e6f2ec;
+            /* Secondary text was #8fa89d, dim enough that labels and
+               hints read as noise against the dark panels. */
+            --ink-dim: #a9c2b6;
+            /* Section headings get their own hue so structure is visible
+               at a glance. Deliberately not phosphor/amber/red, which all
+               carry status meaning elsewhere in this widget. */
+            --title: #7fe9ff;
+            --title-glow: rgba(127, 233, 255, 0.45);
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { height: 100%; }
         body {
-            font-family: 'Share Tech Mono', ui-monospace, Menlo, Consolas, monospace;
+            font-family: var(--mono);
+            font-size: 13px;
             color: var(--ink);
             background:
                 radial-gradient(1200px 800px at 30% -10%, #0a1a15 0%, #050807 60%, #030503 100%);
@@ -64,16 +74,17 @@
             padding: 2px 4px 8px 4px;
         }
         .brand .name {
-            font-family: 'Orbitron', 'Share Tech Mono', monospace;
+            font-family: 'Orbitron', var(--mono);
             font-weight: 800;
-            font-size: 14px;
-            letter-spacing: 0.34em;
+            font-size: 17px;
+            letter-spacing: 0.26em;
             color: var(--ink);
             text-shadow: 0 0 6px rgba(215,229,223,0.15);
         }
         .brand .sub {
-            font-size: 10px;
-            letter-spacing: 0.3em;
+            font-size: 11.5px;
+            font-weight: 500;
+            letter-spacing: 0.18em;
             color: var(--ink-dim);
         }
 
@@ -121,8 +132,8 @@
             color: var(--phosphor-dim);
             border: 1px solid transparent;
             padding: 7px 0;
-            font: 700 11px 'Share Tech Mono', monospace;
-            letter-spacing: 0.28em;
+            font: 700 12.5px var(--mono);
+            letter-spacing: 0.14em;
             cursor: pointer;
             border-radius: 4px;
             transition: color 0.15s, background 0.15s, box-shadow 0.15s;
@@ -148,7 +159,7 @@
             border: 1px solid #0a120e;
             border-radius: 6px;
             margin-bottom: 8px;
-            font-size: 11px;
+            font-size: 12.5px;
         }
         .lamp {
             display: inline-flex;
@@ -159,7 +170,7 @@
             background: #050807;
             border: 1px solid #0d1310;
             font-weight: 700;
-            letter-spacing: 0.18em;
+            letter-spacing: 0.08em;
             color: var(--off);
         }
         .lamp .dot {
@@ -181,10 +192,10 @@
         .mode-readout {
             text-align: center;
             font-weight: 700;
-            letter-spacing: 0.22em;
+            letter-spacing: 0.1em;
             color: var(--phosphor);
             text-shadow: 0 0 4px var(--phosphor-glow);
-            font-size: 12px;
+            font-size: 13.5px;
         }
         .mode-readout.unknown { color: var(--ink-dim); text-shadow: none; }
 
@@ -197,7 +208,7 @@
             background: #050807;
             border: 1px solid #0d1310;
             font-weight: 700;
-            letter-spacing: 0.18em;
+            letter-spacing: 0.08em;
             color: var(--off);
         }
         .rec-lamp .dot {
@@ -226,7 +237,8 @@
             padding-top: 6px;
             border-top: 1px dashed #16221c;
             margin-top: 6px;
-            font-size: 10px;
+            font-size: 12px;
+            font-weight: 500;
         }
         .strip-mini .cell {
             display: flex;
@@ -236,13 +248,14 @@
         }
         .strip-mini .label {
             color: var(--ink-dim);
-            letter-spacing: 0.24em;
-            font-size: 9px;
+            letter-spacing: 0.12em;
+            font-size: 10.5px;
+            font-weight: 500;
         }
         .strip-mini .value {
             color: var(--phosphor);
             text-shadow: 0 0 4px var(--phosphor-glow);
-            letter-spacing: 0.12em;
+            letter-spacing: 0.03em;
         }
         .strip-mini .value.dim {
             color: var(--ink-dim);
@@ -271,12 +284,13 @@
             border-left: 1px dashed #16221c;
         }
         .strip-depth .dlabel {
-            font-size: 10px;
-            letter-spacing: 0.24em;
+            font-size: 11.5px;
+            font-weight: 500;
+            letter-spacing: 0.12em;
             color: var(--ink-dim);
         }
         .strip-depth .dvalue {
-            font: 800 22px 'Orbitron', 'Share Tech Mono', monospace;
+            font: 800 24px 'Orbitron', var(--mono);
             line-height: 1;
             color: var(--sky);
             text-shadow: 0 0 8px var(--sky-glow);
@@ -288,17 +302,18 @@
         .strip-depth .dvalue.dim { color: var(--ink-dim); text-shadow: none; }
         .strip-depth .dvalue.warn { color: var(--amber); text-shadow: 0 0 8px var(--amber-glow); }
         .strip-depth .dunit {
-            font-size: 11px;
-            letter-spacing: 0.2em;
+            font-size: 12.5px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
             color: var(--ink-dim);
         }
         /* Depth-jog activity flag -- always visible so the operator sees
            the simulated pilot input regardless of which tab is open. */
         .jog-flag {
             margin-left: 6px;
-            font-size: 11px;
+            font-size: 12.5px;
             font-weight: 700;
-            letter-spacing: 0.18em;
+            letter-spacing: 0.08em;
             padding: 2px 7px;
             border-radius: 3px;
             border: 1px solid transparent;
@@ -330,18 +345,42 @@
             padding: 8px;
         }
         .section-title {
-            font-size: 10px;
-            letter-spacing: 0.28em;
-            color: var(--ink-dim);
-            margin-bottom: 6px;
+            position: relative;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            color: var(--title);
+            text-shadow: 0 0 8px var(--title-glow);
+            margin-bottom: 7px;
+            padding-left: 10px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #1b2f33;
             display: flex;
             justify-content: space-between;
             align-items: baseline;
         }
+        /* Accent bar so each panel's heading is findable at a glance on a
+           small MFD, not just a differently-coloured line of text. These
+           headings hold bare text rather than a wrapping span, so the bar
+           is positioned against the title box itself; as a flex item it
+           would be pushed away from the text by space-between. */
+        .section-title::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0.15em;
+            width: 3px;
+            height: 0.95em;
+            border-radius: 2px;
+            background: var(--title);
+            box-shadow: 0 0 6px var(--title-glow);
+        }
         .section-title .aux {
-            color: var(--phosphor-dim);
-            letter-spacing: 0.14em;
-            font-size: 10px;
+            color: var(--ink-dim);
+            letter-spacing: 0.06em;
+            font-size: 11.5px;
+            font-weight: 400;
+            text-shadow: none;
         }
 
         .row {
@@ -350,6 +389,9 @@
             gap: 6px;
         }
         .row.three  { grid-template-columns: repeat(3, 1fr); }
+        /* A labelled toggle needs the full panel width in a side-panel-sized
+           widget; sharing a half column wraps its label onto three lines. */
+        .row.stack  { grid-template-columns: 1fr; }
         .row.four   { grid-template-columns: repeat(4, 1fr); }
         .row + .row { margin-top: 6px; }
 
@@ -358,8 +400,8 @@
             border: 1px solid #1a2621;
             background: linear-gradient(180deg, #10201a 0%, #081611 100%);
             color: var(--phosphor);
-            font: 700 12px 'Share Tech Mono', monospace;
-            letter-spacing: 0.22em;
+            font: 700 13px var(--mono);
+            letter-spacing: 0.1em;
             padding: 10px 6px;
             border-radius: 4px;
             cursor: pointer;
@@ -406,7 +448,7 @@
                 inset 0 0 0 1px #26583d,
                 0 0 10px var(--phosphor-glow);
         }
-        .btn.small { font-size: 11px; padding: 8px 4px; letter-spacing: 0.14em; }
+        .btn.small { font-size: 12px; padding: 8px 4px; letter-spacing: 0.06em; }
         .btn.wide { grid-column: 1 / -1; }
 
         /* Toggle switch */
@@ -418,14 +460,15 @@
             padding: 6px 4px;
         }
         .toggle-row .label {
-            font-size: 11px;
-            letter-spacing: 0.18em;
+            font-size: 12.5px;
+            font-weight: 500;
+            letter-spacing: 0.06em;
             color: var(--ink);
         }
         .toggle-row .aux {
-            font-size: 10px;
+            font-size: 11.5px;
             color: var(--ink-dim);
-            letter-spacing: 0.14em;
+            letter-spacing: 0.02em;
         }
         .toggle {
             width: 44px;
@@ -468,22 +511,24 @@
             text-align: center;
         }
         .readout .label {
-            font-size: 9px;
-            letter-spacing: 0.3em;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 0.12em;
             color: var(--ink-dim);
             margin-bottom: 4px;
         }
         .readout .value {
-            font: 700 18px 'Share Tech Mono', monospace;
-            letter-spacing: 0.12em;
+            font: 700 20px var(--mono);
+            letter-spacing: 0.02em;
             color: var(--phosphor);
             text-shadow: 0 0 6px var(--phosphor-glow);
         }
         .readout .value.dim { color: var(--ink-dim); text-shadow: none; }
         .readout .sub {
-            font-size: 9px;
+            font-size: 11px;
+            font-weight: 500;
             color: var(--ink-dim);
-            letter-spacing: 0.18em;
+            letter-spacing: 0.04em;
             margin-top: 3px;
         }
 
@@ -500,8 +545,8 @@
         }
         .mode-switch .btn {
             padding: 6px 0;
-            font-size: 10px;
-            letter-spacing: 0.16em;
+            font-size: 12px;
+            letter-spacing: 0.06em;
             border: 1px solid transparent;
             background: transparent;
             color: var(--phosphor-dim);
@@ -520,8 +565,9 @@
             display: none;
             align-items: center;
             gap: 6px;
-            font-size: 10px;
-            letter-spacing: 0.2em;
+            font-size: 11.5px;
+            font-weight: 500;
+            letter-spacing: 0.08em;
             color: var(--ink-dim);
         }
         .capture-row.visible { display: flex; }
@@ -532,8 +578,8 @@
             border: 1px solid #0d1310;
             border-radius: 4px;
             padding: 4px 6px;
-            font: 700 11px 'Share Tech Mono', monospace;
-            letter-spacing: 0.12em;
+            font: 700 12.5px var(--mono);
+            letter-spacing: 0.03em;
         }
         .capture-row select:disabled { opacity: 0.5; }
 
@@ -546,7 +592,8 @@
             background: #050807;
             border: 1px solid #0d1310;
             border-radius: 4px;
-            font-size: 11px;
+            font-size: 12.5px;
+            font-weight: 500;
             min-height: 34px;
         }
         .file-name {
@@ -554,7 +601,7 @@
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-            letter-spacing: 0.08em;
+            letter-spacing: 0.02em;
         }
         .file-size {
             color: var(--phosphor);
@@ -565,9 +612,10 @@
         .file-size.transect  { color: var(--sky);   text-shadow: 0 0 4px var(--sky-glow); }
 
         .stats-row {
-            font-size: 10px;
+            font-size: 12px;
+            font-weight: 500;
             color: var(--ink-dim);
-            letter-spacing: 0.1em;
+            letter-spacing: 0.02em;
             padding: 0 2px;
             display: flex;
             justify-content: space-between;
@@ -576,10 +624,11 @@
         .stats-row .warn { color: var(--amber); }
 
         .duration {
-            font-family: 'Share Tech Mono', monospace;
-            font-size: 12px;
+            font-family: var(--mono);
+            font-size: 14px;
+            font-weight: 700;
             color: var(--ink-dim);
-            letter-spacing: 0.12em;
+            letter-spacing: 0.03em;
         }
         .duration.active { color: var(--red); }
         .duration.active.timelapse { color: var(--amber); }
@@ -590,16 +639,18 @@
             background: #2b0808;
             border: 1px solid #501313;
             border-radius: 4px;
-            font-size: 10px;
-            letter-spacing: 0.14em;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.02em;
             color: #ffb4b4;
             display: none;
         }
 
         .hint {
-            font-size: 9px;
+            font-size: 11.5px;
+            font-weight: 500;
             color: var(--ink-dim);
-            letter-spacing: 0.18em;
+            letter-spacing: 0.02em;
             padding: 2px 4px;
         }
 
@@ -615,8 +666,9 @@
             align-items: center;
             justify-content: space-between;
             gap: 6px;
-            font-size: 9px;
-            letter-spacing: 0.16em;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 0.06em;
             color: var(--ink-dim);
             background: var(--panel-inset);
             border: 1px solid #14261d;
@@ -630,7 +682,7 @@
             border-radius: 2px;
             color: var(--amber);
             font-family: inherit;
-            font-size: 12px;
+            font-size: 13px;
             text-align: center;
             padding: 2px 0;
         }
@@ -769,7 +821,7 @@
             </div>
             <div class="section">
                 <div class="section-title">WHITE BALANCE</div>
-                <div class="row">
+                <div class="row stack">
                     <button class="btn sky"   id="awbOnceBtn">ONE-PUSH AWB</button>
                     <div class="toggle-row">
                         <div>
