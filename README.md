@@ -9,6 +9,44 @@ H.264 stream or captures geotagged 2 Hz stills, and can drive both
 automatically from the boat's mission state so one file or image folder is
 produced per waypoint leg.
 
+## About the vehicle
+
+The TowFish is a towed camera body rather than a free-swimming ROV or AUV. It
+flies on a cable behind a BlueBoat — or any other surface towing platform — and
+the two vehicles work as a pair. The boat contributes position and the depth of
+water beneath it; the fish contributes its own depth, attitude and imagery.
+Coordinating that pair is what this extension exists to do.
+
+Depth is flown against two references at once: a desired depth in the water
+column, and the bottom depth under the boat. Working from both is what lets the
+fish be held at a useful standoff over terrain that rises and falls, instead of
+at a fixed depth below the surface that either loses the bottom or risks
+striking it. Bottom depth comes from the boat's Ping sonar (`DISTANCE_SENSOR`
+over `mavlink2rest`) and the fish's depth from its own barometer; the widget
+shows the two side by side so the operator can fly the difference, with the
+depth jog and ALT_HOLD on the same panel.
+
+Every capture — video frame or still — is tagged with where the camera was and
+where it was pointing: GPS position, altitude, towfish roll/pitch/yaw, and the
+mount pitch derived from the tilt servo. That is what makes the imagery
+measurable after the fact rather than only watchable.
+
+### Position estimation
+
+The fish is underwater and carries no GPS of its own, so its position is
+inferred from the boat's. Today that inference is a **static offset**: 4 m
+behind the boat's GPS fix, along the towfish's heading.
+
+This is a deliberate first approximation, and it is the weakest link in the
+geotagging chain — real layback varies with cable scope, tow speed and fish
+depth, none of which a fixed distance accounts for. Planned work:
+
+- a richer layback model driven by cable scope, speed and depth rather than a
+  constant
+- validating whichever model we adopt against an acoustic localization system
+  carried on both the TowFish and the BlueBoat, so the estimate can be checked
+  against a measured baseline instead of trusted on geometry alone
+
 ## Features
 
 - **Transect auto capture** — watches the tow boat's mission over `mavlink2rest`
