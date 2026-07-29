@@ -1,0 +1,39 @@
+---
+description: How changes reach the vehicle in this BlueOS extension
+alwaysApply: true
+---
+
+# Shipping changes
+
+Pushing to `main` triggers `.github/workflows/deploy.yml`, which builds and
+publishes the extension image. The user then installs the new version manually
+from the BlueOS extension manager.
+
+So the delivery path for any change is: commit, push, and say the build is
+running. Never present a hand-deploy as having shipped a change.
+
+# Hot-patching the vehicle
+
+Copying files into the running container is a legitimate way to *verify* a fix
+against real hardware, and is often the only way to test something that needs
+the camera or autopilot:
+
+```bash
+C=extension-vshieblueossubreelstowfishmain
+docker cp main.py $C:/app/main.py && docker restart $C
+```
+
+It is not durable. The extension manager can recreate the container at any
+time, silently reverting every copied file to whatever is in the local image
+cache -- which may itself be older than the latest CI build. Both failures are
+quiet, because the app keeps serving either way.
+
+After hot-patching, confirm the new code is actually running instead of
+assuming the copy took effect:
+
+```bash
+docker exec $C grep -c some_symbol_from_the_change /app/main.py
+docker inspect $C --format 'created={{.Created}}'   # recreated behind you?
+```
+
+Anything verified this way still has to be committed and pushed to ship.
