@@ -1117,8 +1117,19 @@ def format_srt_timestamp(seconds):
 # Global counter for SRT subtitle entries
 srt_subtitle_counter = 0
 
+#: Set once so a missing ffprobe warns a single time instead of on every part.
+_ffprobe_missing_logged = False
+
+
 def get_video_duration(video_path):
-    """Get video duration in seconds using ffprobe"""
+    """Encoded duration of ``video_path`` in seconds via ffprobe, else None.
+
+    Returning None is survivable -- callers leave sidecars on their
+    wall-clock timeline instead of rescaling to the encoded duration --
+    but it means subtitle/telemetry timing drifts from the video, so a
+    missing ffprobe is logged once at WARNING rather than swallowed.
+    """
+    global _ffprobe_missing_logged
     try:
         cmd = [
             'ffprobe', '-v', 'error',
@@ -1128,8 +1139,16 @@ def get_video_duration(video_path):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
-            duration = float(result.stdout.strip())
-            return duration
+            return float(result.stdout.strip())
+        logger.error("ffprobe failed on %s (rc=%s): %s",
+                     video_path, result.returncode, result.stderr.strip())
+    except FileNotFoundError:
+        if not _ffprobe_missing_logged:
+            _ffprobe_missing_logged = True
+            logger.warning(
+                "ffprobe not installed -- SRT/CSV sidecars keep their "
+                "wall-clock timing and are not rescaled to the encoded "
+                "duration. Install ffmpeg in the extension image.")
     except Exception as e:
         logger.error(f"Error getting video duration: {str(e)}")
     return None
@@ -1965,6 +1984,38 @@ def _ensure_gst_init():
 #: muxer overhead so the active fragment can finalise before the cap hits.
 FAT32_MAX_PART_BYTES = int(3.5 * 1024 * 1024 * 1024)
 
+_element_prop_cache = {}
+
+
+def _element_has_property(factory_name, prop_name):
+    """Whether the installed ``factory_name`` element exposes ``prop_name``.
+
+    Element properties come and go between GStreamer releases and the
+    BlueOS base image is not pinned to one, so anything version-dependent
+    has to be probed rather than assumed. This matters because
+    ``Gst.parse_launch`` treats an unknown property as a *fatal* parse
+    error: a single flag the runtime doesn't recognise takes out the whole
+    recorder rather than degrading. Cached because it's asked once per
+    pipeline build and the answer can't change while we're running.
+    """
+    key = (factory_name, prop_name)
+    if key not in _element_prop_cache:
+        present = False
+        try:
+            _ensure_gst_init()
+            element = Gst.ElementFactory.make(factory_name, None)
+            if element is None:
+                logger.warning("property probe: element %s unavailable", factory_name)
+            else:
+                present = element.find_property(prop_name) is not None
+        except Exception:
+            logger.exception("property probe failed for %s %s",
+                             factory_name, prop_name)
+        _element_prop_cache[key] = present
+        logger.info("property probe: %s has %s = %s",
+                    factory_name, prop_name, present)
+    return _element_prop_cache[key]
+
 
 def _build_pipeline_description(rtsp_url, container_fmt, proto,
                                 mux_name="muxsink", max_size_bytes=0):
@@ -1991,16 +2042,30 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto,
     a new part once the current file reaches the byte threshold. Used
     when the resolved target lives on a vfat USB stick to stay under
     the FAT32 4 GiB per-file cap.
+
+    Deliberately *no* ``stream-format`` capsfilter ahead of the muxer:
+    the two containers disagree (``mp4mux`` only accepts ``avc``, while
+    ``mpegtsmux`` only accepts ``byte-stream``), so pinning either one
+    makes the other container fail to link at parse time. Leaving it out
+    lets ``h264parse`` negotiate whatever the configured muxer asks for.
     """
     if container_fmt == "mpegts":
         muxer_factory = "mpegtsmux"
     else:
         muxer_factory = "mp4mux"
     proto = proto if proto in VALID_STREAM_PROTOCOLS else DEFAULT_STREAM_PROTOCOL
+    # Starting a part mid-GOP yields a leading burst of undecodable
+    # frames, which "wait-for-keyframe" avoids -- but it only exists from
+    # GStreamer 1.20, and asking for it on 1.16 is a fatal parse error.
+    # splitmuxsink still gates each fragment on a keyframe regardless, so
+    # omitting it on older runtimes costs nothing at a file boundary.
+    depay = "rtph264depay"
+    if _element_has_property("rtph264depay", "wait-for-keyframe"):
+        depay += " wait-for-keyframe=true"
     return (
-        f"rtspsrc location={rtsp_url} is-live=true latency=5000 "
+        f"rtspsrc location={rtsp_url} latency=5000 "
         f"protocols={proto} retry=5 timeout=5000000 "
-        f"! rtph264depay wait-for-keyframe=true "
+        f"! {depay} "
         f"! h264parse config-interval=-1 "
         # hauv-v2 leaky queue: absorbs RTSP jitter so a brief mux stall
         # never back-pressures the depayloader (which would otherwise
@@ -2008,7 +2073,6 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto,
         # leak the oldest frames downstream if anything ever wedges.
         f"! queue max-size-time=30000000000 max-size-bytes=0 max-size-buffers=0 "
         f"leaky=downstream silent=true "
-        f"! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! splitmuxsink name={mux_name} max-size-time=0 "
         f"max-size-bytes={int(max_size_bytes)} "
         f"muxer-factory={muxer_factory} send-keyframe-requests=true "

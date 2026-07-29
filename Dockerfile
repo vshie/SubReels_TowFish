@@ -24,6 +24,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends --no-install-su
     psmisc \
     && rm -rf /var/lib/apt/lists/*
 
+# ffprobe reports each finished part's encoded duration, which is what the
+# SRT/ASS/telemetry-CSV sidecars are rescaled against. Without it the
+# sidecars keep their wall-clock timing and drift out of sync with the
+# video, so the recorder needs it present rather than optional.
+RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Python GObject Introspection bindings so the recorder can drive
 # GStreamer in-process via gi.repository.Gst (replaces gst-launch-1.0
 # subprocess; needed for splitmuxsink format-location callbacks +
