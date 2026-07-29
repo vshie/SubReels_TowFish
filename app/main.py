@@ -15,8 +15,6 @@ import math
 import websockets
 import csv
 import re
-import io
-import piexif
 from datetime import timezone
 from websockets.exceptions import ConnectionClosed
 
@@ -25,6 +23,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402  (after require_version)
 
 import usb_storage
+import photogrammetry_meta
 from mavlink_params import (
     LOCAL_MAVLINK2REST_URL,
     ParamClient,
@@ -103,6 +102,12 @@ stop_srt_thread = False
 current_srt_file_rtsp = None
 current_video_file_rtsp = None  # path of the FIRST part; used for filesize/list
 
+# Per-video telemetry CSV, written by the same thread (and from the same
+# telemetry sample) as the SRT. ``current_video_csv_wp`` is the leg's
+# waypoint label, parsed once from the .ts filename at creation.
+current_video_csv_file = None
+current_video_csv_wp = None
+
 isp_log_thread = None
 stop_isp_log_thread = False
 current_isp_log_file = None
@@ -114,11 +119,11 @@ stop_ass_thread = False
 current_ass_file = None
 ass_subtitle_counter = 0
 
-# Subtitle timing reference. SRT/ASS entries are timestamped relative to
-# this epoch and (re)scaled to the encoded video duration when a file is
-# finalised. For manual recording it equals ``start_time`` for the whole
-# session; in transect mode it is reset at every leg rollover so each
-# per-leg ``.srt``/``.ass`` starts at 00:00.
+# Sidecar timing reference. SRT/ASS/CSV entries are timestamped relative
+# to this epoch and (re)scaled to the encoded video duration when a file
+# is finalised. For manual recording it equals ``start_time`` for the
+# whole session; in transect mode it is reset at every leg rollover so
+# each per-leg sidecar starts at 00:00.
 sidecar_epoch = None
 # Guards swaps of the current_srt_file_rtsp / current_ass_file / counters
 # / sidecar_epoch globals against the SRT/ASS writer threads while a leg
@@ -1012,6 +1017,95 @@ def create_srt_file(video_path):
         pass
     return srt_path
 
+# Per-video telemetry sidecar. Carries the same telemetry columns (same
+# names, units and formatting) as the timelapse ``telemetry.csv`` so a
+# survey's video legs and its still-image legs are post-processed with
+# one schema. The image-specific columns (seq/filename/frame/size_bytes/
+# snap timing) are replaced by ``video_time_s``, which is the key
+# ``extract_geotagged_frames.py`` interpolates on.
+#
+# ``altitude_m`` is the tow vehicle's GPS altitude above MSL (matching
+# the timelapse column of that name); ``towfish_altitude_m`` is the
+# towfish AHRS2 altitude, which is the value that lands in EXIF
+# ``GPSAltitude``. Both are recorded because they are not the same
+# quantity and photogrammetry needs the latter.
+_VIDEO_CSV_HEADER = [
+    'timestamp', 'video_time_s', 'video_file', 'wp',
+    'lat', 'lon', 'altitude_m', 'towfish_altitude_m', 'towfish_heading_deg',
+    'towfish_roll_deg', 'towfish_pitch_deg',
+    'depth_m', 'temperature_c', 'camera_tilt_deg', 'telem_ms',
+]
+
+_WP_LABEL_RE = re.compile(r'_(wp\d+)(?:_|$)')
+
+
+def create_video_telemetry_csv(video_path):
+    """Create the per-video telemetry CSV sidecar and write its header.
+
+    Returns ``(csv_path, wp_label)``; ``wp_label`` is parsed out of the
+    leg filename (``..._wp03.ts``) so every row can carry it the way the
+    timelapse CSV does, and is ``None`` for manual recordings.
+    """
+    base, _ = os.path.splitext(video_path)
+    csv_path = base + '_telemetry.csv'
+    with open(csv_path, 'w', newline='') as f:
+        csv.writer(f).writerow(_VIDEO_CSV_HEADER)
+    m = _WP_LABEL_RE.search(os.path.basename(base))
+    return csv_path, (m.group(1) if m else None)
+
+
+def adjust_video_csv_timing(csv_path, video_duration):
+    """Scale the CSV's ``video_time_s`` column to the encoded duration.
+
+    The rows are written on wall-clock timing, so they need the same
+    rescale the SRT and ASS get -- otherwise frame extraction would
+    sample telemetry at drifting offsets. Mirrors
+    :func:`adjust_srt_timing`, including its 1% no-op threshold.
+    """
+    try:
+        with open(csv_path, 'r', newline='') as f:
+            rows = list(csv.reader(f))
+        if len(rows) < 2:
+            logger.warning("Telemetry CSV has no data rows, nothing to adjust")
+            return False
+
+        header, data = rows[0], rows[1:]
+        try:
+            t_idx = header.index('video_time_s')
+        except ValueError:
+            logger.warning("Telemetry CSV missing video_time_s column")
+            return False
+
+        times = []
+        for row in data:
+            try:
+                times.append(float(row[t_idx]))
+            except (ValueError, IndexError):
+                times.append(None)
+        max_t = max((t for t in times if t is not None), default=0.0)
+        if max_t <= 0:
+            logger.warning("No valid telemetry CSV timestamps found")
+            return False
+
+        scale = video_duration / max_t
+        if abs(scale - 1.0) < 0.01:
+            logger.info("Telemetry CSV timing already within 1%% of video duration")
+            return True
+
+        with open(csv_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for row, t in zip(data, times):
+                if t is not None:
+                    row[t_idx] = f"{t * scale:.3f}"
+                w.writerow(row)
+
+        logger.info("Telemetry CSV timing adjusted (scaled by %.4f)", scale)
+        return True
+    except Exception:
+        logger.exception("Error adjusting telemetry CSV timing")
+        return False
+
 def format_srt_timestamp(seconds):
     """Format seconds into SRT timestamp format (HH:MM:SS,mmm)"""
     hours = int(seconds // 3600)
@@ -1387,13 +1481,69 @@ def adjust_ass_timing(ass_path, video_duration):
         logger.error(f"Error adjusting ASS timing: {str(e)}")
         return False
 
-def update_srt_file():
-    """Append position data to the active SRT, synced to video recording.
+def fetch_telemetry_block():
+    """Read the full towfish + tow-vehicle telemetry block in one shot.
+
+    Shared by the timelapse capture loop (where it runs in a worker
+    thread parallel to the JPEG fetch so the samples share the camera
+    shutter's wall-clock window) and by the video sidecar writer. One
+    definition means a video leg and a still-image leg record the same
+    fields, computed the same way.
+
+    Returns a dict (always populated, with None values where data was
+    unavailable) plus a ``fetch_ms`` field recording how long the reads
+    took, so consumers can judge staleness.
+    """
+    t0 = time.monotonic()
+    try:
+        bb_lat, bb_lon, bb_alt = get_blueboat_gps_position()
+        # One ATTITUDE read gives heading (yaw), roll and pitch, so we
+        # geotag and record the full towfish orientation per sample
+        # without extra mavlink2rest round-trips.
+        att = get_towfish_attitude()
+        heading = att.get('yaw')
+        roll = att.get('roll')
+        pitch = att.get('pitch')
+        gps_lat, gps_lon = offset_towed_position(bb_lat, bb_lon, heading)
+        tow_alt = get_towfish_altitude()
+        depth = get_depth_data()
+        temp = get_baro_data()
+        # World-relative camera pitch: reuse the ATTITUDE pitch we
+        # already fetched instead of a second round-trip.
+        tilt = get_towfish_camera_tilt(vehicle_pitch_deg=pitch)
+    except Exception:
+        logger.exception("Telemetry fetch raised")
+        bb_lat = bb_lon = bb_alt = None
+        gps_lat = gps_lon = None
+        heading = None
+        roll = None
+        pitch = None
+        tow_alt = None
+        depth = None
+        temp = None
+        tilt = None
+    return {
+        'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
+        'gps_lat': gps_lat, 'gps_lon': gps_lon,
+        'heading': heading, 'roll': roll, 'pitch': pitch,
+        'tow_alt': tow_alt,
+        'depth': depth, 'temp': temp, 'tilt': tilt,
+        'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
+    }
+
+
+def update_geo_sidecars():
+    """Write the SRT position cue and the telemetry CSV row, 5 Hz.
+
+    Both files are produced from a *single* telemetry sample per tick,
+    so they can never disagree about a given instant -- the SRT stays a
+    minimal, player-readable position track while the CSV carries the
+    full orientation set that photogrammetry needs.
 
     Timestamps are relative to ``sidecar_epoch`` (reset per leg in
-    transect mode), then rescaled to the encoded duration when the file
-    is finalised. When tow-vehicle telemetry is *not fresh* (GPS fetch
-    failed/timed out) the entry is written with EMPTY position values
+    transect mode), then rescaled to the encoded duration when the files
+    are finalised. When tow-vehicle telemetry is *not fresh* (GPS fetch
+    failed/timed out) the SRT entry is written with EMPTY position values
     rather than carrying the last known fix forward -- gaps stay explicit
     and never get back-filled with stale coordinates.
     """
@@ -1403,11 +1553,13 @@ def update_srt_file():
 
     while not stop_srt_thread and recording:
         try:
-            # Cheap bookkeeping under the lock: capture the file + epoch
+            # Cheap bookkeeping under the lock: capture the files + epoch
             # and claim a sequence number atomically so a concurrent leg
             # rotation can't interleave a half-written entry.
             with _sidecar_lock:
                 srt_path = current_srt_file_rtsp
+                csv_path = current_video_csv_file
+                wp_label = current_video_csv_wp
                 epoch = sidecar_epoch
                 if srt_path and epoch:
                     srt_subtitle_counter += 1
@@ -1419,17 +1571,18 @@ def update_srt_file():
                     entry_num = None
 
             if entry_num is not None:
+                ts_local = datetime.now()
                 start_timestamp = format_srt_timestamp(elapsed)
                 end_timestamp = format_srt_timestamp(elapsed + 1 / srt_update_rate)
 
-                # Fresh fetch every iteration; (None, None, _) means the
+                # Fresh fetch every iteration; a None lat/lon means the
                 # tow vehicle is unreachable / data is stale.
-                lat, lon, _ = get_blueboat_gps_position()
-                heading = get_towfish_heading()
-                towfish_alt = get_towfish_altitude()
+                telem = fetch_telemetry_block()
+                offset_lat = telem['gps_lat']
+                offset_lon = telem['gps_lon']
+                towfish_alt = telem['tow_alt']
 
-                if lat is not None and lon is not None:
-                    offset_lat, offset_lon = offset_towed_position(lat, lon, heading)
+                if offset_lat is not None and offset_lon is not None:
                     alt_str = f"{towfish_alt:.1f}" if towfish_alt is not None else ""
                     pos_line = (f"latitude: {offset_lat:.6f} "
                                 f"longitude: {offset_lon:.6f} "
@@ -1450,10 +1603,50 @@ def update_srt_file():
                 except Exception as e:
                     logger.debug("SRT append failed (%s): %s", srt_path, e)
 
+                if csv_path:
+                    try:
+                        with open(csv_path, 'a', newline='') as f:
+                            csv.writer(f).writerow(
+                                _video_csv_row(ts_local, elapsed, csv_path,
+                                               wp_label, telem)
+                            )
+                    except Exception as e:
+                        logger.debug("Telemetry CSV append failed (%s): %s",
+                                     csv_path, e)
+
             time.sleep(1 / srt_update_rate)
         except Exception as e:
-            logger.error(f"Error updating SRT file: {str(e)}")
+            logger.error(f"Error updating geo sidecars: {str(e)}")
             time.sleep(1)
+
+
+def _video_csv_row(ts_local, elapsed, csv_path, wp_label, telem):
+    """Format one ``_VIDEO_CSV_HEADER`` row from a telemetry sample.
+
+    Number formatting matches the timelapse CSV column-for-column so
+    both sidecars parse identically downstream.
+    """
+    def num(value, fmt):
+        return format(value, fmt) if value is not None else ""
+
+    video_file = os.path.basename(csv_path).replace('_telemetry.csv', '')
+    return [
+        ts_local.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        f"{elapsed:.3f}",
+        video_file,
+        wp_label or "",
+        num(telem['gps_lat'], '.6f'),
+        num(telem['gps_lon'], '.6f'),
+        num(telem['bb_alt'], '.2f'),
+        num(telem['tow_alt'], '.2f'),
+        num(telem['heading'], '.1f'),
+        num(telem['roll'], '.1f'),
+        num(telem['pitch'], '.1f'),
+        num(telem['depth'], '.2f'),
+        num(telem['temp'], '.2f'),
+        num(telem['tilt'], '.1f'),
+        f"{telem['fetch_ms']:.1f}",
+    ]
 
 async def data_lake_handler(websocket):
     """Stream recording state to Cockpit data lake clients."""
@@ -1822,8 +2015,8 @@ def _build_pipeline_description(rtsp_url, container_fmt, proto,
         f"async-finalize=false"
     )
 
-def _finalize_leg_sidecars(srt_path, ass_path, ts_path):
-    """Rescale a closed leg's SRT/ASS to that leg's encoded duration.
+def _finalize_leg_sidecars(srt_path, ass_path, csv_path, ts_path):
+    """Rescale a closed leg's SRT/ASS/CSV to that leg's encoded duration.
 
     Runs in a short-lived daemon thread. ``splitmuxsink`` finalises the
     ``.ts`` around the time the next fragment opens, so we briefly poll
@@ -1851,6 +2044,8 @@ def _finalize_leg_sidecars(srt_path, ass_path, ts_path):
                 adjust_srt_timing(srt_path, duration)
             if ass_path and os.path.exists(ass_path):
                 adjust_ass_timing(ass_path, duration)
+            if csv_path and os.path.exists(csv_path):
+                adjust_video_csv_timing(csv_path, duration)
             logger.info("Per-leg sidecars finalised for %s (%.2fs)",
                         os.path.basename(ts_path) if ts_path else "?", duration)
         else:
@@ -1861,35 +2056,40 @@ def _finalize_leg_sidecars(srt_path, ass_path, ts_path):
 
 
 def _rotate_leg_sidecars(prev_ts_path, new_ts_path):
-    """Swap SRT/ASS to a new leg file, finalising the previous leg's pair.
+    """Swap SRT/ASS/CSV to a new leg file, finalising the previous leg's set.
 
     Called from the ``splitmuxsink`` format-location callback (GStreamer
     streaming thread) when a new leg ``.ts`` opens. Kept cheap: creates
     the new empty sidecars, repoints the globals under ``_sidecar_lock``
     (resetting counters + ``sidecar_epoch`` so the new leg starts at
-    00:00), and hands the just-closed pair to a background finaliser so
+    00:00), and hands the just-closed set to a background finaliser so
     ffprobe never blocks the streaming thread.
     """
     global current_srt_file_rtsp, current_ass_file
+    global current_video_csv_file, current_video_csv_wp
     global srt_subtitle_counter, ass_subtitle_counter, sidecar_epoch
 
     with _sidecar_lock:
         old_srt = current_srt_file_rtsp
         old_ass = current_ass_file
+        old_csv = current_video_csv_file
 
     new_srt = create_srt_file(new_ts_path)
     new_ass = create_ass_file(new_ts_path)
+    new_csv, new_wp = create_video_telemetry_csv(new_ts_path)
 
     with _sidecar_lock:
         current_srt_file_rtsp = new_srt
         current_ass_file = new_ass
+        current_video_csv_file = new_csv
+        current_video_csv_wp = new_wp
         srt_subtitle_counter = 0
         ass_subtitle_counter = 0
         sidecar_epoch = datetime.now()
 
     threading.Thread(
         target=_finalize_leg_sidecars,
-        args=(old_srt, old_ass, prev_ts_path),
+        args=(old_srt, old_ass, old_csv, prev_ts_path),
         name="leg-sidecar-finalise", daemon=True,
     ).start()
     log_event("leg_sidecars_rotated", os.path.basename(new_ts_path))
@@ -2286,182 +2486,17 @@ class RecordingSession:
 _TIMELAPSE_PERIOD_S = 0.5  # 2 Hz
 _TIMELAPSE_HTTP_TIMEOUT_S = 1.5
 
-def _decimal_deg_to_dms_rationals(deg):
-    """Convert decimal degrees -> EXIF-style ((d,1),(m,1),(s*10000,10000))."""
-    deg = abs(float(deg))
-    d = int(deg)
-    m_full = (deg - d) * 60.0
-    m = int(m_full)
-    s = (m_full - m) * 60.0
-    return ((d, 1), (m, 1), (int(round(s * 10000)), 10000))
-
-def _build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
-                          tilt_deg=None, depth_m=None, temp_c=None,
-                          roll_deg=None, pitch_deg=None):
-    """Build piexif-encoded EXIF bytes embedding the towfish position.
-
-    Mirrors what ``update_srt_file`` writes into the .srt:
-
-    * ``lat`` / ``lon`` are the BlueBoat fix offset 4 m along the
-      towfish heading (already computed by the caller).
-    * ``alt_m`` is the towfish AHRS2 altitude (negative when underwater)
-      -- written as ``GPSAltitude`` with ``GPSAltitudeRef = 1`` (below
-      sea level) when negative.
-    * ``heading_deg`` is the towfish yaw (true heading, 0..360) and
-      becomes ``GPSImgDirection`` so map clients render the camera
-      bearing at each frame.
-    * ``ts_local`` / ``ts_utc`` populate ``DateTimeOriginal`` (local
-      wall-clock for the operator) and ``GPSDateStamp`` /
-      ``GPSTimeStamp`` (always UTC, per EXIF spec).
-    * ``tilt_deg`` (camera tilt, + = up), ``depth_m`` and ``temp_c``
-      have no standard EXIF tags, so they're bundled with the rest into
-      a human-readable ``UserComment`` / ``ImageDescription`` so any
-      viewer surfaces them.
-
-    Returns ``None`` when there's nothing useful to embed.
-    """
-    have_gps = lat is not None and lon is not None
-    have_heading = heading_deg is not None
-    have_extra = (tilt_deg is not None or depth_m is not None
-                  or temp_c is not None or roll_deg is not None
-                  or pitch_deg is not None)
-    if not (have_gps or have_heading or have_extra):
-        return None
-
-    gps_ifd = {}
-
-    if have_gps:
-        gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
-        gps_ifd[piexif.GPSIFD.GPSLatitude] = _decimal_deg_to_dms_rationals(lat)
-        gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
-        gps_ifd[piexif.GPSIFD.GPSLongitude] = _decimal_deg_to_dms_rationals(lon)
-        if alt_m is not None:
-            gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 1 if alt_m < 0 else 0
-            gps_ifd[piexif.GPSIFD.GPSAltitude] = (int(round(abs(alt_m) * 1000)), 1000)
-
-    if have_heading:
-        # 'T' = true heading. The towfish yaw is from the IMU so this
-        # is the absolute heading the camera is pointing.
-        gps_ifd[piexif.GPSIFD.GPSImgDirectionRef] = b'T'
-        gps_ifd[piexif.GPSIFD.GPSImgDirection] = (int(round(heading_deg * 100)), 100)
-
-    # GPS time/date in UTC per spec, regardless of system locale.
-    gps_ifd[piexif.GPSIFD.GPSTimeStamp] = (
-        (ts_utc.hour, 1),
-        (ts_utc.minute, 1),
-        (int(round(ts_utc.second * 100)), 100),
-    )
-    gps_ifd[piexif.GPSIFD.GPSDateStamp] = ts_utc.strftime('%Y:%m:%d').encode('ascii')
-
-    dt_str = ts_local.strftime('%Y:%m:%d %H:%M:%S').encode('ascii')
-    exif_ifd = {
-        piexif.ExifIFD.DateTimeOriginal: dt_str,
-        piexif.ExifIFD.DateTimeDigitized: dt_str,
-    }
-    image_ifd = {
-        piexif.ImageIFD.DateTime: dt_str,
-        piexif.ImageIFD.Software: b"BlueOS-VideoRecorder Towfish",
-    }
-
-    # Human-readable bundle: altitude, heading and camera tilt have
-    # (partial) standard tags above, but tilt/depth/temp don't, so we
-    # also write everything as plain text any viewer can show.
-    comment_parts = []
-    if have_gps:
-        comment_parts.append(f"pos={lat:.6f},{lon:.6f}")
-    if alt_m is not None:
-        comment_parts.append(f"alt={alt_m:.2f}m")
-    if have_heading:
-        comment_parts.append(f"hdg={heading_deg:.1f}deg")
-    if roll_deg is not None:
-        comment_parts.append(f"roll={roll_deg:+.1f}deg")
-    if pitch_deg is not None:
-        comment_parts.append(f"pitch={pitch_deg:+.1f}deg")
-    if tilt_deg is not None:
-        comment_parts.append(f"tilt={tilt_deg:+.1f}deg")
-    if depth_m is not None:
-        comment_parts.append(f"depth={depth_m:.2f}m")
-    if temp_c is not None:
-        comment_parts.append(f"temp={temp_c:.1f}C")
-    comment_parts.append(f"utc={ts_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z")
-    comment = " ".join(comment_parts)
-    if comment:
-        comment_bytes = comment.encode('ascii', 'replace')
-        # EXIF UserComment needs an 8-byte character-code prefix.
-        exif_ifd[piexif.ExifIFD.UserComment] = b"ASCII\x00\x00\x00" + comment_bytes
-        image_ifd[piexif.ImageIFD.ImageDescription] = comment_bytes
-
-    try:
-        return piexif.dump({"0th": image_ifd, "Exif": exif_ifd, "GPS": gps_ifd})
-    except Exception:
-        logger.exception("EXIF dump failed")
-        return None
-
-
-def _build_camera_xmp(yaw_deg=None, pitch_deg=None, roll_deg=None):
-    """Build an XMP packet carrying camera orientation for photogrammetry.
-
-    Uses the Pix4D ``Camera`` namespace (``Camera:Yaw/Pitch/Roll``), which
-    is the de-facto standard read by Pix4D, Agisoft Metashape and
-    OpenDroneMap/WebODM. Values are the *camera* orientation in the earth
-    frame: yaw is the towfish true heading (0..360); for the fixed
-    straight-down camera the caller passes a nadir-based pitch (-90 deg
-    when level, offset by body pitch) and the towfish body roll. The raw
-    body pitch/roll are preserved separately in the CSV + UserComment.
-
-    Returns the XMP string, or ``None`` when no orientation is available.
-    """
-    tags = []
-    if yaw_deg is not None:
-        tags.append(f"    <Camera:Yaw>{yaw_deg:.2f}</Camera:Yaw>")
-    if pitch_deg is not None:
-        tags.append(f"    <Camera:Pitch>{pitch_deg:.2f}</Camera:Pitch>")
-    if roll_deg is not None:
-        tags.append(f"    <Camera:Roll>{roll_deg:.2f}</Camera:Roll>")
-    if not tags:
-        return None
-    body = "\n".join(tags)
-    return (
-        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
-        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
-        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
-        '<rdf:Description rdf:about="" '
-        'xmlns:Camera="http://pix4d.com/camera/1.0/">\n'
-        f'{body}\n'
-        '  </rdf:Description>'
-        '</rdf:RDF>'
-        '</x:xmpmeta>'
-        '<?xpacket end="w"?>'
-    )
-
-
-def _insert_xmp_app1(jpeg_bytes, xmp_packet):
-    """Splice an APP1 XMP segment in just after the JPEG SOI marker.
-
-    Raw byte insertion so the image is never re-encoded (no quality loss).
-    A second APP1 alongside piexif's Exif APP1 is valid -- readers key off
-    each segment's namespace header. Returns the input unchanged on any
-    structural surprise or if the packet won't fit a single APP1.
-    """
-    try:
-        if jpeg_bytes[0:2] != b"\xff\xd8":
-            return jpeg_bytes
-        payload = b"http://ns.adobe.com/xap/1.0/\x00" + xmp_packet.encode("utf-8")
-        seg_len = len(payload) + 2
-        if seg_len > 0xFFFF:
-            return jpeg_bytes
-        app1 = b"\xff\xe1" + seg_len.to_bytes(2, "big") + payload
-        return jpeg_bytes[:2] + app1 + jpeg_bytes[2:]
-    except Exception:
-        logger.exception("XMP insert failed")
-        return jpeg_bytes
-
+# ``towfish_altitude_m`` is appended at the end rather than slotted in
+# next to ``altitude_m`` so readers that index this CSV positionally keep
+# working against surveys recorded before it existed. It holds the
+# towfish AHRS2 altitude -- the value written to EXIF GPSAltitude --
+# whereas ``altitude_m`` is the tow vehicle's GPS altitude above MSL.
 _TIMELAPSE_CSV_HEADER = [
     'timestamp', 'seq', 'filename', 'source_tag', 'wp', 'frame', 'size_bytes',
     'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
     'towfish_roll_deg', 'towfish_pitch_deg',
     'depth_m', 'temperature_c', 'camera_tilt_deg',
-    'snap_ms', 'telem_ms', 'sync_skew_ms',
+    'snap_ms', 'telem_ms', 'sync_skew_ms', 'towfish_altitude_m',
 ]
 
 
@@ -2623,52 +2658,14 @@ class TimelapseSession:
     def _fetch_telemetry_block(self):
         """Read the full telemetry block in one shot.
 
-        Designed to be called from a worker thread that runs in parallel
-        with ``_fetch_jpeg`` so the GPS / heading / altitude samples
-        share the same wall-clock window as the camera shutter (the
-        snap CGI takes ~200 ms, each mavlink2rest GET ~10-300 ms; in
-        parallel they overlap).
-
-        Returns a dict (always populated, with None values where data
-        was unavailable) plus a ``fetch_ms`` field so the CSV can
-        record how stale the telemetry was relative to the snap.
+        Called from a worker thread that runs in parallel with
+        ``_fetch_jpeg`` so the GPS / heading / altitude samples share the
+        same wall-clock window as the camera shutter (the snap CGI takes
+        ~200 ms, each mavlink2rest GET ~10-300 ms; in parallel they
+        overlap). The sampling itself lives at module scope so the video
+        sidecar writer records an identical field set.
         """
-        t0 = time.monotonic()
-        try:
-            bb_lat, bb_lon, bb_alt = get_blueboat_gps_position()
-            # One ATTITUDE read gives heading (yaw), roll and pitch, so we
-            # geotag and record the full towfish orientation per frame
-            # without extra mavlink2rest round-trips.
-            att = get_towfish_attitude()
-            heading = att.get('yaw')
-            roll = att.get('roll')
-            pitch = att.get('pitch')
-            gps_lat, gps_lon = offset_towed_position(bb_lat, bb_lon, heading)
-            tow_alt = get_towfish_altitude()
-            depth = get_depth_data()
-            temp = get_baro_data()
-            # World-relative camera pitch: reuse the ATTITUDE pitch we
-            # already fetched this frame instead of a second round-trip.
-            tilt = get_towfish_camera_tilt(vehicle_pitch_deg=pitch)
-        except Exception:
-            logger.exception("TIMELAPSE telemetry fetch raised")
-            bb_lat = bb_lon = bb_alt = None
-            gps_lat = gps_lon = None
-            heading = None
-            roll = None
-            pitch = None
-            tow_alt = None
-            depth = None
-            temp = None
-            tilt = None
-        return {
-            'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
-            'gps_lat': gps_lat, 'gps_lon': gps_lon,
-            'heading': heading, 'roll': roll, 'pitch': pitch,
-            'tow_alt': tow_alt,
-            'depth': depth, 'temp': temp, 'tilt': tilt,
-            'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
-        }
+        return fetch_telemetry_block()
 
     def _loop(self):
         next_fire = time.monotonic()
@@ -2764,39 +2761,18 @@ class TimelapseSession:
                 temp = telemetry['temp']
                 tilt = telemetry['tilt']
 
-            # Embed GPS+heading+tilt+timestamp into EXIF before writing
-            # so the on-disk JPEG is self-describing (geotagged in any
-            # standard map / photo viewer). Failure here is non-fatal:
-            # the raw JPEG and CSV row still get written.
-            try:
-                exif_bytes = _build_gps_exif_bytes(
-                    gps_lat, gps_lon, tow_alt, heading, ts_local, ts_utc,
-                    tilt_deg=tilt, depth_m=depth, temp_c=temp,
-                    roll_deg=roll, pitch_deg=pitch,
-                )
-                if exif_bytes is not None:
-                    # piexif.insert with raw bytes requires either a
-                    # path or a BytesIO output buffer; using BytesIO
-                    # keeps the rewrite in memory so we still write
-                    # the file exactly once.
-                    out_buf = io.BytesIO()
-                    piexif.insert(exif_bytes, jpeg, out_buf)
-                    jpeg = out_buf.getvalue()
-                # XMP camera orientation (yaw/pitch/roll) for photogrammetry
-                # importers -- pitch/roll have no standard EXIF tags.
-                #
-                # The camera is fixed looking straight down, so the
-                # earth-frame camera pitch is nadir (-90 deg) when the
-                # towfish is level, offset by the body pitch. We therefore
-                # write the *camera* pitch here (not the raw body pitch);
-                # the raw body pitch/roll stay in the CSV + UserComment.
-                camera_pitch = -90.0 + (pitch if pitch is not None else 0.0)
-                xmp = _build_camera_xmp(yaw_deg=heading,
-                                        pitch_deg=camera_pitch, roll_deg=roll)
-                if xmp is not None:
-                    jpeg = _insert_xmp_app1(jpeg, xmp)
-            except Exception:
-                logger.exception("TIMELAPSE EXIF insert failed; saving raw JPEG")
+            # Embed GPS+heading+tilt+timestamp into EXIF and the camera
+            # orientation into Pix4D-namespace XMP before writing, so the
+            # on-disk JPEG is self-describing (geotagged in any standard
+            # map / photo viewer, and orientable by Metashape/Pix4D/WebODM).
+            # Shared with extract_geotagged_frames.py so video-derived
+            # frames carry an identical tag set. Failure is non-fatal:
+            # the raw JPEG and the CSV row still get written.
+            jpeg = photogrammetry_meta.embed_metadata(
+                jpeg, gps_lat, gps_lon, tow_alt, heading, ts_local, ts_utc,
+                tilt_deg=tilt, depth_m=depth, temp_c=temp,
+                roll_deg=roll, pitch_deg=pitch,
+            )
 
             # Claim the global day sequence + per-waypoint frame number
             # atomically so a concurrent set_leg() can't reuse a frame
@@ -2858,6 +2834,7 @@ class TimelapseSession:
                         f"{snap_ms:.1f}",
                         f"{telem_ms:.1f}" if telem_ms >= 0 else "",
                         f"{sync_skew_ms:.1f}" if sync_skew_ms >= 0 else "",
+                        f"{tow_alt:.2f}" if tow_alt is not None else "",
                     ])
             except Exception:
                 logger.exception("TIMELAPSE CSV write failed")
@@ -3054,14 +3031,15 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
     manual recording path.
 
     ``per_leg_sidecars`` (transect only): when True each leg .ts gets its
-    own matching .srt/.ass, rotated automatically when splitmuxsink opens
-    each new fragment.
+    own matching .srt/.ass/_telemetry.csv, rotated automatically when
+    splitmuxsink opens each new fragment.
 
     ``force_local`` is set by the failover path so a session that just
     lost the USB drive doesn't immediately re-pick it on restart.
     """
     global recording, start_time, sidecar_epoch
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp, srt_subtitle_counter
+    global current_video_csv_file, current_video_csv_wp
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     global current_events_file
     global ass_thread, stop_ass_thread, current_ass_file, ass_subtitle_counter
@@ -3089,6 +3067,7 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
 
     current_srt_file_rtsp = create_srt_file(anchor_path)
     srt_subtitle_counter = 0
+    current_video_csv_file, current_video_csv_wp = create_video_telemetry_csv(anchor_path)
     current_isp_log_file = create_isp_log_file(anchor_path)
     current_ass_file = create_ass_file(anchor_path)
     ass_subtitle_counter = 0
@@ -3124,6 +3103,8 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
         _session = None
         current_srt_file_rtsp = None
         current_video_file_rtsp = None
+        current_video_csv_file = None
+        current_video_csv_wp = None
         current_isp_log_file = None
         current_ass_file = None
         current_events_file = None
@@ -3139,7 +3120,7 @@ def _start_video_session(base_prefix, target_mode, initial_label=None,
     sidecar_epoch = start_time
 
     stop_srt_thread = False
-    srt_thread = threading.Thread(target=update_srt_file, daemon=True)
+    srt_thread = threading.Thread(target=update_geo_sidecars, daemon=True)
     srt_thread.start()
 
     stop_isp_log_thread = False
@@ -3170,6 +3151,7 @@ def _stop_video_session():
     """
     global recording, start_time
     global srt_thread, stop_srt_thread, current_srt_file_rtsp, current_video_file_rtsp
+    global current_video_csv_file, current_video_csv_wp
     global isp_log_thread, stop_isp_log_thread, current_isp_log_file
     global current_events_file
     global ass_thread, stop_ass_thread, current_ass_file
@@ -3180,6 +3162,7 @@ def _stop_video_session():
     video_anchor = current_video_file_rtsp
     srt_path = current_srt_file_rtsp
     ass_path = current_ass_file
+    telemetry_csv_path = current_video_csv_file
     isp_log_path = current_isp_log_file
     events_path = current_events_file
 
@@ -3210,6 +3193,8 @@ def _stop_video_session():
     start_time = None
     current_srt_file_rtsp = None
     current_video_file_rtsp = None
+    current_video_csv_file = None
+    current_video_csv_wp = None
     current_isp_log_file = None
     current_ass_file = None
     current_events_file = None
@@ -3219,6 +3204,8 @@ def _stop_video_session():
         logger.info("ISP log file saved: %s", isp_log_path)
     if ass_path and os.path.exists(ass_path):
         logger.info("ASS telemetry file saved: %s", ass_path)
+    if telemetry_csv_path and os.path.exists(telemetry_csv_path):
+        logger.info("Telemetry CSV saved: %s", telemetry_csv_path)
     if events_path and os.path.exists(events_path):
         logger.info("Events log saved: %s", events_path)
 
@@ -3227,10 +3214,10 @@ def _stop_video_session():
         # the *final* leg's sidecars remain, rescaled to that one leg's
         # encoded duration (NOT the session sum). Done in the background
         # so /transect/disable and the monitor's exit return promptly.
-        if (srt_path or ass_path) and last_leg_ts:
+        if (srt_path or ass_path or telemetry_csv_path) and last_leg_ts:
             threading.Thread(
                 target=_finalize_leg_sidecars,
-                args=(srt_path, ass_path, last_leg_ts),
+                args=(srt_path, ass_path, telemetry_csv_path, last_leg_ts),
                 name="leg-sidecar-finalise", daemon=True,
             ).start()
     elif video_anchor and srt_path and os.path.exists(srt_path):
@@ -3246,6 +3233,8 @@ def _stop_video_session():
             adjust_srt_timing(srt_path, video_duration)
             if ass_path and os.path.exists(ass_path):
                 adjust_ass_timing(ass_path, video_duration)
+            if telemetry_csv_path and os.path.exists(telemetry_csv_path):
+                adjust_video_csv_timing(telemetry_csv_path, video_duration)
         else:
             logger.warning(
                 "Could not determine session video duration, "

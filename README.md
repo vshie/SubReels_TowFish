@@ -71,9 +71,13 @@ scope, tow speed and depth. Planned work:
   and rolls a new file or image folder at every `MISSION_CURRENT.seq` change,
   keeping the RTSP pipeline alive across leg boundaries.
 - **Geotagged stills** — 2 Hz JPEGs with GPS position, altitude and full towfish
-  attitude written into EXIF/XMP, plus a `telemetry.csv` sidecar per session.
-- **Telemetry subtitles** — SRT and ASS sidecars burned from live depth,
-  heading, altitude and camera tilt.
+  attitude written into EXIF plus Pix4D-namespace XMP (`Camera:Yaw/Pitch/Roll`,
+  read by Agisoft Metashape, Pix4D and WebODM), and a `telemetry.csv` sidecar
+  per session.
+- **Telemetry sidecars for video** — every recording gets a `*_telemetry.csv`
+  at 5 Hz carrying the same fields as the stills path, so frames extracted
+  later with `extract_geotagged_frames.py` come out with identical metadata.
+  SRT and ASS subtitle sidecars are written alongside it for players.
 - **USB storage with failover** — records to an attached USB drive when one is
   usable and falls back to the local SD mid-session if the drive disappears.
 - **Cockpit MFD widget** — a compact black/green panel for field use with
