@@ -281,8 +281,9 @@ PARAM_SPECS = [
         "decimals": 3,
         "min": 0.0,
         "max": 12.0,
-        "desc": "Roll angle P gain. Zero leaves roll passive so the tow "
-                "cable, not the autopilot, sets the fish attitude.",
+        "desc": "Roll axis angle controller P gain. Converts the error "
+                "between the desired roll angle and actual angle to a "
+                "desired roll rate.",
     },
     {
         "name": "ATC_RAT_RLL_D",
@@ -292,8 +293,8 @@ PARAM_SPECS = [
         "decimals": 4,
         "min": 0.0,
         "max": 0.5,
-        "desc": "Roll rate D gain -- damps the roll oscillation the tow "
-                "cable induces.",
+        "desc": "Roll axis rate controller D gain. Compensates for "
+                "short-term change in desired roll rate vs actual roll rate.",
     },
     {
         "name": "ATC_RAT_RLL_FLTE",
@@ -303,7 +304,7 @@ PARAM_SPECS = [
         "decimals": 2,
         "min": 0.0,
         "max": 100.0,
-        "desc": "Roll rate error filter cutoff.",
+        "desc": "Roll axis rate controller error frequency in Hz.",
     },
     {
         "name": "ATC_RAT_RLL_FLTD",
@@ -313,7 +314,7 @@ PARAM_SPECS = [
         "decimals": 2,
         "min": 0.0,
         "max": 100.0,
-        "desc": "Roll rate derivative filter cutoff.",
+        "desc": "Roll axis rate controller derivative frequency in Hz.",
     },
 ]
 
