@@ -106,7 +106,7 @@ selection, arm/disarm, flight mode, depth jog, camera tilt, zoom, focus and
 white balance. Add it to Cockpit as a custom widget pointing at
 `http://<vehicle>/"port number from Available Services for the extension"/widget`.
 
-## Survey parameters
+## ArduRover & ArduSub configuration
 
 The setup console can check and correct the parameters a tow survey depends on.
 Each target is editable and persisted, so the values below are a starting point

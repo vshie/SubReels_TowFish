@@ -6,9 +6,16 @@
     <title>Towfish Setup</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
+    <!-- JetBrains Mono replaces Share Tech Mono for body text: the latter
+         ships weight 400 only, so every bold rule was being faux-bolded by
+         the browser, which is what made the console look thin. The system
+         fallback stack below also has real weights, so the console stays
+         legible on a boat with no internet to fetch webfonts. -->
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
     <style>
         :root {
+            --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular,
+                    Menlo, Consolas, 'DejaVu Sans Mono', monospace;
             --panel: #0d1310;
             --panel-edge: #1f2a25;
             --panel-inset: #060a08;
@@ -23,22 +30,30 @@
             --red-glow: rgba(239, 83, 80, 0.45);
             --sky: #6ec6ff;
             --sky-glow: rgba(110, 198, 255, 0.35);
-            --off: #4a5852;
-            --ink: #d7e5df;
-            --ink-dim: #8fa89d;
+            --off: #6b7d76;
+            --ink: #e6f2ec;
+            /* Secondary text was #8fa89d, dim enough that hints and labels
+               read as noise against the dark panels. Lifted for contrast. */
+            --ink-dim: #a9c2b6;
+            /* Section headings get their own hue so structure is visible at a
+               glance. Deliberately not phosphor/amber/red, which all carry
+               status meaning elsewhere in this console. */
+            --title: #7fe9ff;
+            --title-glow: rgba(127, 233, 255, 0.45);
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { min-height: 100%; }
         body {
-            font-family: 'Share Tech Mono', ui-monospace, Menlo, Consolas, monospace;
+            font-family: var(--mono);
+            font-size: 14px;
             color: var(--ink);
             background:
                 radial-gradient(1400px 900px at 25% -10%, #0a1a15 0%, #050807 60%, #030503 100%);
             background-attachment: fixed;
             min-height: 100vh;
             padding: 14px;
-            letter-spacing: 0.02em;
+            letter-spacing: 0.01em;
         }
 
         /* --- Console shell (same bezel + CRT screen as the MFD widget) --- */
@@ -66,23 +81,24 @@
             padding: 2px 4px 8px 4px;
         }
         .brand .name {
-            font-family: 'Orbitron', 'Share Tech Mono', monospace;
+            font-family: 'Orbitron', var(--mono);
             font-weight: 800;
-            font-size: 14px;
-            letter-spacing: 0.34em;
+            font-size: 19px;
+            letter-spacing: 0.28em;
             color: var(--ink);
             text-shadow: 0 0 6px rgba(215,229,223,0.15);
         }
         .brand .sub {
-            font-size: 10px;
-            letter-spacing: 0.3em;
+            font-size: 12px;
+            letter-spacing: 0.2em;
             color: var(--ink-dim);
         }
         .brand a {
-            color: var(--phosphor-dim);
+            color: var(--phosphor);
             text-decoration: none;
-            font-size: 10px;
-            letter-spacing: 0.24em;
+            font-size: 12.5px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
         }
         .brand a:hover { color: var(--phosphor); text-shadow: 0 0 6px var(--phosphor-glow); }
         .brand .spacer { flex: 1; }
@@ -100,7 +116,7 @@
             overflow: hidden;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 14px;
         }
         .screen::before {
             content: '';
@@ -149,8 +165,8 @@
             align-items: center;
             gap: 6px;
             color: var(--off);
-            font-size: 10px;
-            letter-spacing: 0.3em;
+            font-size: 12px;
+            letter-spacing: 0.2em;
             text-align: center;
         }
         .logo-slot .placeholder .frame {
@@ -179,18 +195,18 @@
             background: var(--panel-inset);
             border: 1px solid #0a120e;
             border-radius: 6px;
-            font-size: 11px;
+            font-size: 13px;
         }
         .lamp {
             display: inline-flex;
             align-items: center;
-            gap: 6px;
-            padding: 3px 8px;
+            gap: 7px;
+            padding: 4px 9px;
             border-radius: 3px;
             background: #050807;
             border: 1px solid #0d1310;
             font-weight: 700;
-            letter-spacing: 0.18em;
+            letter-spacing: 0.08em;
             color: var(--off);
             white-space: nowrap;
         }
@@ -212,8 +228,10 @@
         .strip .spacer { flex: 1; }
         .strip .clock {
             color: var(--phosphor);
+            font-weight: 700;
+            font-size: 15px;
             text-shadow: 0 0 4px var(--phosphor-glow);
-            letter-spacing: 0.18em;
+            letter-spacing: 0.08em;
         }
 
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -223,30 +241,55 @@
             background: linear-gradient(180deg, #0a1611 0%, #06100c 100%);
             border: 1px solid #16221c;
             border-radius: 6px;
-            padding: 10px;
+            padding: 13px;
         }
         .section-title {
-            font-size: 10px;
-            letter-spacing: 0.28em;
-            color: var(--ink-dim);
-            margin-bottom: 8px;
+            font-size: 15px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            color: var(--title);
+            text-shadow: 0 0 8px var(--title-glow);
+            margin-bottom: 10px;
+            padding-bottom: 7px;
+            border-bottom: 1px solid #1b2f33;
             display: flex;
             justify-content: space-between;
             align-items: baseline;
             gap: 10px;
             flex-wrap: wrap;
         }
+        /* Accent bar so each panel's heading is findable when scanning a long
+           page, not just a differently-coloured line of text. */
+        .section-title > span:first-child {
+            position: relative;
+            padding-left: 11px;
+        }
+        .section-title > span:first-child::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0.12em;
+            bottom: 0.12em;
+            width: 3px;
+            border-radius: 2px;
+            background: var(--title);
+            box-shadow: 0 0 6px var(--title-glow);
+        }
         .section-title .aux {
-            color: var(--phosphor-dim);
-            letter-spacing: 0.14em;
-            font-size: 10px;
+            color: var(--ink-dim);
+            letter-spacing: 0.06em;
+            font-size: 11.5px;
+            font-weight: 400;
+            text-shadow: none;
         }
         .head-right .section { flex: 1; }
 
         /* Telemetry + storage readout cells */
         .cells {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+            /* Wide enough that the longest readout ("0.00 m/s") fits at the
+               value font size instead of being ellipsised. */
+            grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
             gap: 6px;
         }
         .cell {
@@ -258,17 +301,18 @@
             min-width: 0;
         }
         .cell .label {
-            font-size: 9px;
-            letter-spacing: 0.26em;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 0.12em;
             color: var(--ink-dim);
-            margin-bottom: 4px;
+            margin-bottom: 5px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
         .cell .value {
-            font: 700 16px 'Share Tech Mono', monospace;
-            letter-spacing: 0.08em;
+            font: 700 19px var(--mono);
+            letter-spacing: 0.01em;
             color: var(--phosphor);
             text-shadow: 0 0 6px var(--phosphor-glow);
             white-space: nowrap;
@@ -278,7 +322,7 @@
         .cell .value.dim { color: var(--ink-dim); text-shadow: none; }
         /* A lat/lon pair needs more room than a single scalar readout. */
         .cell.wide { grid-column: span 2; }
-        .cell.wide .value { font-size: 13px; }
+        .cell.wide .value { font-size: 17px; }
         .cell .value.sky { color: var(--sky); text-shadow: 0 0 6px var(--sky-glow); }
         .cell .value.amber { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
 
@@ -287,21 +331,23 @@
             align-items: baseline;
             gap: 10px;
             flex-wrap: wrap;
-            font-size: 11px;
+            font-size: 14px;
         }
         .storage-line .primary {
             color: var(--phosphor);
+            font-weight: 700;
+            font-size: 15px;
             text-shadow: 0 0 4px var(--phosphor-glow);
-            letter-spacing: 0.12em;
+            letter-spacing: 0.04em;
         }
         .storage-line .primary.warn { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
-        .storage-line .aux { color: var(--ink-dim); font-size: 10px; letter-spacing: 0.1em; }
+        .storage-line .aux { color: var(--ink-dim); font-size: 12.5px; letter-spacing: 0.02em; }
         .hint {
             color: var(--ink-dim);
-            font-size: 10px;
-            line-height: 1.6;
-            letter-spacing: 0.06em;
-            margin-top: 6px;
+            font-size: 12.5px;
+            line-height: 1.65;
+            letter-spacing: 0.01em;
+            margin-top: 7px;
         }
         .hint code {
             color: var(--phosphor-dim);
@@ -317,10 +363,11 @@
         .field { min-width: 0; }
         .field > label {
             display: block;
-            font-size: 9px;
-            letter-spacing: 0.26em;
+            font-size: 11.5px;
+            font-weight: 500;
+            letter-spacing: 0.12em;
             color: var(--ink-dim);
-            margin-bottom: 5px;
+            margin-bottom: 6px;
         }
         .field-row {
             display: flex;
@@ -334,9 +381,9 @@
             color: var(--phosphor);
             border: 1px solid #0d1310;
             border-radius: 4px;
-            padding: 7px 8px;
-            font: 700 12px 'Share Tech Mono', monospace;
-            letter-spacing: 0.1em;
+            padding: 8px 9px;
+            font: 700 14px var(--mono);
+            letter-spacing: 0.03em;
         }
         input[type="text"]:focus, input[type="number"]:focus, select:focus {
             outline: none;
@@ -353,9 +400,9 @@
             border: 1px solid #1a2621;
             background: linear-gradient(180deg, #10201a 0%, #081611 100%);
             color: var(--phosphor);
-            font: 700 11px 'Share Tech Mono', monospace;
-            letter-spacing: 0.2em;
-            padding: 7px 12px;
+            font: 700 12.5px var(--mono);
+            letter-spacing: 0.1em;
+            padding: 8px 13px;
             border-radius: 4px;
             cursor: pointer;
             text-shadow: 0 0 4px var(--phosphor-glow);
@@ -378,12 +425,13 @@
         .btn:disabled { opacity: 0.35; cursor: not-allowed; text-shadow: none; }
         .btn.amber { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); border-color: #3a2d12; }
         .btn.amber:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--amber-glow); }
-        .btn.tiny { font-size: 10px; padding: 5px 8px; letter-spacing: 0.12em; }
+        .btn.tiny { font-size: 11.5px; padding: 6px 9px; letter-spacing: 0.06em; }
 
         .saved {
             align-self: center;
-            font-size: 10px;
-            letter-spacing: 0.2em;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
             color: var(--phosphor);
             text-shadow: 0 0 6px var(--phosphor-glow);
             opacity: 0;
@@ -394,9 +442,9 @@
 
         .field-row .unit {
             align-self: center;
-            font-size: 10px;
+            font-size: 12.5px;
             color: var(--ink-dim);
-            letter-spacing: 0.1em;
+            letter-spacing: 0.02em;
             white-space: nowrap;
         }
         .seg { display: flex; gap: 4px; flex-wrap: wrap; }
@@ -410,10 +458,11 @@
             padding: 10px;
         }
         .calc-title {
-            font-size: 9px;
-            letter-spacing: 0.26em;
-            color: var(--ink-dim);
-            margin-bottom: 8px;
+            font-size: 12.5px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            color: var(--ink);
+            margin-bottom: 9px;
         }
         .calc-row {
             display: grid;
@@ -424,15 +473,15 @@
         .calc-result {
             flex: 1;
             min-width: 0;
-            font: 700 16px 'Share Tech Mono', monospace;
-            letter-spacing: 0.08em;
+            font: 700 21px var(--mono);
+            letter-spacing: 0.02em;
             color: var(--phosphor);
             text-shadow: 0 0 6px var(--phosphor-glow);
             padding: 5px 0;
             border-bottom: 1px solid #0d1310;
         }
-        .calc-result.dim { color: var(--ink-dim); text-shadow: none; font-size: 12px; }
-        .calc-result.error { color: var(--amber); text-shadow: none; font-size: 11px; }
+        .calc-result.dim { color: var(--ink-dim); text-shadow: none; font-size: 15px; }
+        .calc-result.error { color: var(--amber); text-shadow: none; font-size: 13px; }
 
         /* --- Parameter checker ------------------------------------------- */
         .param-toolbar {
@@ -449,26 +498,33 @@
         .param-toolbar .job {
             flex: 1;
             min-width: 160px;
-            font-size: 10px;
-            letter-spacing: 0.14em;
+            font-size: 12.5px;
+            letter-spacing: 0.02em;
             color: var(--ink-dim);
         }
         .param-toolbar .job.busy { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
 
-        .vehicle-group + .vehicle-group { margin-top: 12px; }
+        .vehicle-group + .vehicle-group { margin-top: 18px; }
         .vehicle-head {
             display: flex;
-            align-items: center;
+            align-items: baseline;
             gap: 10px;
             flex-wrap: wrap;
-            font-size: 10px;
-            letter-spacing: 0.26em;
+            font-size: 12.5px;
+            letter-spacing: 0.04em;
             color: var(--ink-dim);
-            padding-bottom: 6px;
-            margin-bottom: 8px;
-            border-bottom: 1px dashed #16221c;
+            padding-bottom: 7px;
+            margin-bottom: 10px;
+            border-bottom: 1px dashed #1b2f33;
         }
-        .vehicle-head .title { color: var(--ink); letter-spacing: 0.3em; }
+        /* One step below .section-title in the hierarchy: same hue so it reads
+           as a heading, smaller and unglowed so it doesn't compete. */
+        .vehicle-head .title {
+            color: var(--title);
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+        }
 
         .param-grid {
             display: grid;
@@ -495,17 +551,18 @@
         }
         .pcard-name {
             font-weight: 700;
-            font-size: 12px;
-            letter-spacing: 0.14em;
+            font-size: 14.5px;
+            letter-spacing: 0.05em;
             color: var(--ink);
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
         .badge {
-            font-size: 9px;
-            letter-spacing: 0.2em;
-            padding: 2px 7px;
+            font-size: 10.5px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            padding: 3px 8px;
             border-radius: 3px;
             border: 1px solid #16221c;
             color: var(--off);
@@ -517,10 +574,10 @@
         .badge.error { color: var(--red); border-color: #501313; }
         .badge.busy { color: var(--sky); border-color: #143047; animation: pulse 1.2s infinite; }
         .pcard-desc {
-            font-size: 10px;
-            line-height: 1.55;
+            font-size: 12.5px;
+            line-height: 1.6;
             color: var(--ink-dim);
-            letter-spacing: 0.04em;
+            letter-spacing: 0.01em;
         }
         .pcard-values {
             display: grid;
@@ -529,27 +586,28 @@
             align-items: end;
         }
         .pcard-values .label {
-            font-size: 9px;
-            letter-spacing: 0.24em;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 0.12em;
             color: var(--ink-dim);
-            margin-bottom: 4px;
+            margin-bottom: 5px;
         }
         .pcard-current {
-            font: 700 16px 'Share Tech Mono', monospace;
-            letter-spacing: 0.08em;
+            font: 700 21px var(--mono);
+            letter-spacing: 0.02em;
             color: var(--phosphor);
             text-shadow: 0 0 6px var(--phosphor-glow);
             padding-bottom: 2px;
         }
         .pcard-current.dim { color: var(--ink-dim); text-shadow: none; }
         .pcard-current.mismatch { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
-        .pcard-current.error { color: var(--red); text-shadow: none; font-size: 11px; }
-        .pcard-current .unit { font-size: 10px; color: var(--ink-dim); text-shadow: none; margin-left: 3px; }
+        .pcard-current.error { color: var(--red); text-shadow: none; font-size: 13px; }
+        .pcard-current .unit { font-size: 12.5px; color: var(--ink-dim); text-shadow: none; margin-left: 4px; }
         .pcard-target { display: flex; gap: 5px; align-items: center; }
         .pcard-target .unit {
-            font-size: 10px;
+            font-size: 12.5px;
             color: var(--ink-dim);
-            letter-spacing: 0.1em;
+            letter-spacing: 0.02em;
             white-space: nowrap;
         }
         .pcard-actions {
@@ -561,9 +619,9 @@
         .pcard-actions .presets { display: flex; gap: 4px; flex-wrap: wrap; }
         .pcard-actions .spacer { flex: 1; }
         .btn.preset {
-            font-size: 10px;
-            padding: 4px 7px;
-            letter-spacing: 0.06em;
+            font-size: 11.5px;
+            padding: 5px 8px;
+            letter-spacing: 0.02em;
             color: var(--phosphor-dim);
             text-shadow: none;
         }
@@ -590,9 +648,10 @@
             border: 1px solid #501313;
             color: #ffb4b4;
             border-radius: 5px;
-            padding: 8px 10px;
-            font-size: 11px;
-            letter-spacing: 0.08em;
+            padding: 10px 12px;
+            font-size: 13px;
+            font-weight: 500;
+            letter-spacing: 0.02em;
         }
         .error-box.visible { display: block; }
 
@@ -744,7 +803,7 @@
         <div class="section">
             <div class="section-title">
                 <span>TOW GEOMETRY</span>
-                <span class="aux">LAYBACK APPLIED TO EVERY RECORDED POSITION</span>
+                <span class="aux">Layback applied to every recorded position</span>
             </div>
             <div class="field-grid">
                 <div class="field">
@@ -816,8 +875,8 @@
         <!-- Parameter checker -->
         <div class="section">
             <div class="section-title">
-                <span>SURVEY PARAMETERS</span>
-                <span class="aux">EDIT A TARGET, THEN APPLY TO WRITE IT TO THE AUTOPILOT</span>
+                <span>ARDUROVER &amp; ARDUSUB CONFIGURATION</span>
+                <span class="aux">Edit a target, then Apply to write it to the autopilot</span>
             </div>
 
             <div class="param-toolbar">
