@@ -25,6 +25,17 @@ USB_MIN_FREE_GB = 20
 TOWFISH_DIR = "Towfish"
 PROBE_INTERVAL_S = 30
 
+#: Free space below which an *already running* recording must move off the
+#: drive. Deliberately far smaller than the ``USB_MIN_FREE_GB`` gate used to
+#: pick a drive at session start: that one is a "is this stick worth starting
+#: a survey on" question, this one is "how much runway do we need to land the
+#: current session cleanly". The reserve has to cover the health-watcher poll
+#: interval, whatever the encoder still has buffered, and -- the expensive
+#: part -- mp4 finalisation, since a moov atom that cannot be written leaves
+#: an unplayable file. 1 GiB is a few minutes of 4K H.264 and under 5% of the
+#: smallest stick that can pass the start gate, so it is cheap insurance.
+USB_MIN_FREE_MB_RECORDING = 1024
+
 _lock = threading.Lock()
 _mounted = False
 _device = None          # e.g. "/dev/sda1"
@@ -242,6 +253,22 @@ def is_usable():
     return free >= USB_MIN_FREE_GB * 1024
 
 
+def has_recording_headroom():
+    """Is there still room to keep an in-flight recording on this drive?
+
+    Separate from :func:`is_healthy`, which only answers "does the mount
+    still respond" -- a filesystem that is 100% full stats perfectly well,
+    so health alone never notices a drive filling up mid-mission. Returns
+    False once free space drops under ``USB_MIN_FREE_MB_RECORDING``, which
+    is the signal to move the session to local storage while there is still
+    room to finalise the current file.
+    """
+    free = get_free_mb()
+    if free is None:
+        return False
+    return free >= USB_MIN_FREE_MB_RECORDING
+
+
 def get_fstype():
     """Return the filesystem type of the active USB mount, or '' if unknown."""
     return (_fstype or "").lower()
@@ -276,8 +303,10 @@ def get_status():
         "fstype": _fstype if mounted else None,
         "free_mb": free,
         "usable": is_usable() if mounted else False,
+        "has_recording_headroom": has_recording_headroom() if mounted else False,
         "mount_point": USB_MOUNT_POINT,
         "min_free_gb": USB_MIN_FREE_GB,
+        "min_free_mb_recording": USB_MIN_FREE_MB_RECORDING,
     }
 
 

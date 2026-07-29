@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from flask import Flask, jsonify, request, send_file
 import asyncio
+import errno
 import json
 import os
 import glob
@@ -614,19 +615,28 @@ def _persist_config():
 # Recording-storage state
 #
 # ``usb_recording`` is True when the *currently active* video or
-# timelapse session is writing to the USB mount. The video watchdog
-# and timelapse loop watch ``usb_storage.is_healthy()`` and trigger
-# a one-shot failover to local storage if the drive disappears
-# mid-recording. ``usb_failover_count`` is reset only at startup;
+# timelapse session is writing to the USB mount. A background watcher
+# triggers a one-shot failover to local storage if the drive either
+# disappears or fills up mid-recording. ``usb_failover_count`` is reset
+# only at startup;
 # it surfaces in /status so the UI can warn the operator that a
 # session was forced onto the SD card.
 usb_recording = False
 usb_failover_count = 0
+#: Why the last failover fired -- "lost" (drive gone) or "full" (out of
+#: space). Distinct causes with the same symptom, and the operator's fix
+#: differs, so /status reports which one it was.
+usb_failover_reason = None
 
 # Local fallback root for recordings that don't (or no longer) live
 # on USB. Using a named constant lets every capture path call the
 # same resolver instead of hardcoding "/app/videorecordings".
 LOCAL_RECORDING_DIR = "/app/videorecordings"
+
+#: Free space on the local fallback below which we warn loudly. Failing
+#: over onto an SD card that is itself nearly full only buys a few minutes,
+#: and that is worth saying out loud rather than discovering in the logs.
+_LOCAL_LOW_FREE_MB = 2048
 
 # Towfish (ArduSub) telemetry is read through the local BlueOS host the
 # extension runs on (host.docker.internal), same as depth/altitude/temp,
@@ -1793,33 +1803,79 @@ def _resolve_recording_dir(subfolder=None, force_local=False):
 
 
 # ── Mid-recording USB failover ───────────────────────────────────────────
-# A background daemon polls usb_storage.is_healthy() while a session is
-# writing to USB.  On failure (drive yanked, FS error, etc.) we kill the
-# current session and immediately restart on local storage with
-# force_local=True so we don't bounce straight back to the broken USB.
+# A background daemon watches the USB drive while a session is writing to
+# it and moves the session to local storage on either failure mode:
+#
+#   "lost"  -- drive yanked, FS error: usb_storage.is_healthy() goes False.
+#   "full"  -- drive ran out of room mid-mission. A full filesystem still
+#              stats fine, so health never catches this; we watch free
+#              space against usb_storage.USB_MIN_FREE_MB_RECORDING instead
+#              and move while there is still room to finalise the file.
+#
+# Either way we kill the current session and immediately restart on local
+# storage with force_local=True so we don't bounce straight back.
 
 _USB_HEALTH_INTERVAL_S = 5.0
 _usb_health_thread = None
 _usb_health_stop = threading.Event()
 
+#: Set by a capture path that has actually hit ENOSPC, so the watcher can
+#: fail over on the next tick instead of waiting for free space to cross the
+#: low-water mark. Belt-and-braces for a drive that fills faster than the
+#: poll interval, or one whose free-space reporting we can't trust.
+_usb_space_alarm = threading.Event()
 
-def _handle_usb_failover():
+
+def _raise_usb_space_alarm(where):
+    """Flag that a write hit ENOSPC on the USB drive.
+
+    Called from capture threads, which must not run the failover
+    themselves: it stops and restarts the very session they belong to,
+    so doing it inline would have a thread join itself. Handing the work
+    to the watcher keeps all session teardown on one thread.
+    """
+    if not usb_recording:
+        return
+    if not _usb_space_alarm.is_set():
+        logger.error("USB write hit ENOSPC in %s; requesting failover", where)
+    _usb_space_alarm.set()
+
+
+def _handle_usb_failover(reason="lost"):
     """Stop the active USB-backed session and restart it on local storage.
 
     Runs from the USB health watcher thread; takes ``_mode_lock`` so it
     can never race the Flask /start, /stop, /timelapse routes or the
     TransectMonitor's own start/stop calls.
+
+    ``reason`` is ``"lost"`` (drive gone) or ``"full"`` (out of space), and
+    is surfaced on /status so the operator can tell a yanked stick from one
+    that simply filled up.
     """
-    global usb_recording, usb_failover_count
+    global usb_recording, usb_failover_count, usb_failover_reason
     with _mode_lock:
         if not usb_recording:
             return
         active_mode = mode
-        logger.warning("USB failover: storage lost mid-recording (mode=%s)",
-                       active_mode)
+        detail = ("ran out of space" if reason == "full" else "was lost")
+        logger.warning("USB failover: storage %s mid-recording "
+                       "(mode=%s, free_mb=%s)",
+                       detail, active_mode, usb_storage.get_free_mb())
         log_event("usb_failover",
-                  f"USB storage lost during recording (mode={active_mode})")
+                  f"USB storage {detail} during recording "
+                  f"(mode={active_mode}, reason={reason})")
         usb_failover_count += 1
+        usb_failover_reason = reason
+
+        # Moving to a local disk that is itself nearly full just relocates
+        # the problem, and the operator can only act on it if we say so.
+        local_free = _read_disk_free_mb(LOCAL_RECORDING_DIR)
+        if local_free is not None and local_free < _LOCAL_LOW_FREE_MB:
+            logger.error("USB failover: local storage is also low "
+                         "(%.0f MB free at %s) -- recording may stop shortly",
+                         local_free, LOCAL_RECORDING_DIR)
+            log_event("local_storage_low",
+                      f"{local_free:.0f} MB free at {LOCAL_RECORDING_DIR}")
 
         try:
             if active_mode == MODE_VIDEO:
@@ -1852,33 +1908,41 @@ def _handle_usb_failover():
                 _timelapse = new_session
                 _set_mode(MODE_TIMELAPSE)
             elif active_mode == MODE_TRANSECT:
-                # Transect mode is owned by the TransectMonitor. We can't
-                # cleanly mid-mission swap a USB-backed session for a
-                # local one without confusing the monitor's state machine,
-                # so the safe path is to disable the monitor: it tears
-                # down the in-flight capture, surfaces a clear status,
-                # and lets the operator re-enable transect after the USB
-                # issue is resolved (the next /transect/enable will see
-                # is_usable()==False and start on local storage).
+                # Transect is the mode an actual survey runs in, so tearing
+                # it down on a storage problem means abandoning the mission
+                # the boat is still flying. Ask the monitor to swap the
+                # in-flight capture onto local storage and stay in
+                # "recording" instead; it re-opens the session at the
+                # current waypoint so the leg continues.
+                swapped = False
                 if _transect_monitor is not None:
                     try:
-                        _transect_monitor.disable()
+                        swapped = _transect_monitor.swap_to_local_storage()
                     except Exception:
-                        logger.exception("transect monitor disable failed")
-                # Belt-and-suspenders: if disable() didn't fully tear
-                # down (e.g. it raised), make sure no stale session
-                # keeps writing to the dead USB.
-                if _session is not None:
-                    try:
-                        _stop_video_session()
-                    except Exception:
-                        logger.exception("post-disable video stop failed")
-                if _timelapse is not None:
-                    try:
-                        _stop_transect_timelapse()
-                    except Exception:
-                        logger.exception("post-disable timelapse stop failed")
-                _set_mode(MODE_IDLE)
+                        logger.exception("transect storage swap failed")
+                if not swapped:
+                    # Swap failed, so fall back to the old behaviour: stop
+                    # everything rather than let a session keep writing at
+                    # a drive that is gone or full. The operator can
+                    # re-enable, which will start on local storage.
+                    logger.warning(
+                        "transect storage swap unavailable; disabling monitor")
+                    if _transect_monitor is not None:
+                        try:
+                            _transect_monitor.disable()
+                        except Exception:
+                            logger.exception("transect monitor disable failed")
+                    if _session is not None:
+                        try:
+                            _stop_video_session()
+                        except Exception:
+                            logger.exception("post-disable video stop failed")
+                    if _timelapse is not None:
+                        try:
+                            _stop_transect_timelapse()
+                        except Exception:
+                            logger.exception("post-disable timelapse stop failed")
+                    _set_mode(MODE_IDLE)
             else:
                 logger.warning("USB failover: unexpected mode=%s, no-op",
                                active_mode)
@@ -1902,12 +1966,38 @@ def _handle_usb_failover():
                   f"resumed mode={mode} on local storage")
 
 
+def _gst_error_is_no_space(err):
+    """Is this GStreamer GError a "disk is full" from a sink?
+
+    Prefer the typed domain/code so we aren't matching on message text,
+    which is translated; fall back to a substring only if the typed check
+    isn't available on this GStreamer build.
+    """
+    try:
+        if err.matches(Gst.ResourceError.quark(), Gst.ResourceError.NO_SPACE_LEFT):
+            return True
+    except Exception:
+        pass
+    return "no space left" in (getattr(err, "message", "") or "").lower()
+
+
 def _usb_health_loop():
-    """Background loop that triggers failover on USB loss during recording."""
+    """Trigger failover when the USB drive is lost or fills up mid-recording."""
     while not _usb_health_stop.is_set():
         try:
-            if usb_recording and not usb_storage.is_healthy():
-                _handle_usb_failover()
+            if usb_recording:
+                reason = None
+                if not usb_storage.is_healthy():
+                    reason = "lost"
+                elif _usb_space_alarm.is_set():
+                    reason = "full"
+                elif not usb_storage.has_recording_headroom():
+                    reason = "full"
+                if reason is not None:
+                    _handle_usb_failover(reason)
+                    # Clear only after the swap, so a capture thread that
+                    # trips ENOSPC again on the new target can re-arm it.
+                    _usb_space_alarm.clear()
         except Exception:
             logger.exception("USB health watcher raised")
         _usb_health_stop.wait(_USB_HEALTH_INTERVAL_S)
@@ -2376,6 +2466,12 @@ class RecordingSession:
                                        self._current_part, err.message, dbg)
                         log_event("gst_error", f"{err.message} | {dbg}")
                         exit_reason = f"error:{err.message}"
+                        # A full disk otherwise looks like any other sink
+                        # error, and the watchdog would rebuild the pipeline
+                        # against the same full drive forever. Flag it so the
+                        # health watcher moves us to local storage instead.
+                        if _gst_error_is_no_space(err):
+                            _raise_usb_space_alarm("gstreamer sink")
                         break
                     if msg.type == Gst.MessageType.EOS:
                         logger.info("gst[part=%d] unexpected EOS", self._current_part)
@@ -2639,6 +2735,11 @@ class TimelapseSession:
         self.last_snap_size_bytes = 0
         self.last_snap_path = None
         self.last_snap_at = None
+        # Overwritten by whoever resolved the recording directory. Defaulted
+        # here so the capture loop can always test it: it is read on the
+        # ENOSPC path, which is exactly when we can least afford an
+        # AttributeError from a caller that forgot to set it.
+        self.on_usb = False
         # Wall-clock gap (ms) between the most recent snap finishing
         # and its parallel telemetry fetch finishing. Surfaces the
         # tightness of snap/GPS sync on /status so a field operator
@@ -2860,6 +2961,23 @@ class TimelapseSession:
             try:
                 with open(path, 'wb') as f:
                     f.write(jpeg)
+            except OSError as e:
+                # A frame that ran out of room part-way through leaves a
+                # truncated JPEG behind. Drop it rather than leave a corrupt
+                # image in the survey folder for the photogrammetry run to
+                # trip over; the CSV row is skipped below with it.
+                if e.errno == errno.ENOSPC:
+                    logger.error("TIMELAPSE out of space writing %s", path)
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    if self.on_usb:
+                        _raise_usb_space_alarm("timelapse frame")
+                else:
+                    logger.exception("TIMELAPSE write failed: %s", path)
+                self.miss_count += 1
+                continue
             except Exception:
                 logger.exception("TIMELAPSE write failed: %s", path)
                 self.miss_count += 1
@@ -3504,6 +3622,71 @@ class TransectMonitor:
         self._mission_complete_latch = False
 
     # -- lifecycle ----------------------------------------------------
+    def swap_to_local_storage(self):
+        """Move the in-flight capture to local storage, staying in "recording".
+
+        Called by the USB failover path (which already holds ``_mode_lock``)
+        when the drive is lost or fills up mid-survey. The boat is still
+        flying the mission, so the useful response is to reopen the capture
+        on the SD card at the current waypoint rather than abandon the leg:
+        the recording is interrupted for as long as the restart takes and
+        picks up under a new file, but the survey keeps going and the
+        manifest follows it.
+
+        Returns True when the capture is running again on local storage.
+        A False return means the caller should tear the monitor down.
+        """
+        if self.state != "recording":
+            return False
+        capture = self._capture_type
+        seq = self.current_seq if self.current_seq is not None else 0
+        wp_label = f"wp{int(seq):02d}"
+
+        try:
+            if capture == "timelapse":
+                _stop_transect_timelapse()
+            else:
+                _stop_video_session()
+        except Exception:
+            logger.exception("transect swap: stopping the USB session failed")
+            # Keep going regardless: whatever state the old session is in,
+            # leaving the monitor wedged on a dead drive is worse.
+
+        try:
+            if capture == "timelapse":
+                anchor = _start_transect_timelapse(wp_label, force_local=True)
+            else:
+                anchor = _start_video_session(
+                    base_prefix="transect",
+                    target_mode=MODE_TRANSECT,
+                    initial_label=wp_label,
+                    per_leg_sidecars=True,
+                    force_local=True,
+                )
+        except Exception:
+            logger.exception("transect swap: restart on local storage failed")
+            return False
+
+        # Point the manifest at the new session. The old one stays on the
+        # USB drive describing the frames that made it there.
+        try:
+            if capture == "timelapse":
+                tl = _timelapse
+                tag = tl.source_tag if tl is not None else _make_source_tag("tr")
+                self._manifest_path = os.path.join(anchor, f"{tag}_manifest.ndjson")
+            else:
+                self._manifest_path = _transect_manifest_path(anchor)
+            _manifest_write_header(self._manifest_path, anchor)
+        except Exception:
+            logger.exception("transect swap: manifest re-open failed")
+
+        self.leg_count += 1
+        self.session_started_at = datetime.now()
+        self._note_event(f"storage swapped to local at {wp_label}")
+        logger.warning("Transect %s capture swapped to local storage at %s",
+                       capture, wp_label)
+        return True
+
     def enable(self):
         """Spin up the poll thread and arm the state machine."""
         if self._thread is not None and self._thread.is_alive():
@@ -4556,6 +4739,7 @@ def get_status():
             "usb_storage": usb_status,
             "usb_recording": usb_recording,
             "usb_failover_count": usb_failover_count,
+            "usb_failover_reason": usb_failover_reason,
             "active_storage": "usb" if usb_recording else (
                 "local" if mode != MODE_IDLE else None),
             # Per-poll snapshot of the automatic transect monitor. Null

@@ -1005,7 +1005,12 @@ function renderStorage(d) {
         primary = 'RECORDING TO SD (USB FAILOVER)';
         warn = true;
         free = localFree;
-        detail = `USB drive was lost mid-recording and the session continued on local storage. Failovers: ${failovers}.`;
+        // The two causes need different things from the operator: a full
+        // drive wants swapping or clearing, a lost one wants reseating.
+        const cause = d.usb_failover_reason === 'full'
+            ? 'USB drive ran out of space mid-recording'
+            : 'USB drive was lost mid-recording';
+        detail = `${cause} and the session continued on local storage. Failovers: ${failovers}.`;
     } else if (busy) {
         primary = 'RECORDING TO LOCAL SD';
         free = localFree;
