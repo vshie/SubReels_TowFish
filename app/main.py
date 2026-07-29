@@ -171,6 +171,28 @@ VALID_TRANSECT_CAPTURE_TYPES = ("video", "timelapse")
 DEFAULT_STORAGE_PREFERENCE = "usb"
 VALID_STORAGE_PREFERENCES = ("usb", "local")
 
+# ── Towed-body layback ───────────────────────────────────────────────────
+# The towfish has no GPS of its own, so every geotag is the tow point's
+# fix pushed backwards along a heading. Both the distance and which
+# heading to use are operator-configurable, because real layback depends
+# on tether scope, tow speed and depth.
+#
+# The heading source matters when the fish and the boat are not aligned
+# (turns, crosswind, cross-current):
+#   "towfish" -> the fish's own yaw. Best when the fish tracks straight
+#                behind and the boat is being pushed off its course.
+#   "boat"    -> the tow vehicle's yaw. Best when the fish is yawing on
+#                the tether but the tow direction is steady.
+#   "average" -> circular mean of the two, as a compromise.
+DEFAULT_TOW_OFFSET_M = 7.0
+DEFAULT_TOW_HEADING_SOURCE = "towfish"
+VALID_TOW_HEADING_SOURCES = ("towfish", "boat", "average")
+# 0 disables the offset (geotag straight from the tow point). The upper
+# bound is a sanity rail, not a physical limit -- it only exists to stop
+# a fat-fingered entry from throwing fixes a kilometre off.
+TOW_OFFSET_MIN_M = 0.0
+TOW_OFFSET_MAX_M = 300.0
+
 # One-push white-balance loop that runs while the transect monitor is
 # enabled. The operator can flip this off from the widget for scenes
 # where re-triggering AWB every 2 minutes would produce a visible
@@ -319,6 +341,25 @@ def _sanitize_param_targets(raw):
     return targets
 
 
+def _sanitize_tow_offset_m(raw, fallback=DEFAULT_TOW_OFFSET_M):
+    """Coerce a saved/posted layback distance to a clamped float."""
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if num != num or num in (float("inf"), float("-inf")):
+        return fallback
+    return max(TOW_OFFSET_MIN_M, min(TOW_OFFSET_MAX_M, num))
+
+
+def _sanitize_tow_heading_source(raw, fallback=DEFAULT_TOW_HEADING_SOURCE):
+    """Coerce a saved/posted heading-source name to a known mode."""
+    if not isinstance(raw, str):
+        return fallback
+    value = raw.strip().lower()
+    return value if value in VALID_TOW_HEADING_SOURCES else fallback
+
+
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
@@ -330,6 +371,8 @@ def load_config():
         "storage_preference": DEFAULT_STORAGE_PREFERENCE,
         "awb_loop_enabled": DEFAULT_AWB_LOOP_ENABLED,
         "param_targets": dict(DEFAULT_PARAM_TARGETS),
+        "tow_offset_m": DEFAULT_TOW_OFFSET_M,
+        "tow_heading_source": DEFAULT_TOW_HEADING_SOURCE,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -352,6 +395,10 @@ def load_config():
                                                      DEFAULT_AWB_LOOP_ENABLED))
     defaults["param_targets"] = _sanitize_param_targets(
         defaults.get("param_targets"))
+    defaults["tow_offset_m"] = _sanitize_tow_offset_m(
+        defaults.get("tow_offset_m"))
+    defaults["tow_heading_source"] = _sanitize_tow_heading_source(
+        defaults.get("tow_heading_source"))
     return defaults
 
 def save_config(cfg):
@@ -541,6 +588,8 @@ transect_capture_type = _cfg["transect_capture_type"]
 storage_preference = _cfg["storage_preference"]
 awb_loop_enabled = _cfg["awb_loop_enabled"]
 param_targets = _cfg["param_targets"]
+tow_offset_m = _cfg["tow_offset_m"]
+tow_heading_source = _cfg["tow_heading_source"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -553,6 +602,8 @@ def _persist_config():
         "storage_preference": storage_preference,
         "awb_loop_enabled": awb_loop_enabled,
         "param_targets": param_targets,
+        "tow_offset_m": tow_offset_m,
+        "tow_heading_source": tow_heading_source,
     })
 
 # Recording-storage state
@@ -806,23 +857,73 @@ def calculate_offset_position(lat, lon, heading_deg, offset_meters):
     
     return (new_lat, new_lon)
 
-def get_towing_gps_position():
-    """Get GPS position from BlueBoat with 4m offset behind towfish heading.
-    Returns (lat, lon) or (None, None) on failure."""
-    # Get BlueBoat position
-    lat, lon, alt = get_blueboat_gps_position()
+def circular_mean_deg(a_deg, b_deg):
+    """Mean of two compass headings, taken the short way around.
+
+    Plain arithmetic averaging breaks across north: (350 + 10) / 2 gives
+    180, pointing the layback exactly backwards. Averaging the unit
+    vectors instead gives 0.
+    """
+    a_rad = math.radians(a_deg)
+    b_rad = math.radians(b_deg)
+    mean = math.atan2(math.sin(a_rad) + math.sin(b_rad),
+                      math.cos(a_rad) + math.cos(b_rad))
+    return math.degrees(mean) % 360
+
+
+def resolve_tow_heading(towfish_heading=None):
+    """Heading to lay the towfish back along, per ``tow_heading_source``.
+
+    ``towfish_heading`` lets a caller that already read ATTITUDE this
+    cycle pass it in rather than paying for a second mavlink2rest
+    round-trip. Whichever source is configured, an unavailable reading
+    falls back to the other vehicle before giving up, so a dropout on
+    one link degrades the estimate instead of dropping the offset.
+    """
+    def fish():
+        return (towfish_heading if towfish_heading is not None
+                else get_towfish_heading())
+
+    def boat():
+        return get_blueboat_attitude().get('yaw')
+
+    if tow_heading_source == "average":
+        f, b = fish(), boat()
+        if f is not None and b is not None:
+            return circular_mean_deg(f, b)
+        return f if f is not None else b
+
+    if tow_heading_source == "boat":
+        b = boat()
+        return b if b is not None else fish()
+
+    f = fish()
+    return f if f is not None else boat()
+
+
+def offset_towed_position(lat, lon, towfish_heading=None):
+    """Push a tow-point fix back to where the towfish is estimated to be.
+
+    Returns the input position unchanged when the offset is disabled or
+    no heading is available from either vehicle.
+    """
     if lat is None or lon is None:
         return (None, None)
-    
-    # Get towfish heading
-    heading = get_towfish_heading()
-    if heading is None:
-        # If no heading available, return BlueBoat position without offset
+    if tow_offset_m <= 0:
         return (lat, lon)
-    
-    # Calculate offset position (4 meters behind towfish heading)
-    offset_lat, offset_lon = calculate_offset_position(lat, lon, heading, 4.0)
-    return (offset_lat, offset_lon)
+    heading = resolve_tow_heading(towfish_heading)
+    if heading is None:
+        return (lat, lon)
+    return calculate_offset_position(lat, lon, heading, tow_offset_m)
+
+
+def get_towing_gps_position():
+    """Estimated towfish position: the tow vehicle's fix, laid back.
+
+    Returns (lat, lon) or (None, None) if the tow vehicle has no fix.
+    """
+    lat, lon, _alt = get_blueboat_gps_position()
+    return offset_towed_position(lat, lon)
 
 def get_isp_info():
     """Get camera ISP info from the camera endpoint.
@@ -1328,10 +1429,7 @@ def update_srt_file():
                 towfish_alt = get_towfish_altitude()
 
                 if lat is not None and lon is not None:
-                    if heading is not None:
-                        offset_lat, offset_lon = calculate_offset_position(lat, lon, heading, 4.0)
-                    else:
-                        offset_lat, offset_lon = lat, lon
+                    offset_lat, offset_lon = offset_towed_position(lat, lon, heading)
                     alt_str = f"{towfish_alt:.1f}" if towfish_alt is not None else ""
                     pos_line = (f"latitude: {offset_lat:.6f} "
                                 f"longitude: {offset_lon:.6f} "
@@ -2545,12 +2643,7 @@ class TimelapseSession:
             heading = att.get('yaw')
             roll = att.get('roll')
             pitch = att.get('pitch')
-            if bb_lat is not None and bb_lon is not None and heading is not None:
-                gps_lat, gps_lon = calculate_offset_position(
-                    bb_lat, bb_lon, heading, 4.0,
-                )
-            else:
-                gps_lat, gps_lon = bb_lat, bb_lon
+            gps_lat, gps_lon = offset_towed_position(bb_lat, bb_lon, heading)
             tow_alt = get_towfish_altitude()
             depth = get_depth_data()
             temp = get_baro_data()
@@ -2797,6 +2890,7 @@ def register_service():
 def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
     global transect_capture_type, storage_preference, awb_loop_enabled
+    global tow_offset_m, tow_heading_source
 
     if request.method == 'POST':
         # The AWB-loop toggle is safe to change while a mode is active
@@ -2874,6 +2968,28 @@ def config():
             storage_preference = new_storage
             changed = True
 
+        new_offset = data.get('tow_offset_m')
+        if new_offset is not None:
+            try:
+                offset_val = float(new_offset)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "tow_offset_m must be a number"}), 400
+            if not (TOW_OFFSET_MIN_M <= offset_val <= TOW_OFFSET_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"tow_offset_m must be between {TOW_OFFSET_MIN_M} and {TOW_OFFSET_MAX_M} m"}), 400
+            tow_offset_m = _sanitize_tow_offset_m(offset_val)
+            changed = True
+
+        new_heading_src = data.get('tow_heading_source')
+        if new_heading_src is not None:
+            new_heading_src = str(new_heading_src).strip().lower()
+            if new_heading_src not in VALID_TOW_HEADING_SOURCES:
+                return jsonify({"success": False,
+                                "message": f"tow_heading_source must be one of {VALID_TOW_HEADING_SOURCES}"}), 400
+            tow_heading_source = new_heading_src
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
@@ -2881,9 +2997,11 @@ def config():
         logger.info(
             "Config updated: tow_vehicle_ip=%s, container_format=%s, "
             "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s, "
-            "storage_preference=%s, awb_loop_enabled=%s",
+            "storage_preference=%s, awb_loop_enabled=%s, tow_offset_m=%s, "
+            "tow_heading_source=%s",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
             transect_capture_type, storage_preference, awb_loop_enabled,
+            tow_offset_m, tow_heading_source,
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
@@ -2892,7 +3010,9 @@ def config():
                         "snapshot_url": snapshot_url,
                         "transect_capture_type": transect_capture_type,
                         "storage_preference": storage_preference,
-                        "awb_loop_enabled": awb_loop_enabled})
+                        "awb_loop_enabled": awb_loop_enabled,
+                        "tow_offset_m": tow_offset_m,
+                        "tow_heading_source": tow_heading_source})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -2903,6 +3023,11 @@ def config():
         "transect_capture_type": transect_capture_type,
         "storage_preference": storage_preference,
         "awb_loop_enabled": awb_loop_enabled,
+        "tow_offset_m": tow_offset_m,
+        "tow_heading_source": tow_heading_source,
+        "tow_heading_sources": list(VALID_TOW_HEADING_SOURCES),
+        "tow_offset_min_m": TOW_OFFSET_MIN_M,
+        "tow_offset_max_m": TOW_OFFSET_MAX_M,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -5029,8 +5154,8 @@ def get_telemetry():
         # Get towfish heading for offset calculation
         towfish_heading = get_towfish_heading()
         
-        # Get offset position (4m behind towfish heading)
-        gps_lat, gps_lon = get_towing_gps_position()
+        # Estimated towfish position: boat fix laid back per config
+        gps_lat, gps_lon = offset_towed_position(bb_lat, bb_lon, towfish_heading)
         
         logger.info(f"Sending telemetry: depth={depth}, climb={vfr_data}, temp={baro_data}, lights={light_percentage}%, GPS=({gps_lat}, {gps_lon}), heading={towfish_heading}")
         

@@ -34,15 +34,31 @@ measurable after the fact rather than only watchable.
 ### Position estimation
 
 The fish is underwater and carries no GPS of its own, so its position is
-inferred from the boat's. Today that inference is a **static offset**: 4 m
-behind the boat's GPS fix, along the towfish's heading.
+inferred from the boat's: every geotag is the tow vehicle's fix pushed
+backwards by a **static offset**, defaulting to 7 m. Both the distance and the
+heading it is laid back along are set in the setup console and persist across
+restarts.
 
-This is a deliberate first approximation, and it is the weakest link in the
-geotagging chain — real layback varies with cable scope, tow speed and fish
-depth, none of which a fixed distance accounts for. Planned work:
+The heading source matters whenever the fish and the boat are not aligned —
+turns, crosswind, cross-current:
 
-- a richer layback model driven by cable scope, speed and depth rather than a
-  constant
+| Source | Use when |
+| --- | --- |
+| `towfish` (default) | the fish tracks straight behind and the boat is being pushed off its course |
+| `boat` | the fish is yawing on the tether but the tow direction is steady |
+| `average` | a compromise between the two, taken as a circular mean so it stays correct across north |
+
+The console also carries a layback calculator: enter tether deployed and
+average towfish depth and it solves the right triangle for the horizontal leg,
+which is the offset from the tow point. A straight tether is the best case, so
+that result is an upper bound — real cable sags and the fish rides closer in.
+
+This is still a deliberate first approximation, and it remains the weakest link
+in the geotagging chain, since real layback varies continuously with cable
+scope, tow speed and depth. Planned work:
+
+- a layback model that tracks scope, speed and depth live rather than holding a
+  configured constant
 - validating whichever model we adopt against an acoustic localization system
   carried on both the TowFish and the BlueBoat, so the estimate can be checked
   against a measured baseline instead of trusted on geometry alone
@@ -73,6 +89,7 @@ Pre-survey configuration only, at full page width:
 
 - tow vehicle IP, recording storage, stream transport and camera snapshot URL
 - recorder status, storage state and live telemetry
+- tow geometry: layback distance, heading source and the layback calculator
 - the survey parameter checker
 - a file browser over the recordings folder
 
@@ -121,6 +138,99 @@ is only reported as successful once the autopilot echoes back a fresh
 - An ArduRover tow boat reachable on the same network, running `mavlink2rest`
 - A camera publishing an RTSP H.264 stream
 
+### Installation
+
+#### Option A — Manual install in BlueOS (recommended)
+
+Every push to `main` publishes a new image to Docker Hub via the `Deploy BlueOS
+Extension Image` GitHub Action (see `.github/workflows/deploy.yml`). The action
+prepends `blueos-` to the configured image name, so the published image is
+`vshie/blueos-subreels_towfish`, not `vshie/subreels_towfish`.
+
+1. Open BlueOS in your browser.
+2. Go to **Extensions → Installed Extensions** and click the **+** button in
+   the bottom-right.
+3. Fill in the dialog:
+   - **Extension Identifier:** `vshie.subreels_towfish`
+   - **Extension Name:** `SubReels: TowFish`
+   - **Docker image:** `vshie/blueos-subreels_towfish`
+   - **Docker tag:** `main`
+   - **Permissions:** copy and paste the JSON block below verbatim.
+
+   ```json
+   {
+     "ExposedPorts": {
+       "5423/tcp": {},
+       "8765/tcp": {}
+     },
+     "HostConfig": {
+       "Binds": [
+         "/usr/blueos/extensions/subreels_towfish:/app/videorecordings",
+         "/dev/video2:/dev/video2",
+         "/dev:/dev",
+         "/mnt:/mnt:rshared"
+       ],
+       "ExtraHosts": ["host.docker.internal:host-gateway"],
+       "PortBindings": {
+         "5423/tcp": [
+           {
+             "HostPort": ""
+           }
+         ],
+         "8765/tcp": [
+           {
+             "HostPort": ""
+           }
+         ]
+       },
+       "NetworkMode": "host",
+       "Privileged": true
+     }
+   }
+   ```
+
+4. Click **Create**. BlueOS pulls the image and starts the container.
+5. Once it shows as running, open it from the BlueOS sidebar.
+
+That block is identical to the `LABEL permissions` baked into the image. It
+tells BlueOS to:
+
+- **Bind `/usr/blueos/extensions/subreels_towfish` → `/app/videorecordings`**
+  so recordings and `subreels_towfish_config.json` persist on the host and show
+  up in the BlueOS file browser at
+  `http://<host>:7777/files/extensions/subreels_towfish/`.
+- **Bind `/dev` and `/mnt:rshared`** so USB drives the host hot-plugs appear
+  inside the container and stay visible after a remount. Without the `rshared`
+  propagation, a stick inserted after the container started would never show up.
+- **Use host networking, privileged mode and `host.docker.internal`** so the
+  container can reach `mavlink2rest` on the towfish, plus the tow boat across
+  the network.
+- **Expose 5423 and 8765** — the web UI and the Cockpit data-lake WebSocket.
+
+The `/dev/video2` bind is inherited from the original video recorder and is not
+used here, since this extension captures over RTSP. Drop that one line if your
+towfish has no `/dev/video2`.
+
+#### Option B — Build a local image and install from file
+
+To test changes before they reach Docker Hub, build locally, export a `.tar`,
+and upload it directly:
+
+1. Build and save the image:
+
+   ```bash
+   git clone https://github.com/vshie/SubReels_TowFish.git
+   cd SubReels_TowFish
+   docker build -t blueos-subreels_towfish:local .
+   docker save -o blueos-subreels_towfish-local.tar blueos-subreels_towfish:local
+   ```
+
+2. Copy the `.tar` to the machine with BlueOS open in a browser.
+3. In BlueOS, go to **Extensions → Installed Extensions** and click the **+**
+   button in the bottom-right.
+4. Choose **Install from file** and select the `.tar` you just built.
+5. When prompted, reuse the same permissions JSON from Option A.
+
 ### First run
 
 1. Install the extension and open its page from the BlueOS sidebar.
@@ -130,7 +240,10 @@ is only reported as successful once the autopilot echoes back a fresh
    coding quality at maximum.
 4. Choose a recording storage preference. USB is used when a drive with enough
    free space is mounted, otherwise recordings fall back to the local SD.
-5. Run **Check All** in the survey parameters panel, adjust any targets, then
+5. Set the tow geometry. Use the layback calculator if you know the tether
+   length and working depth, and pick the heading source that matches how the
+   fish tracks behind the boat.
+6. Run **Check All** in the survey parameters panel, adjust any targets, then
    **Apply Mismatched**.
 
 ### Branding

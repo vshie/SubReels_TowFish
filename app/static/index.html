@@ -392,6 +392,48 @@
         }
         .saved.visible { opacity: 1; }
 
+        .field-row .unit {
+            align-self: center;
+            font-size: 10px;
+            color: var(--ink-dim);
+            letter-spacing: 0.1em;
+            white-space: nowrap;
+        }
+        .seg { display: flex; gap: 4px; flex-wrap: wrap; }
+
+        /* --- Layback calculator ------------------------------------------- */
+        .calc {
+            margin-top: 12px;
+            border: 1px solid #0d1310;
+            border-radius: 5px;
+            background: #050807;
+            padding: 10px;
+        }
+        .calc-title {
+            font-size: 9px;
+            letter-spacing: 0.26em;
+            color: var(--ink-dim);
+            margin-bottom: 8px;
+        }
+        .calc-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px;
+            align-items: end;
+        }
+        .calc-result {
+            flex: 1;
+            min-width: 0;
+            font: 700 16px 'Share Tech Mono', monospace;
+            letter-spacing: 0.08em;
+            color: var(--phosphor);
+            text-shadow: 0 0 6px var(--phosphor-glow);
+            padding: 5px 0;
+            border-bottom: 1px solid #0d1310;
+        }
+        .calc-result.dim { color: var(--ink-dim); text-shadow: none; font-size: 12px; }
+        .calc-result.error { color: var(--amber); text-shadow: none; font-size: 11px; }
+
         /* --- Parameter checker ------------------------------------------- */
         .param-toolbar {
             display: flex;
@@ -698,6 +740,79 @@
             </div>
         </div>
 
+        <!-- Tow geometry -->
+        <div class="section">
+            <div class="section-title">
+                <span>TOW GEOMETRY</span>
+                <span class="aux">LAYBACK APPLIED TO EVERY RECORDED POSITION</span>
+            </div>
+            <div class="field-grid">
+                <div class="field">
+                    <label for="towOffset">STATIC OFFSET</label>
+                    <div class="field-row">
+                        <input type="number" id="towOffset" step="0.1" min="0" max="300" placeholder="7.0" autocomplete="off">
+                        <span class="unit">m</span>
+                        <button class="btn" id="towOffsetSave">SAVE</button>
+                        <span class="saved" id="towOffsetSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        How far the towfish trails behind the tow point. Every geotag is the
+                        boat's fix pushed back this distance. <code>0</code> records the tow
+                        point itself.
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label>OFFSET HEADING</label>
+                    <div class="field-row">
+                        <div class="seg" id="towHeadingSource">
+                            <button class="btn preset" data-source="towfish">TOWFISH</button>
+                            <button class="btn preset" data-source="boat">TOW BOAT</button>
+                            <button class="btn preset" data-source="average">AVERAGE</button>
+                        </div>
+                        <span class="saved" id="towHeadingSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Which vehicle's heading the offset is laid back along. Use TOWFISH when
+                        the fish tracks straight and the boat is being pushed off course, TOW
+                        BOAT when the fish yaws on the tether, AVERAGE as a compromise.
+                    </div>
+                </div>
+            </div>
+
+            <div class="calc">
+                <div class="calc-title">LAYBACK CALCULATOR</div>
+                <div class="calc-row">
+                    <div class="field">
+                        <label for="calcTether">TETHER DEPLOYED</label>
+                        <div class="field-row">
+                            <input type="number" id="calcTether" step="0.5" min="0" placeholder="10.0" autocomplete="off">
+                            <span class="unit">m</span>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label for="calcDepth">AVERAGE DEPTH</label>
+                        <div class="field-row">
+                            <input type="number" id="calcDepth" step="0.1" min="0" placeholder="7.0" autocomplete="off">
+                            <span class="unit">m</span>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label>HORIZONTAL OFFSET</label>
+                        <div class="field-row">
+                            <span class="calc-result dim" id="calcResult">--</span>
+                            <button class="btn" id="calcUse" disabled>USE</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="hint">
+                    Solves the right triangle with the tether as hypotenuse and depth as the
+                    vertical leg. A straight tether is the best case, so treat the result as an
+                    upper bound &mdash; real cable sags and the fish rides closer in.
+                </div>
+            </div>
+        </div>
+
         <!-- Parameter checker -->
         <div class="section">
             <div class="section-title">
@@ -896,6 +1011,8 @@ async function loadConfig() {
         if (d.storage_preference) $('storagePreference').value = d.storage_preference;
         if (d.stream_protocol) $('streamProtocol').value = d.stream_protocol;
         if (d.rtsp_endpoint) $('rtspEndpoint').textContent = d.rtsp_endpoint;
+        if (d.tow_offset_m != null) $('towOffset').value = Number(d.tow_offset_m).toFixed(1);
+        if (d.tow_heading_source) markHeadingSource(d.tow_heading_source);
     } catch (e) {
         showError(`Could not load configuration: ${e.message}`);
     }
@@ -933,6 +1050,72 @@ $('storagePreference').addEventListener('change', (e) => {
 });
 $('streamProtocol').addEventListener('change', (e) => {
     saveConfigField({ stream_protocol: e.target.value }, 'protocolSaved');
+});
+
+// ── Tow geometry ─────────────────────────────────────────────────────────
+const headingButtons = Array.from(
+    $('towHeadingSource').querySelectorAll('button[data-source]'));
+
+function markHeadingSource(source) {
+    headingButtons.forEach((btn) => {
+        btn.classList.toggle('selected', btn.dataset.source === source);
+    });
+}
+
+headingButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+        markHeadingSource(btn.dataset.source);
+        saveConfigField({ tow_heading_source: btn.dataset.source }, 'towHeadingSaved');
+    });
+});
+
+$('towOffsetSave').addEventListener('click', () => {
+    const value = parseFloat($('towOffset').value);
+    if (!Number.isFinite(value) || value < 0) {
+        showError('Static offset must be a number of metres, 0 or greater.');
+        return;
+    }
+    saveConfigField({ tow_offset_m: value }, 'towOffsetSaved');
+});
+$('towOffset').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('towOffsetSave').click();
+});
+
+// Right triangle: tether is the hypotenuse, depth the vertical leg, and
+// the horizontal leg is the layback from the tow point.
+let calcOffset = null;
+
+function updateCalc() {
+    const tether = parseFloat($('calcTether').value);
+    const depth = parseFloat($('calcDepth').value);
+    const out = $('calcResult');
+    const use = $('calcUse');
+    calcOffset = null;
+
+    const setState = (text, cls) => {
+        out.textContent = text;
+        out.className = 'calc-result' + (cls ? ` ${cls}` : '');
+    };
+
+    if (!Number.isFinite(tether) || !Number.isFinite(depth)) {
+        setState('--', 'dim');
+    } else if (tether < 0 || depth < 0) {
+        setState('VALUES MUST BE POSITIVE', 'error');
+    } else if (depth > tether) {
+        setState('DEPTH EXCEEDS TETHER', 'error');
+    } else {
+        calcOffset = Math.sqrt(tether * tether - depth * depth);
+        setState(`${calcOffset.toFixed(1)} m`, '');
+    }
+    use.disabled = calcOffset === null;
+}
+
+$('calcTether').addEventListener('input', updateCalc);
+$('calcDepth').addEventListener('input', updateCalc);
+$('calcUse').addEventListener('click', () => {
+    if (calcOffset === null) return;
+    $('towOffset').value = calcOffset.toFixed(1);
+    saveConfigField({ tow_offset_m: Number(calcOffset.toFixed(1)) }, 'towOffsetSaved');
 });
 
 // ── Parameter checker ────────────────────────────────────────────────────
