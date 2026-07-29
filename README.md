@@ -1,21 +1,23 @@
 # SubReels: TowFish
 
-Towed-body video survey extension for BlueOS. Second in the
+Towed-body photogrammetry survey extension for BlueOS. Second in the
 [SubReels](https://github.com/vshie/SubReels) series.
 
 SubReels: TowFish runs on the towed camera body (ArduSub) and coordinates with
 an ArduRover tow boat on the surface. It records the towfish camera's RTSP
-H.264 stream or captures geotagged 2 Hz stills, and can drive both
+H.264 or H.265 stream, or captures geotagged 2 Hz stills, and can drive both
 automatically from the boat's mission state so one file or image folder is
-produced per waypoint leg.
+produced per survey, with numbering including waypoint leg information and time.
+EXIF data (PIX4D formatting for Metashape ingestion) of images and a .csv file / subtitle file 
+with similar information. 
 
 ## About the vehicle
 
 The TowFish is a towed camera body rather than a free-swimming ROV or AUV. It
-flies on a cable behind a BlueBoat — or any other surface towing platform — and
-the two vehicles work as a pair. The boat contributes position and the depth of
-water beneath it; the fish contributes its own depth, attitude and imagery.
-Coordinating that pair is what this extension exists to do.
+flies on a tether behind a BlueBoat — or any other surface towing platform — and
+the two vehicles work as a pair. The boat contributes position and measures the depth of
+water beneath it (via Ping sonar); the fish contributes its own pressure-depth measurement, attitude and imagery.
+Coordinating that pair is what this extension exists to do!
 
 Depth is flown against two references at once: a desired depth in the water
 column, and the bottom depth under the boat. Working from both is what lets the
@@ -29,7 +31,7 @@ depth jog and ALT_HOLD on the same panel.
 Every capture — video frame or still — is tagged with where the camera was and
 where it was pointing: GPS position, altitude, towfish roll/pitch/yaw, and the
 mount pitch derived from the tilt servo. That is what makes the imagery
-measurable after the fact rather than only watchable.
+usable for to-scale model output, rather than no scaling or scaling via known objects / positions in the model. 
 
 ### Position estimation
 
@@ -98,7 +100,7 @@ Pre-survey configuration only, at full page width:
 Everything used while a survey is running — record/timelapse/transect mode
 selection, arm/disarm, flight mode, depth jog, camera tilt, zoom, focus and
 white balance. Add it to Cockpit as a custom widget pointing at
-`http://<vehicle>/extensionv2/subreels-towfish/widget`.
+`http://<vehicle>/"port number from Available Services for the extension"/widget`.
 
 ## Survey parameters
 
@@ -112,8 +114,8 @@ state.
 | Parameter | Default | Why |
 | --- | --- | --- |
 | `TURN_RADIUS` | 2.50 m | Round waypoints tightly enough that the towfish is not dragged across its own track. |
-| `WP_PIVOT_ANGLE` | 0 deg | Disables pivot turns so the boat keeps way on through every corner. |
-| `WP_SPEED` | 0.8–1.1 m/s | Target speed on an AUTO mission leg. |
+| `WP_PIVOT_ANGLE` | 0 deg | Disables pivot turns so the boat doesn't slow down/stop at every corner. |
+| `WP_SPEED` | 0.8–1.1 m/s | Target speed on an AUTO mission leg.|
 | `CRUISE_SPEED` | 0.8–1.1 m/s | Kept equal to `WP_SPEED` so the boat does not fight its own mission. |
 
 **Towfish (ArduSub)**
@@ -135,8 +137,8 @@ is only reported as successful once the autopilot echoes back a fresh
 ### Prerequisites
 
 - BlueOS on the towfish ([installation guide](https://blueos.cloud/docs/latest/usage/installation/))
-- An ArduRover tow boat reachable on the same network, running `mavlink2rest`
-- A camera publishing an RTSP H.264 stream
+- An ArduRover tow boat/gps instance reachable on the same network, running `mavlink2rest`
+- A camera publishing an RTSP H.264/H265 stream with JPEG endpoint
 
 ### Installation
 
@@ -245,11 +247,6 @@ and upload it directly:
    fish tracks behind the boat.
 6. Run **Check All** in the survey parameters panel, adjust any targets, then
    **Apply Mismatched**.
-
-### Branding
-
-Drop a square logo into `app/static/` as `logo.png`, `.svg`, `.jpg` or `.webp`
-and it fills the bay at the top left of the setup console.
 
 ## Storage layout
 
