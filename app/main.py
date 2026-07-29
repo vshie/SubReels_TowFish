@@ -25,6 +25,11 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402  (after require_version)
 
 import usb_storage
+from mavlink_params import (
+    LOCAL_MAVLINK2REST_URL,
+    ParamClient,
+    ParamReadError,
+)
 from mavlink_writer import (
     MavlinkWriter,
     get_default_writer,
@@ -35,6 +40,8 @@ from mavlink_writer import (
     Z_PWM_ASCEND,
     Z_PWM_DESCEND,
     Z_PWM_NEUTRAL,
+    Z_PWM_MIN,
+    Z_PWM_MAX,
     focus_pwm_to_pct,
     focus_pct_to_pwm,
     FOCUS_PWM_MIN as MAV_FOCUS_PWM_MIN,
@@ -178,6 +185,140 @@ AWB_LOOP_INTERVAL_S = 120.0
 RADCAM_AWB_URL = 'http://192.168.2.10/action/setImageAdjustmentEx'
 RADCAM_AWB_BODY = {"onceAWB": 1}
 
+# ── Survey parameter checker ─────────────────────────────────────────────
+# Autopilot parameters that have to be right before a tow survey, split
+# across the two vehicles involved:
+#
+#   "boat"    -> the ArduRover tow boat, reached at ``tow_vehicle_ip``
+#   "towfish" -> the local ArduSub towfish (host.docker.internal)
+#
+# ``default`` is our starting recommendation, not a hard requirement:
+# every target is operator-editable and persisted, because the right
+# values shift with hull, tow point and sea state. The checker compares
+# what the vehicle reports against the *saved target*, never against the
+# constant below.
+PARAM_VEHICLES = ("boat", "towfish")
+
+PARAM_SPECS = [
+    {
+        "name": "TURN_RADIUS",
+        "vehicle": "boat",
+        "default": 2.50,
+        "unit": "m",
+        "decimals": 2,
+        "min": 0.1,
+        "max": 100.0,
+        "desc": "Radius the boat uses to round a waypoint. Tight enough "
+                "that the towfish is not dragged across its own track.",
+    },
+    {
+        "name": "WP_PIVOT_ANGLE",
+        "vehicle": "boat",
+        "default": 0.0,
+        "unit": "deg",
+        "decimals": 0,
+        "min": 0.0,
+        "max": 180.0,
+        "desc": "0 disables pivot turns, so the boat keeps way on through "
+                "every corner instead of stopping and spinning.",
+    },
+    {
+        "name": "WP_SPEED",
+        "vehicle": "boat",
+        "default": 1.0,
+        "unit": "m/s",
+        "decimals": 2,
+        "min": 0.8,
+        "max": 1.1,
+        "presets": [0.8, 0.9, 1.0, 1.1],
+        "desc": "Target speed while running an AUTO mission leg.",
+    },
+    {
+        "name": "CRUISE_SPEED",
+        "vehicle": "boat",
+        "default": 1.0,
+        "unit": "m/s",
+        "decimals": 2,
+        "min": 0.8,
+        "max": 1.1,
+        "presets": [0.8, 0.9, 1.0, 1.1],
+        "desc": "Speed the throttle controller trims around. Keep it equal "
+                "to WP_SPEED so the boat does not fight its own mission.",
+    },
+    {
+        "name": "ATC_ANG_RLL_P",
+        "vehicle": "towfish",
+        "default": 0.00,
+        "unit": "",
+        "decimals": 3,
+        "min": 0.0,
+        "max": 12.0,
+        "desc": "Roll angle P gain. Zero leaves roll passive so the tow "
+                "cable, not the autopilot, sets the fish attitude.",
+    },
+    {
+        "name": "ATC_RAT_RLL_D",
+        "vehicle": "towfish",
+        "default": 0.0072,
+        "unit": "",
+        "decimals": 4,
+        "min": 0.0,
+        "max": 0.5,
+        "desc": "Roll rate D gain -- damps the roll oscillation the tow "
+                "cable induces.",
+    },
+    {
+        "name": "ATC_RAT_RLL_FLTE",
+        "vehicle": "towfish",
+        "default": 3.0,
+        "unit": "Hz",
+        "decimals": 2,
+        "min": 0.0,
+        "max": 100.0,
+        "desc": "Roll rate error filter cutoff.",
+    },
+    {
+        "name": "ATC_RAT_RLL_FLTD",
+        "vehicle": "towfish",
+        "default": 4.0,
+        "unit": "Hz",
+        "decimals": 2,
+        "min": 0.0,
+        "max": 100.0,
+        "desc": "Roll rate derivative filter cutoff.",
+    },
+]
+
+PARAM_SPECS_BY_NAME = {spec["name"]: spec for spec in PARAM_SPECS}
+
+DEFAULT_PARAM_TARGETS = {spec["name"]: float(spec["default"])
+                         for spec in PARAM_SPECS}
+
+
+def _sanitize_param_targets(raw):
+    """Coerce a saved/posted target map into ``{name: float}``.
+
+    Unknown names are dropped and out-of-range values are clamped to the
+    spec envelope, so a hand-edited config file or a stale browser tab
+    can never push a nonsense value at an autopilot.
+    """
+    targets = dict(DEFAULT_PARAM_TARGETS)
+    if not isinstance(raw, dict):
+        return targets
+    for name, value in raw.items():
+        spec = PARAM_SPECS_BY_NAME.get(name)
+        if spec is None:
+            continue
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            continue
+        if num != num or num in (float("inf"), float("-inf")):
+            continue
+        targets[name] = max(float(spec["min"]), min(float(spec["max"]), num))
+    return targets
+
+
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
@@ -188,6 +329,7 @@ def load_config():
         "transect_capture_type": DEFAULT_TRANSECT_CAPTURE_TYPE,
         "storage_preference": DEFAULT_STORAGE_PREFERENCE,
         "awb_loop_enabled": DEFAULT_AWB_LOOP_ENABLED,
+        "param_targets": dict(DEFAULT_PARAM_TARGETS),
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -208,6 +350,8 @@ def load_config():
         defaults["storage_preference"] = DEFAULT_STORAGE_PREFERENCE
     defaults["awb_loop_enabled"] = bool(defaults.get("awb_loop_enabled",
                                                      DEFAULT_AWB_LOOP_ENABLED))
+    defaults["param_targets"] = _sanitize_param_targets(
+        defaults.get("param_targets"))
     return defaults
 
 def save_config(cfg):
@@ -396,6 +540,7 @@ snapshot_url = _cfg["snapshot_url"]
 transect_capture_type = _cfg["transect_capture_type"]
 storage_preference = _cfg["storage_preference"]
 awb_loop_enabled = _cfg["awb_loop_enabled"]
+param_targets = _cfg["param_targets"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -407,6 +552,7 @@ def _persist_config():
         "transect_capture_type": transect_capture_type,
         "storage_preference": storage_preference,
         "awb_loop_enabled": awb_loop_enabled,
+        "param_targets": param_targets,
     })
 
 # Recording-storage state
@@ -432,16 +578,25 @@ LOCAL_RECORDING_DIR = "/app/videorecordings"
 towfish_attitude_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
 servo_output_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SERVO_OUTPUT_RAW'
 
-# Camera tilt is driven by a servo; we read its PWM from SERVO_OUTPUT_RAW
-# and map it linearly to the mount angle. Defaults: channel 16, with
-# 1100 us -> -90 deg and 1900 us -> +90 deg. Sign convention: positive =
-# camera tilted up (toward the surface). Adjust if the servo travel or
-# wiring differs in the field.
+# Camera tilt is driven by SERVO16 (SERVO16_FUNCTION = 7, mount pitch)
+# with the mount running earth-frame stabilised (MNT1_TYPE = 1). We read
+# the servo PWM from SERVO_OUTPUT_RAW and map it to the *body-frame* mount
+# angle (camera pitch relative to the towfish), then add the vehicle pitch
+# to publish the *world-relative* (earth-frame) angle the mount is holding.
+#
+# Calibration is the vehicle's own SERVO16/MNT1 configuration, confirmed
+# against the towfish 00000061 dataflash log (angle = -0.10723*pwm +
+# 162.575, 0.45 deg rms over 28,640 samples). Because SERVO16_REVERSED = 1
+# the travel is inverted: SERVO16_MIN maps to MNT1_PITCH_MAX and
+# SERVO16_MAX maps to MNT1_PITCH_MIN. The old hardcoded 1100/1900 -> +/-90
+# mapping was wrong for this frame (recorded +144 deg where the mount was
+# actually at -66.9 deg). Adjust these if the vehicle params change.
 TILT_SERVO_CHANNEL = 16
-TILT_PWM_MIN = 1100
-TILT_PWM_MAX = 1900
-TILT_ANGLE_AT_PWM_MIN = -90.0
-TILT_ANGLE_AT_PWM_MAX = 90.0
+TILT_PWM_MIN = 865            # SERVO16_MIN
+TILT_PWM_MAX = 2170           # SERVO16_MAX
+TILT_SERVO_REVERSED = True    # SERVO16_REVERSED
+TILT_MOUNT_PITCH_MIN_DEG = -70.0  # MNT1_PITCH_MIN (camera fully down)
+TILT_MOUNT_PITCH_MAX_DEG = 70.0   # MNT1_PITCH_MAX (camera fully up)
 
 # Camera ISP info endpoint
 camera_isp_url = 'http://192.168.2.10/action/getISPInfo'
@@ -917,32 +1072,58 @@ def get_towfish_altitude():
         logger.debug(f"Error fetching towfish altitude: {str(e)}")
     return 0.0
 
-def get_towfish_camera_tilt():
-    """Camera tilt (degrees) from the tilt servo PWM. Positive = up.
+def tilt_pwm_to_body_deg(pwm):
+    """Map a raw SERVO16 PWM to the body-frame mount pitch (degrees).
 
-    Reads ``SERVO_OUTPUT_RAW.servo{N}_raw`` for the configured tilt
-    channel and maps the PWM linearly onto the configured angle
-    endpoints. Returns ``None`` when the message/servo is unavailable
-    (e.g. disarmed, where the channel reports 0).
+    This is the camera pitch *relative to the towfish body* -- the raw
+    servo deflection. ``SERVO16_REVERSED`` inverts the travel so the
+    minimum PWM points the camera up (MNT1_PITCH_MAX) and the maximum PWM
+    points it down (MNT1_PITCH_MIN). Returns ``None`` for a missing/zero
+    PWM (servo not driven, e.g. disarmed).
+    """
+    if not pwm:  # None or 0 -> servo not driven
+        return None
+    span = TILT_PWM_MAX - TILT_PWM_MIN
+    if span == 0:
+        return None
+    frac = (pwm - TILT_PWM_MIN) / span
+    if TILT_SERVO_REVERSED:
+        frac = 1.0 - frac
+    angle = (TILT_MOUNT_PITCH_MIN_DEG
+             + frac * (TILT_MOUNT_PITCH_MAX_DEG - TILT_MOUNT_PITCH_MIN_DEG))
+    # Clamp to the configured mount travel so an out-of-range PWM can't
+    # yield an absurd angle.
+    lo = min(TILT_MOUNT_PITCH_MIN_DEG, TILT_MOUNT_PITCH_MAX_DEG)
+    hi = max(TILT_MOUNT_PITCH_MIN_DEG, TILT_MOUNT_PITCH_MAX_DEG)
+    return max(lo, min(hi, angle))
+
+
+def get_towfish_camera_tilt(vehicle_pitch_deg=None):
+    """Camera tilt (degrees), world-relative (earth-frame). Negative = down.
+
+    The mount runs earth-frame stabilised, so the servo continuously
+    trims the *body-frame* angle to hold a fixed earth-frame pointing.
+    The number worth publishing (for EXIF / photogrammetry) is that
+    world-relative angle, which is::
+
+        world_pitch = body_pitch(SERVO16) + vehicle_pitch
+
+    ``vehicle_pitch_deg`` should be the towfish ATTITUDE pitch in degrees;
+    if omitted it is fetched here (one extra mavlink2rest GET). Returns
+    ``None`` when the servo PWM is unavailable (e.g. disarmed, channel 0).
     """
     try:
         response = requests.get(servo_output_url, timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             pwm = message.get(f'servo{TILT_SERVO_CHANNEL}_raw', None)
-            if not pwm:  # None or 0 -> servo not driven
+            body_deg = tilt_pwm_to_body_deg(pwm)
+            if body_deg is None:
                 return None
-            span = TILT_PWM_MAX - TILT_PWM_MIN
-            if span == 0:
-                return None
-            frac = (pwm - TILT_PWM_MIN) / span
-            angle = (TILT_ANGLE_AT_PWM_MIN
-                     + frac * (TILT_ANGLE_AT_PWM_MAX - TILT_ANGLE_AT_PWM_MIN))
-            # Clamp to the configured travel so an out-of-range PWM can't
-            # yield an absurd angle.
-            lo = min(TILT_ANGLE_AT_PWM_MIN, TILT_ANGLE_AT_PWM_MAX)
-            hi = max(TILT_ANGLE_AT_PWM_MIN, TILT_ANGLE_AT_PWM_MAX)
-            return max(lo, min(hi, angle))
+            if vehicle_pitch_deg is None:
+                vehicle_pitch_deg = get_towfish_attitude().get('pitch')
+            world_deg = body_deg + (vehicle_pitch_deg or 0.0)
+            return world_deg
     except Exception as e:
         logger.debug(f"Error fetching camera tilt: {str(e)}")
     return None
@@ -2373,7 +2554,9 @@ class TimelapseSession:
             tow_alt = get_towfish_altitude()
             depth = get_depth_data()
             temp = get_baro_data()
-            tilt = get_towfish_camera_tilt()
+            # World-relative camera pitch: reuse the ATTITUDE pitch we
+            # already fetched this frame instead of a second round-trip.
+            tilt = get_towfish_camera_tilt(vehicle_pitch_deg=pitch)
         except Exception:
             logger.exception("TIMELAPSE telemetry fetch raised")
             bb_lat = bb_lon = bb_alt = None
@@ -3572,9 +3755,17 @@ def get_optics_snapshot() -> dict:
     focus_pwm = _current_servo_pwm(12)
     zoom_pwm = _current_servo_pwm(11)
     focus_pct = focus_pwm_to_pct(focus_pwm) if focus_pwm else None
+    # World-relative (earth-frame) camera pitch: reuse the tilt PWM we
+    # just read, then add the vehicle pitch from ATTITUDE.
+    tilt_body = tilt_pwm_to_body_deg(tilt_pwm)
+    if tilt_body is None:
+        tilt_deg = None
+    else:
+        veh_pitch = get_towfish_attitude().get('pitch') or 0.0
+        tilt_deg = round(tilt_body + veh_pitch, 1)
     return {
         "tilt_pwm": tilt_pwm,
-        "tilt_deg": get_towfish_camera_tilt(),
+        "tilt_deg": tilt_deg,
         "focus_pwm": focus_pwm,
         "focus_pct": (round(focus_pct, 2) if focus_pct is not None else None),
         "focus_pwm_min": MAV_FOCUS_PWM_MIN,
@@ -3755,11 +3946,15 @@ _thrust_direction: str | None = None
 _thrust_deadline: float | None = None
 _thrust_pwm: int = Z_PWM_NEUTRAL
 _thrust_lock = threading.Lock()
-# Each /vehicle/thrust POST extends this many seconds into the future.
-# The frontend re-hits the route every ~200 ms while a button is held,
-# so a value slightly larger than the frontend cadence keeps the
-# override alive without letting a lost client run away.
-_THRUST_KEEPALIVE_S = 0.5
+# Rolling release watchdog. Every /vehicle/thrust POST pushes the deadline
+# this many seconds into the future; the frontend re-hits the route every
+# ~200 ms while a button is held, so a live hold keeps extending itself
+# indefinitely. If the posts stop -- released button, tab close, or a
+# flaky link that swallowed the stop -- the override falls back to neutral
+# within this window and AltHold retakes depth. 3 s tolerates a brief comms
+# gap without pinning the vehicle in descend the way the 651 s hold in the
+# towfish 00000061 log did.
+_THRUST_KEEPALIVE_S = 3.0
 _THRUST_REFRESH_HZ = 5.0
 
 
@@ -3905,11 +4100,16 @@ def vehicle_tilt_down():
 def vehicle_thrust():
     """Start / keep-alive a Z-axis RC override (depth jog).
 
-    Body: ``{"direction": "up"|"down"|"stop"}``. Each POST extends the
-    override lifetime by ``_THRUST_KEEPALIVE_S`` so if the frontend
-    stops sending (tab close, network glitch, released button), the
-    backend releases the override on its own within a short window and
-    AltHold takes back over.
+    Body: ``{"direction": "up"|"down"|"stop", "pwm": <optional int>}``.
+    Each POST extends the override lifetime by ``_THRUST_KEEPALIVE_S`` so
+    if the frontend stops sending (tab close, network glitch, released
+    button), the backend releases the override on its own within a short
+    window and AltHold takes back over.
+
+    ``pwm`` lets the operator tune the jog strength from the widget (how
+    hard to drive the vertical thrusters). It is clamped to
+    ``Z_PWM_MIN``..``Z_PWM_MAX``; when omitted the built-in
+    ascend/descend defaults are used.
     """
     global _thrust_direction, _thrust_deadline, _thrust_pwm
     data = request.get_json(silent=True) or {}
@@ -3921,7 +4121,16 @@ def vehicle_thrust():
         return jsonify({"success": False,
                         "message": "direction must be up/down/stop"}), 400
 
-    pwm = Z_PWM_ASCEND if direction == 'up' else Z_PWM_DESCEND
+    default_pwm = Z_PWM_ASCEND if direction == 'up' else Z_PWM_DESCEND
+    pwm = default_pwm
+    if data.get('pwm') is not None:
+        try:
+            pwm = int(round(float(data['pwm'])))
+        except (TypeError, ValueError):
+            return jsonify({"success": False,
+                            "message": "pwm must be numeric"}), 400
+    pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
+
     with _thrust_lock:
         _thrust_direction = direction
         _thrust_pwm = pwm
@@ -4528,6 +4737,279 @@ def transect_disable():
     except Exception as e:
         logger.exception("Error in /transect/disable")
         return jsonify({"success": False, "message": str(e)}), 500
+
+# ── Survey parameter checker ─────────────────────────────────────────────
+# Reads and writes are slow enough (a MAVLink round-trip per parameter,
+# retried on loss) that doing them inside a request would leave the page
+# hanging for tens of seconds against an unreachable boat. Instead one
+# background worker at a time owns the whole batch and the UI polls
+# /params for progress.
+_param_lock = threading.Lock()
+_param_readings = {}
+_param_links = {v: {"reachable": None, "checked_at": None}
+                for v in PARAM_VEHICLES}
+_param_job = {
+    "running": False,
+    "kind": None,
+    "total": 0,
+    "done": 0,
+    "current": None,
+    "started_at": None,
+    "finished_at": None,
+    "message": None,
+}
+_param_thread = None
+
+
+def _param_client(vehicle):
+    """Build a ParamClient aimed at one of the two vehicles.
+
+    The boat's URL is rebuilt per call because the operator can change
+    ``tow_vehicle_ip`` from this very page between batches.
+    """
+    if vehicle == "boat":
+        return ParamClient(f'http://{tow_vehicle_ip}/mavlink2rest')
+    return ParamClient(LOCAL_MAVLINK2REST_URL)
+
+
+def _param_matches(spec, current, target):
+    """Is the vehicle's value close enough to the target to call it set?
+
+    Parameters cross the wire as float32 and ArduPilot rounds integer
+    parameters, so an exact compare would flag correctly-set values as
+    mismatched. The tolerance is relative for large values and absolute
+    for ones near zero.
+    """
+    if current is None or target is None:
+        return None
+    return abs(float(current) - float(target)) <= max(1e-4,
+                                                      abs(float(target)) * 1e-3)
+
+
+def _param_snapshot():
+    """Assemble the /params payload under the lock."""
+    with _param_lock:
+        readings = dict(_param_readings)
+        job = dict(_param_job)
+        links = {k: dict(v) for k, v in _param_links.items()}
+    targets = dict(param_targets)
+
+    params = []
+    for spec in PARAM_SPECS:
+        name = spec["name"]
+        reading = readings.get(name, {})
+        current = reading.get("value")
+        target = targets.get(name)
+        params.append({
+            **{k: spec[k] for k in ("name", "vehicle", "unit", "decimals",
+                                    "min", "max", "desc")},
+            "presets": spec.get("presets"),
+            "default": spec["default"],
+            "target": target,
+            "current": current,
+            "matches": _param_matches(spec, current, target),
+            "read_at": reading.get("read_at"),
+            "error": reading.get("error"),
+        })
+    return {
+        "params": params,
+        "job": job,
+        "links": links,
+        "boat_url": f'http://{tow_vehicle_ip}/mavlink2rest',
+        "towfish_url": LOCAL_MAVLINK2REST_URL,
+    }
+
+
+def _param_record(name, value=None, error=None, param_type=None):
+    with _param_lock:
+        _param_readings[name] = {
+            "value": value,
+            "error": error,
+            "type": param_type,
+            "read_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def _param_job_update(**fields):
+    with _param_lock:
+        _param_job.update(fields)
+
+
+def _param_worker(kind, names):
+    """Run one check or apply batch across both vehicles.
+
+    Vehicles are grouped so each ParamClient is built once and its
+    reachability probed once; an unreachable vehicle short-circuits its
+    whole group instead of burning a multi-second timeout per parameter.
+    """
+    try:
+        by_vehicle = {}
+        for name in names:
+            spec = PARAM_SPECS_BY_NAME[name]
+            by_vehicle.setdefault(spec["vehicle"], []).append(name)
+
+        done = 0
+        failures = 0
+        for vehicle, vehicle_names in by_vehicle.items():
+            client = _param_client(vehicle)
+            reachable = client.is_reachable()
+            with _param_lock:
+                _param_links[vehicle] = {
+                    "reachable": reachable,
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            if not reachable:
+                label = "tow boat" if vehicle == "boat" else "towfish"
+                for name in vehicle_names:
+                    _param_record(name, error=f"{label} not responding")
+                    done += 1
+                    failures += 1
+                _param_job_update(done=done)
+                continue
+
+            for name in vehicle_names:
+                _param_job_update(current=name, done=done)
+                try:
+                    if kind == "apply":
+                        result = client.write(name, param_targets[name])
+                    else:
+                        result = client.read(name)
+                    _param_record(name, value=result.get("value"),
+                                  param_type=result.get("type"))
+                except ParamReadError as e:
+                    _param_record(name, error=str(e))
+                    failures += 1
+                except Exception as e:
+                    logger.warning("Parameter %s on %s failed: %s",
+                                   name, vehicle, e)
+                    _param_record(name, error=str(e))
+                    failures += 1
+                done += 1
+                _param_job_update(done=done)
+
+        verb = "Applied" if kind == "apply" else "Checked"
+        message = f"{verb} {done - failures}/{done} parameters"
+        if failures:
+            message += f" -- {failures} failed"
+        _param_job_update(message=message)
+    except Exception as e:
+        logger.error("Parameter %s batch crashed: %s", kind, e)
+        _param_job_update(message=f"Batch failed: {e}")
+    finally:
+        _param_job_update(running=False, current=None,
+                          finished_at=datetime.now().isoformat(timespec="seconds"))
+
+
+def _param_start_job(kind, names):
+    """Spawn the worker unless one is already running.
+
+    Returns ``(started, message)``.
+    """
+    global _param_thread
+    with _param_lock:
+        if _param_job["running"]:
+            return False, "A parameter operation is already running"
+        _param_job.update({
+            "running": True,
+            "kind": kind,
+            "total": len(names),
+            "done": 0,
+            "current": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "message": None,
+        })
+    _param_thread = threading.Thread(
+        target=_param_worker, args=(kind, names),
+        name=f"param-{kind}", daemon=True,
+    )
+    _param_thread.start()
+    return True, None
+
+
+def _param_names_from_request(data):
+    """Resolve a ``names``/``vehicles`` request body to a spec-name list.
+
+    An empty body means "everything", which is what both toolbar buttons
+    send.
+    """
+    names = data.get("names")
+    if names:
+        unknown = [n for n in names if n not in PARAM_SPECS_BY_NAME]
+        if unknown:
+            return None, f"Unknown parameter(s): {', '.join(unknown)}"
+        return list(names), None
+
+    vehicles = data.get("vehicles")
+    if vehicles:
+        unknown = [v for v in vehicles if v not in PARAM_VEHICLES]
+        if unknown:
+            return None, f"Unknown vehicle(s): {', '.join(unknown)}"
+        return [s["name"] for s in PARAM_SPECS
+                if s["vehicle"] in vehicles], None
+
+    return [s["name"] for s in PARAM_SPECS], None
+
+
+@app.route('/params', methods=['GET'])
+def params_state():
+    resp = jsonify(_param_snapshot())
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route('/params/targets', methods=['POST'])
+def params_set_targets():
+    """Persist operator-edited target values without touching a vehicle."""
+    global param_targets
+    data = request.get_json(silent=True) or {}
+    incoming = data.get("targets")
+    if not isinstance(incoming, dict) or not incoming:
+        return jsonify({"success": False,
+                        "message": "targets object required"}), 400
+
+    unknown = [n for n in incoming if n not in PARAM_SPECS_BY_NAME]
+    if unknown:
+        return jsonify({"success": False,
+                        "message": f"Unknown parameter(s): {', '.join(unknown)}"}), 400
+
+    merged = dict(param_targets)
+    merged.update(incoming)
+    param_targets = _sanitize_param_targets(merged)
+    _persist_config()
+    return jsonify({"success": True, "targets": param_targets})
+
+
+@app.route('/params/check', methods=['POST'])
+def params_check():
+    data = request.get_json(silent=True) or {}
+    names, error = _param_names_from_request(data)
+    if error:
+        return jsonify({"success": False, "message": error}), 400
+    started, message = _param_start_job("check", names)
+    if not started:
+        return jsonify({"success": False, "message": message}), 409
+    return jsonify({"success": True, "queued": len(names)})
+
+
+@app.route('/params/apply', methods=['POST'])
+def params_apply():
+    """Write the saved targets for the requested parameters.
+
+    Targets come from the persisted config rather than the request body,
+    so the UI has to save an edit before it can push it -- that keeps
+    what the operator sees on screen and what lands on the autopilot from
+    drifting apart.
+    """
+    data = request.get_json(silent=True) or {}
+    names, error = _param_names_from_request(data)
+    if error:
+        return jsonify({"success": False, "message": error}), 400
+    started, message = _param_start_job("apply", names)
+    if not started:
+        return jsonify({"success": False, "message": message}), 409
+    return jsonify({"success": True, "queued": len(names)})
+
 
 @app.route('/widget')
 def widget():

@@ -78,6 +78,11 @@ Z_CHANNEL = 3
 Z_PWM_ASCEND = 1600
 Z_PWM_DESCEND = 1400
 Z_PWM_NEUTRAL = 1500
+# Hard clamp for operator-adjustable jog PWM values coming from the
+# widget. Keeps a fat-fingered field entry from commanding full-scale
+# thrust; the RC input range on this frame is 1100..1900 us.
+Z_PWM_MIN = 1100
+Z_PWM_MAX = 1900
 
 
 class MavlinkWriter:

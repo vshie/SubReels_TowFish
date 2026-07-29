@@ -602,6 +602,43 @@
             letter-spacing: 0.18em;
             padding: 2px 4px;
         }
+
+        /* Depth-jog PWM tuning fields */
+        .jog-tune {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .jog-tune label {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            font-size: 9px;
+            letter-spacing: 0.16em;
+            color: var(--ink-dim);
+            background: var(--panel-inset);
+            border: 1px solid #14261d;
+            border-radius: 3px;
+            padding: 3px 6px;
+        }
+        .jog-tune input {
+            width: 52px;
+            background: #050807;
+            border: 1px solid #1c3a2a;
+            border-radius: 2px;
+            color: var(--amber);
+            font-family: inherit;
+            font-size: 12px;
+            text-align: center;
+            padding: 2px 0;
+        }
+        .jog-tune input:focus {
+            outline: none;
+            border-color: var(--amber);
+            box-shadow: 0 0 5px var(--amber-glow);
+        }
     </style>
 </head>
 <body>
@@ -688,6 +725,10 @@
                 <div class="row">
                     <button class="btn amber" id="thrustUpBtn">▲ UP</button>
                     <button class="btn amber" id="thrustDownBtn">▼ DOWN</button>
+                </div>
+                <div class="jog-tune">
+                    <label>UP µs <input type="number" id="jogUpPwm" min="1500" max="1900" step="10" value="1600"></label>
+                    <label>DN µs <input type="number" id="jogDownPwm" min="1100" max="1500" step="10" value="1400"></label>
                 </div>
                 <div class="hint" id="jogHint">RELEASE TO HAND OFF TO ALT_HOLD</div>
             </div>
@@ -960,34 +1001,68 @@ $('vehStabilizeBtn').addEventListener('click', () => postJson('/vehicle/mode', {
 $('vehAltHoldBtn').addEventListener('click',   () => postJson('/vehicle/mode', { mode: 'althold' }));
 $('tiltDownBtn').addEventListener('click',     () => postJson('/vehicle/tilt-down', {}));
 
+// Operator-tunable jog PWM. The field value is what gets sent to the
+// autopilot on RC3 while a button is held; persisted so a survey keeps
+// its tuning across reloads. Clamped to the same band the backend
+// enforces (1100..1900) with a direction-sane split around neutral (1500).
+function clampJog(v, direction) {
+    v = Math.round(Number(v));
+    if (!isFinite(v)) return direction === 'up' ? 1600 : 1400;
+    if (direction === 'up')   return Math.max(1501, Math.min(1900, v));
+    return Math.min(1499, Math.max(1100, v));
+}
+function jogPwmFor(direction) {
+    const el = direction === 'up' ? $('jogUpPwm') : $('jogDownPwm');
+    return clampJog(el.value, direction);
+}
+['jogUpPwm', 'jogDownPwm'].forEach(id => {
+    const el = $(id);
+    const dir = id === 'jogUpPwm' ? 'up' : 'down';
+    const saved = localStorage.getItem('towfish.' + id);
+    if (saved !== null) el.value = saved;
+    const commit = () => {
+        el.value = clampJog(el.value, dir);
+        localStorage.setItem('towfish.' + id, el.value);
+    };
+    el.addEventListener('change', commit);
+});
+
 // Hold-to-thrust: while pointer is down we ping /vehicle/thrust every
-// 200 ms with a keep-alive; on release we send /vehicle/thrust/stop.
-// The backend also times out on its own if the ping stops arriving.
+// 200 ms with a keep-alive carrying the tuned PWM; on release we send
+// /vehicle/thrust/stop. A live hold keeps refreshing the backend's 3 s
+// release watchdog, so the operator can hold as long as they like; the
+// moment posts stop (release, tab close, flaky link) the backend returns
+// RC3 to neutral within 3 s. Release is bound on `window` (not just the
+// button) so a pointer that drifts off or a swallowed pointerup on the
+// element still ends the hold.
 function bindHold(el, direction) {
     let active = false;
     let iv = null;
+    const stop = () => {
+        if (!active) return;
+        active = false;
+        el.classList.remove('held');
+        clearInterval(iv); iv = null;
+        postJson('/vehicle/thrust/stop', {});
+    };
     const start = (e) => {
         e.preventDefault();
         if (active) return;
         active = true;
         el.classList.add('held');
-        postJson('/vehicle/thrust', { direction });
-        iv = setInterval(() => postJson('/vehicle/thrust', { direction }), 200);
-    };
-    const stop = () => {
-        if (!active) return;
-        active = false;
-        el.classList.remove('held');
-        clearInterval(iv);
-        iv = null;
-        postJson('/vehicle/thrust/stop', {});
+        const send = () => postJson('/vehicle/thrust', { direction, pwm: jogPwmFor(direction) });
+        send();
+        iv = setInterval(send, 200);
     };
     el.addEventListener('pointerdown', start);
-    el.addEventListener('pointerup', stop);
+    // Release anywhere, not just on the button, so a pointer that drifts
+    // off or a swallowed pointerup can't leave the jog latched on.
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
     el.addEventListener('pointerleave', stop);
-    el.addEventListener('pointercancel', stop);
-    // Safety: release if the tab hides (user swipes away).
+    // Safety: release if the tab hides (user swipes away) or focus is lost.
     document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
+    window.addEventListener('blur', stop);
 }
 bindHold($('thrustUpBtn'), 'up');
 bindHold($('thrustDownBtn'), 'down');

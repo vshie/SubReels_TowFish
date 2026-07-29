@@ -3,1038 +3,1302 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Video Recorder</title>
-    <script defer src="/static/axios.min.js"></script>
+    <title>Towfish Setup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 20px auto;
-            padding: 0 20px;
-            background-color: white;
-            color: black;
-        }
-        
-        .status-container {
-            margin: 20px 0;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            background-color: white;
-        }
-        
-        .controls {
-            margin: 20px 0;
-        }
-        
-        .error {
-            color: red;
-            display: none;
-            margin: 10px 0;
-            padding: 10px;
-            background-color: #ffe6e6;
-            border: 1px solid #ff9999;
-            border-radius: 4px;
-        }
-        
-        #recordingStatus {
-            font-weight: bold;
-        }
-        
-        #recordingDuration {
-            font-family: monospace;
-            font-size: 1.2em;
-            margin-left: 10px;
-        }
-        
-        button {
-            padding: 8px 16px;
-            margin-right: 10px;
-            cursor: pointer;
-            border-radius: 4px;
-            border: 1px solid #ccc;
-            background-color: white;
-        }
-        
-        button:hover {
-            background-color: #f0f0f0;
-        }
-        
-        button:disabled {
-            background-color: #cccccc;
-            cursor: not-allowed;
-        }
-        
-        .recording {
-            color: red;
-            font-weight: bold;
-        }
-        
-        #videoList {
-            list-style: none;
-            padding: 0;
-        }
-        
-        #videoList li {
-            margin: 5px 0;
-            padding: 5px;
-            border-bottom: 1px solid #eee;
-        }
-        
-        #videoList a {
-            text-decoration: none;
-            color: #0066cc;
-        }
-        
-        #videoList a:hover {
-            text-decoration: underline;
-        }
-        
-        .input-group {
-            margin: 15px 0;
-        }
-        
-        .input-group label {
-            margin-right: 10px;
-        }
-        
-        .config-section {
-            margin: 15px 0;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            background-color: #f9f9f9;
+        :root {
+            --panel: #0d1310;
+            --panel-edge: #1f2a25;
+            --panel-inset: #060a08;
+            --bezel: #1a1e1c;
+            --bezel-highlight: #2a2e2c;
+            --phosphor: #7cf29c;
+            --phosphor-dim: #3f8a53;
+            --phosphor-glow: rgba(124, 242, 156, 0.35);
+            --amber: #f2b34c;
+            --amber-glow: rgba(242, 179, 76, 0.4);
+            --red: #ef5350;
+            --red-glow: rgba(239, 83, 80, 0.45);
+            --sky: #6ec6ff;
+            --sky-glow: rgba(110, 198, 255, 0.35);
+            --off: #4a5852;
+            --ink: #d7e5df;
+            --ink-dim: #8fa89d;
         }
 
-        .config-row {
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { min-height: 100%; }
+        body {
+            font-family: 'Share Tech Mono', ui-monospace, Menlo, Consolas, monospace;
+            color: var(--ink);
+            background:
+                radial-gradient(1400px 900px at 25% -10%, #0a1a15 0%, #050807 60%, #030503 100%);
+            background-attachment: fixed;
+            min-height: 100vh;
+            padding: 14px;
+            letter-spacing: 0.02em;
+        }
+
+        /* --- Console shell (same bezel + CRT screen as the MFD widget) --- */
+        .console {
+            width: 100%;
+            max-width: 1180px;
+            margin: 0 auto;
+            border-radius: 14px;
+            padding: 12px;
+            background:
+                linear-gradient(180deg, var(--bezel-highlight) 0%, var(--bezel) 4%, #111512 96%, #0b0d0c 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.05),
+                inset 0 -1px 0 rgba(0,0,0,0.4),
+                0 12px 30px rgba(0,0,0,0.65),
+                0 0 0 1px #050807;
+        }
+
+        .brand {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            padding: 2px 4px 8px 4px;
+        }
+        .brand .name {
+            font-family: 'Orbitron', 'Share Tech Mono', monospace;
+            font-weight: 800;
+            font-size: 14px;
+            letter-spacing: 0.34em;
+            color: var(--ink);
+            text-shadow: 0 0 6px rgba(215,229,223,0.15);
+        }
+        .brand .sub {
+            font-size: 10px;
+            letter-spacing: 0.3em;
+            color: var(--ink-dim);
+        }
+        .brand a {
+            color: var(--phosphor-dim);
+            text-decoration: none;
+            font-size: 10px;
+            letter-spacing: 0.24em;
+        }
+        .brand a:hover { color: var(--phosphor); text-shadow: 0 0 6px var(--phosphor-glow); }
+        .brand .spacer { flex: 1; }
+
+        .screen {
+            background:
+                radial-gradient(120% 90% at 50% 0%, #0d1a15 0%, #060a08 55%, #040705 100%);
+            border-radius: 8px;
+            border: 1px solid var(--panel-edge);
+            padding: 10px;
+            box-shadow:
+                inset 0 0 24px rgba(0,0,0,0.7),
+                inset 0 0 0 1px rgba(255,255,255,0.02);
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .screen::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                rgba(0,0,0,0.14) 0px,
+                rgba(0,0,0,0.14) 1px,
+                transparent 1px,
+                transparent 3px
+            );
+            pointer-events: none;
+            z-index: 2;
+        }
+        .screen > * { position: relative; z-index: 1; }
+
+        /* --- Header: square logo bay on the left, status to the right --- */
+        .head {
+            display: grid;
+            grid-template-columns: 178px 1fr;
+            gap: 10px;
+            align-items: start;
+        }
+        .logo-slot {
+            aspect-ratio: 1 / 1;
+            width: 100%;
+            background: var(--panel-inset);
+            border: 1px solid #16221c;
+            border-radius: 6px;
+            padding: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .logo-slot img {
+            display: block;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+        .logo-slot .placeholder {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            color: var(--off);
+            font-size: 10px;
+            letter-spacing: 0.3em;
+            text-align: center;
+        }
+        .logo-slot .placeholder .frame {
+            width: 54px;
+            height: 54px;
+            border: 1px dashed #22332b;
+            border-radius: 4px;
+        }
+        .logo-slot.empty img { display: none; }
+        .logo-slot.empty .placeholder { display: flex; }
+
+        .head-right {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        /* Status strip: lamps for recorder mode + both MAVLink links */
+        .strip {
             display: flex;
             align-items: center;
             gap: 8px;
             flex-wrap: wrap;
+            padding: 7px 8px;
+            background: var(--panel-inset);
+            border: 1px solid #0a120e;
+            border-radius: 6px;
+            font-size: 11px;
         }
-
-        .config-row label {
-            font-size: 0.9em;
-            color: #444;
+        .lamp {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 8px;
+            border-radius: 3px;
+            background: #050807;
+            border: 1px solid #0d1310;
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            color: var(--off);
             white-space: nowrap;
         }
-
-        .config-row input[type="text"] {
-            padding: 5px 8px;
-            border-radius: 4px;
-            border: 1px solid #ccc;
-            font-family: monospace;
-            font-size: 0.95em;
-            width: 160px;
+        .lamp .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--off);
+            flex-shrink: 0;
+        }
+        .lamp.ok { color: var(--phosphor); }
+        .lamp.ok .dot { background: var(--phosphor); box-shadow: 0 0 8px var(--phosphor-glow); }
+        .lamp.warn { color: var(--amber); }
+        .lamp.warn .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber-glow); animation: pulse 1.6s ease-in-out infinite; }
+        .lamp.bad { color: var(--red); }
+        .lamp.bad .dot { background: var(--red); box-shadow: 0 0 8px var(--red-glow); animation: pulse 1.6s ease-in-out infinite; }
+        .lamp.live { color: var(--sky); }
+        .lamp.live .dot { background: var(--sky); box-shadow: 0 0 8px var(--sky-glow); animation: pulse 1.2s infinite; }
+        .strip .spacer { flex: 1; }
+        .strip .clock {
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            letter-spacing: 0.18em;
         }
 
-        .config-row select {
-            padding: 5px 8px;
-            border-radius: 4px;
-            border: 1px solid #ccc;
-            font-size: 0.95em;
-        }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-        .config-row button {
-            padding: 5px 12px;
-            font-size: 0.85em;
-        }
-
-        .config-saved {
-            font-size: 0.85em;
-            color: #43a047;
-            opacity: 0;
-            transition: opacity 0.3s;
-        }
-
-        .config-saved.visible { opacity: 1; }
-
-        .timelapse-section {
-            margin: 15px 0;
+        /* --- Panels ------------------------------------------------------ */
+        .section {
+            background: linear-gradient(180deg, #0a1611 0%, #06100c 100%);
+            border: 1px solid #16221c;
+            border-radius: 6px;
             padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            background-color: #fff8e1;
         }
-        .timelapse-section h3 {
-            margin: 0 0 8px 0;
-            font-size: 1em;
-            color: #b26a00;
-        }
-        .timelapse-stats {
-            font-family: monospace;
-            font-size: 0.9em;
-            color: #555;
-            margin: 6px 0;
-        }
-        .transect-section {
-            margin-top: 20px;
-            padding: 12px;
-            background: #e3f2fd;
-            border-left: 4px solid #0288d1;
-            border-radius: 4px;
-        }
-        .transect-section h3 {
-            margin: 0 0 6px 0;
-            color: #01579b;
-            font-size: 1.05em;
-        }
-        .transect-stats {
-            font-family: monospace;
-            font-size: 0.9em;
-            color: #444;
-            margin-top: 6px;
-            white-space: pre-wrap;
-        }
-        button.btn-transect {
-            background: #0288d1;
-            margin-right: 8px;
-        }
-        button.btn-transect:hover:not(:disabled) {
-            background: #01579b;
-        }
-
-        button.btn-timelapse {
-            background-color: #fb8c00;
-            color: white;
-            border-color: #ef6c00;
-        }
-        button.btn-timelapse:hover:not(:disabled) {
-            background-color: #ef6c00;
-        }
-
-        .file-manager-wrapper {
-            width: 100vw;
-            position: relative;
-            left: 50%;
-            margin-left: -50vw;
-            box-sizing: border-box;
-        }
-        
-        input[type="number"] {
-            padding: 5px;
-            border-radius: 4px;
-            border: 1px solid #ccc;
-            background-color: white;
-        }
-        
-        .telemetry-container {
-            margin: 20px 0;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            background-color: #f9f9f9;
-        }
-        
-        .telemetry-title {
-            font-weight: bold;
-            margin-bottom: 10px;
-        }
-        
-        .telemetry-data {
+        .section-title {
+            font-size: 10px;
+            letter-spacing: 0.28em;
+            color: var(--ink-dim);
+            margin-bottom: 8px;
             display: flex;
             justify-content: space-between;
+            align-items: baseline;
+            gap: 10px;
             flex-wrap: wrap;
         }
-        
-        .telemetry-item {
-            flex: 1;
-            min-width: 120px;
-            margin: 5px;
-            padding: 8px;
-            background-color: white;
+        .section-title .aux {
+            color: var(--phosphor-dim);
+            letter-spacing: 0.14em;
+            font-size: 10px;
+        }
+        .head-right .section { flex: 1; }
+
+        /* Telemetry + storage readout cells */
+        .cells {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+            gap: 6px;
+        }
+        .cell {
+            background: #050807;
+            border: 1px solid #0d1310;
             border-radius: 4px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 6px 8px;
+            text-align: center;
+            min-width: 0;
         }
-        
-        .telemetry-item-label {
-            font-size: 0.9em;
-            color: #666;
+        .cell .label {
+            font-size: 9px;
+            letter-spacing: 0.26em;
+            color: var(--ink-dim);
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
-        
-        .telemetry-item-value {
-            font-size: 1.2em;
-            font-weight: bold;
+        .cell .value {
+            font: 700 16px 'Share Tech Mono', monospace;
+            letter-spacing: 0.08em;
+            color: var(--phosphor);
+            text-shadow: 0 0 6px var(--phosphor-glow);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .cell .value.dim { color: var(--ink-dim); text-shadow: none; }
+        /* A lat/lon pair needs more room than a single scalar readout. */
+        .cell.wide { grid-column: span 2; }
+        .cell.wide .value { font-size: 13px; }
+        .cell .value.sky { color: var(--sky); text-shadow: 0 0 6px var(--sky-glow); }
+        .cell .value.amber { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
+
+        .storage-line {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+            flex-wrap: wrap;
+            font-size: 11px;
+        }
+        .storage-line .primary {
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            letter-spacing: 0.12em;
+        }
+        .storage-line .primary.warn { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
+        .storage-line .aux { color: var(--ink-dim); font-size: 10px; letter-spacing: 0.1em; }
+        .hint {
+            color: var(--ink-dim);
+            font-size: 10px;
+            line-height: 1.6;
+            letter-spacing: 0.06em;
+            margin-top: 6px;
+        }
+        .hint code {
+            color: var(--phosphor-dim);
+            font-family: inherit;
+        }
+
+        /* --- Form controls ----------------------------------------------- */
+        .field-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 10px;
+        }
+        .field { min-width: 0; }
+        .field > label {
+            display: block;
+            font-size: 9px;
+            letter-spacing: 0.26em;
+            color: var(--ink-dim);
+            margin-bottom: 5px;
+        }
+        .field-row {
+            display: flex;
+            gap: 6px;
+            align-items: stretch;
+        }
+        input[type="text"], input[type="number"], select {
+            flex: 1;
+            min-width: 0;
+            background: #050807;
+            color: var(--phosphor);
+            border: 1px solid #0d1310;
+            border-radius: 4px;
+            padding: 7px 8px;
+            font: 700 12px 'Share Tech Mono', monospace;
+            letter-spacing: 0.1em;
+        }
+        input[type="text"]:focus, input[type="number"]:focus, select:focus {
+            outline: none;
+            border-color: #1f4a34;
+            box-shadow: 0 0 8px var(--phosphor-glow);
+        }
+        input.dirty { border-color: #4a3a16; color: var(--amber); }
+        select option { background: #050807; color: var(--phosphor); }
+        input[type="number"] { -moz-appearance: textfield; }
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+        .btn {
+            border: 1px solid #1a2621;
+            background: linear-gradient(180deg, #10201a 0%, #081611 100%);
+            color: var(--phosphor);
+            font: 700 11px 'Share Tech Mono', monospace;
+            letter-spacing: 0.2em;
+            padding: 7px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            transition: background 0.1s, box-shadow 0.1s, transform 0.05s;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.03),
+                inset 0 -1px 0 rgba(0,0,0,0.4);
+            user-select: none;
+            white-space: nowrap;
+        }
+        .btn:hover:not(:disabled) {
+            background: linear-gradient(180deg, #14291f 0%, #0b1c15 100%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--phosphor-glow);
+        }
+        .btn:active:not(:disabled) {
+            background: linear-gradient(180deg, #051009 0%, #030906 100%);
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.6), 0 0 10px var(--phosphor-glow);
+            transform: translateY(1px);
+        }
+        .btn:disabled { opacity: 0.35; cursor: not-allowed; text-shadow: none; }
+        .btn.amber { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); border-color: #3a2d12; }
+        .btn.amber:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--amber-glow); }
+        .btn.tiny { font-size: 10px; padding: 5px 8px; letter-spacing: 0.12em; }
+
+        .saved {
+            align-self: center;
+            font-size: 10px;
+            letter-spacing: 0.2em;
+            color: var(--phosphor);
+            text-shadow: 0 0 6px var(--phosphor-glow);
+            opacity: 0;
+            transition: opacity 0.25s;
+            white-space: nowrap;
+        }
+        .saved.visible { opacity: 1; }
+
+        /* --- Parameter checker ------------------------------------------- */
+        .param-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            padding: 7px 8px;
+            background: var(--panel-inset);
+            border: 1px solid #0a120e;
+            border-radius: 6px;
+            margin-bottom: 10px;
+        }
+        .param-toolbar .job {
+            flex: 1;
+            min-width: 160px;
+            font-size: 10px;
+            letter-spacing: 0.14em;
+            color: var(--ink-dim);
+        }
+        .param-toolbar .job.busy { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
+
+        .vehicle-group + .vehicle-group { margin-top: 12px; }
+        .vehicle-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            font-size: 10px;
+            letter-spacing: 0.26em;
+            color: var(--ink-dim);
+            padding-bottom: 6px;
+            margin-bottom: 8px;
+            border-bottom: 1px dashed #16221c;
+        }
+        .vehicle-head .title { color: var(--ink); letter-spacing: 0.3em; }
+
+        .param-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+            gap: 8px;
+        }
+        .pcard {
+            background: #050807;
+            border: 1px solid #0d1310;
+            border-radius: 5px;
+            padding: 9px 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 0;
+        }
+        .pcard.mismatch { border-color: #4a3a16; }
+        .pcard.error { border-color: #501313; }
+        .pcard-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .pcard-name {
+            font-weight: 700;
+            font-size: 12px;
+            letter-spacing: 0.14em;
+            color: var(--ink);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .badge {
+            font-size: 9px;
+            letter-spacing: 0.2em;
+            padding: 2px 7px;
+            border-radius: 3px;
+            border: 1px solid #16221c;
+            color: var(--off);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .badge.ok { color: var(--phosphor); border-color: #1f4a34; text-shadow: 0 0 6px var(--phosphor-glow); }
+        .badge.mismatch { color: var(--amber); border-color: #4a3a16; text-shadow: 0 0 6px var(--amber-glow); }
+        .badge.error { color: var(--red); border-color: #501313; }
+        .badge.busy { color: var(--sky); border-color: #143047; animation: pulse 1.2s infinite; }
+        .pcard-desc {
+            font-size: 10px;
+            line-height: 1.55;
+            color: var(--ink-dim);
+            letter-spacing: 0.04em;
+        }
+        .pcard-values {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            align-items: end;
+        }
+        .pcard-values .label {
+            font-size: 9px;
+            letter-spacing: 0.24em;
+            color: var(--ink-dim);
+            margin-bottom: 4px;
+        }
+        .pcard-current {
+            font: 700 16px 'Share Tech Mono', monospace;
+            letter-spacing: 0.08em;
+            color: var(--phosphor);
+            text-shadow: 0 0 6px var(--phosphor-glow);
+            padding-bottom: 2px;
+        }
+        .pcard-current.dim { color: var(--ink-dim); text-shadow: none; }
+        .pcard-current.mismatch { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
+        .pcard-current.error { color: var(--red); text-shadow: none; font-size: 11px; }
+        .pcard-current .unit { font-size: 10px; color: var(--ink-dim); text-shadow: none; margin-left: 3px; }
+        .pcard-target { display: flex; gap: 5px; align-items: center; }
+        .pcard-target .unit {
+            font-size: 10px;
+            color: var(--ink-dim);
+            letter-spacing: 0.1em;
+            white-space: nowrap;
+        }
+        .pcard-actions {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .pcard-actions .presets { display: flex; gap: 4px; flex-wrap: wrap; }
+        .pcard-actions .spacer { flex: 1; }
+        .btn.preset {
+            font-size: 10px;
+            padding: 4px 7px;
+            letter-spacing: 0.06em;
+            color: var(--phosphor-dim);
+            text-shadow: none;
+        }
+        .btn.preset.selected {
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            box-shadow: inset 0 0 0 1px #1f4a34, 0 0 6px var(--phosphor-glow);
+        }
+
+        /* --- File browser -------------------------------------------------- */
+        .browser-frame {
+            width: 100%;
+            height: 620px;
+            border: 1px solid #0d1310;
+            border-radius: 5px;
+            background: #050807;
+            display: block;
+        }
+
+        /* --- Error banner --------------------------------------------------- */
+        .error-box {
+            display: none;
+            background: #2b0808;
+            border: 1px solid #501313;
+            color: #ffb4b4;
+            border-radius: 5px;
+            padding: 8px 10px;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+        }
+        .error-box.visible { display: block; }
+
+        @media (max-width: 720px) {
+            .head { grid-template-columns: 1fr; }
+            .logo-slot { aspect-ratio: auto; height: 120px; max-width: 160px; }
         }
     </style>
 </head>
 <body>
-    <h1>Video Recorder</h1>
-    <div style="margin-bottom: 15px; color: #666;">
-        <p>Using RTSP H.264 endpoint: <strong id="cameraEndpoint">Loading...</strong></p>
-    </div>
-    <div class="config-section">
-        <div class="config-row">
-            <label for="towVehicleIp">Tow Vehicle IP:</label>
-            <input type="text" id="towVehicleIp" placeholder="192.168.2.12">
-            <button onclick="saveTowVehicleIp()">Save</button>
-            <span class="config-saved" id="configSaved">Saved</span>
-        </div>
-        <div class="config-row" style="margin-top: 8px;">
-            <label for="streamProtocol">Stream Transport:</label>
-            <select id="streamProtocol" autocomplete="off" onchange="saveStreamProtocol()">
-                <option value="udp">UDP (default)</option>
-                <option value="tcp">TCP (RTP over RTSP)</option>
-            </select>
-            <span class="config-saved" id="protocolSaved">Saved</span>
-        </div>
-        <div class="config-row" style="margin-top: 8px;">
-            <label for="containerFormat">Container Format:</label>
-            <select id="containerFormat" autocomplete="off" onchange="saveContainerFormat()">
-                <option value="mp4">MP4 (fragmented)</option>
-                <option value="mpegts">MPEG-TS (power-cut safe)</option>
-            </select>
-            <span class="config-saved" id="formatSaved">Saved</span>
-        </div>
-        <div class="config-row" style="margin-top: 8px;">
-            <label for="snapshotUrl">Snapshot URL:</label>
-            <input type="text" id="snapshotUrl" placeholder="http://192.168.2.10/cgi-bin/onesnap.cgi" style="width: 320px;">
-            <button onclick="saveSnapshotUrl()">Save</button>
-            <span class="config-saved" id="snapshotSaved">Saved</span>
-        </div>
-        <div class="config-row" style="margin-top: 8px;">
-            <label for="storagePreference">Recording Storage:</label>
-            <select id="storagePreference" autocomplete="off" onchange="saveStoragePreference()">
-                <option value="usb">USB drive (preferred)</option>
-                <option value="local">Local SD only</option>
-            </select>
-            <span class="config-saved" id="storageSaved">Saved</span>
-        </div>
+<div class="console">
+    <div class="brand">
+        <span class="name">TOWFISH</span>
+        <span class="sub">SETUP CONSOLE</span>
+        <span class="spacer"></span>
+        <a href="/widget" target="_blank">OPEN MFD WIDGET &rsaquo;</a>
     </div>
 
-    <!-- Storage status card. Rendered from /status.usb_storage; tells the
-         operator whether the active recording is going to USB or to the
-         internal extension volume, and why. -->
-    <div class="config-section" id="storageCard" style="margin-top: 8px;">
-        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <strong id="storageLabel">Storage: --</strong>
-            <span class="mono" id="storageFree" style="color: #555; font-size: 0.9em;"></span>
-            <span class="mono" id="storageDevice" style="color: #888; font-size: 0.85em;"></span>
-        </div>
-        <div id="storageDetail" style="color: #555; font-size: 0.85em; margin-top: 4px;"></div>
-    </div>
-    <div class="status-container">
-        <p>Status: <span id="recordingStatus">Stopped</span><span id="recordingTime" style="display: none;"></span></p>
-    </div>
-    
-    <!-- Telemetry Panel -->
-    <div class="telemetry-container">
-        <div class="telemetry-title">Live Telemetry</div>
-        <div class="telemetry-data">
-            <div class="telemetry-item">
-                <div class="telemetry-item-label">Depth</div>
-                <div class="telemetry-item-value" id="telemetryDepth">--</div>
+    <div class="screen">
+        <div class="error-box" id="errorBox"></div>
+
+        <!-- Header: square logo bay, status + telemetry to its right -->
+        <div class="head">
+            <!-- Drop a square logo into app/static/ as logo.png, .svg, .jpg
+                 or .webp to fill this bay; until then it shows a placeholder. -->
+            <div class="logo-slot empty" id="logoSlot">
+                <img id="brandLogo" alt="">
+                <div class="placeholder">
+                    <div class="frame"></div>
+                    <span>LOGO</span>
+                </div>
             </div>
-            <div class="telemetry-item">
-                <div class="telemetry-item-label">Climb Rate</div>
-                <div class="telemetry-item-value" id="telemetryClimb">--</div>
-            </div>
-            <div class="telemetry-item">
-                <div class="telemetry-item-label">Temperature</div>
-                <div class="telemetry-item-value" id="telemetryTemp">--</div>
-            </div>
-            <div class="telemetry-item">
-                <div class="telemetry-item-label">Lights</div>
-                <div class="telemetry-item-value" id="telemetryLights">--</div>
-            </div>
-            <div class="telemetry-item">
-                <div class="telemetry-item-label">Time</div>
-                <div class="telemetry-item-value" id="telemetryTime">--</div>
+
+            <div class="head-right">
+                <div class="strip">
+                    <span class="lamp" id="lampRecorder"><span class="dot"></span><span class="text">RECORDER</span></span>
+                    <span class="lamp" id="lampTowfish"><span class="dot"></span><span class="text">TOWFISH</span></span>
+                    <span class="lamp" id="lampBoat"><span class="dot"></span><span class="text">TOW BOAT</span></span>
+                    <span class="spacer"></span>
+                    <span class="clock" id="headClock">--:--:--</span>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">
+                        <span>STORAGE</span>
+                        <span class="aux" id="storageDevice"></span>
+                    </div>
+                    <div class="storage-line">
+                        <span class="primary" id="storagePrimary">--</span>
+                        <span class="aux" id="storageFree"></span>
+                    </div>
+                    <div class="hint" id="storageDetail"></div>
+                </div>
+
+                <div class="section">
+                    <div class="section-title">
+                        <span>LIVE TELEMETRY</span>
+                        <span class="aux" id="telemetryAge">--</span>
+                    </div>
+                    <div class="cells">
+                        <div class="cell">
+                            <div class="label">DEPTH</div>
+                            <div class="value sky" id="telDepth">--</div>
+                        </div>
+                        <div class="cell">
+                            <div class="label">CLIMB</div>
+                            <div class="value" id="telClimb">--</div>
+                        </div>
+                        <div class="cell">
+                            <div class="label">TEMP</div>
+                            <div class="value" id="telTemp">--</div>
+                        </div>
+                        <div class="cell">
+                            <div class="label">LIGHTS</div>
+                            <div class="value" id="telLights">--</div>
+                        </div>
+                        <div class="cell">
+                            <div class="label">HEADING</div>
+                            <div class="value" id="telHeading">--</div>
+                        </div>
+                        <div class="cell wide">
+                            <div class="label">BOAT GPS</div>
+                            <div class="value" id="telGps">--</div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
-    </div>
 
-    <div class="error" id="errorMessage"></div>
-    
-    <div class="controls">
-        <button id="startButton" onclick="startRecording()">Start Recording</button>
-        <button id="stopButton" onclick="stopRecording()" disabled>Stop Recording</button>
-    </div>
+        <!-- Configuration -->
+        <div class="section">
+            <div class="section-title">
+                <span>CONFIGURATION</span>
+                <span class="aux" id="rtspEndpoint"></span>
+            </div>
+            <div class="field-grid">
+                <div class="field">
+                    <label for="towVehicleIp">TOW VEHICLE IP</label>
+                    <div class="field-row">
+                        <input type="text" id="towVehicleIp" placeholder="192.168.2.12" autocomplete="off">
+                        <button class="btn" id="towIpSave">SAVE</button>
+                        <span class="saved" id="towIpSaved">OK</span>
+                    </div>
+                    <div class="hint">BlueBoat address used for mission state, GPS, Ping sonar and tow-boat parameters.</div>
+                </div>
 
-    <div class="timelapse-section">
-        <h3>Timelapse (2 Hz HTTP Snapshots)</h3>
-        <p style="font-size: 0.9em; color: #555; margin-bottom: 8px;">
-            Mutually exclusive with video recording. Captures one JPEG every 500&nbsp;ms
-            from the camera's snapshot CGI and writes them to <code>timelapse_&lt;timestamp&gt;/</code>
-            with a <code>telemetry.csv</code> sidecar so each frame is geotaggable.
-        </p>
-        <div class="controls">
-            <button id="timelapseStartBtn" class="btn-timelapse" onclick="startTimelapse()">Start Timelapse</button>
-            <button id="timelapseStopBtn" class="btn-timelapse" onclick="stopTimelapse()" disabled>Stop Timelapse</button>
+                <div class="field">
+                    <label for="storagePreference">RECORDING STORAGE</label>
+                    <div class="field-row">
+                        <select id="storagePreference" autocomplete="off">
+                            <option value="usb">USB DRIVE (PREFERRED)</option>
+                            <option value="local">LOCAL SD ONLY</option>
+                        </select>
+                        <span class="saved" id="storageSaved">OK</span>
+                    </div>
+                    <div class="hint">USB falls back to the local SD automatically if the drive is missing or nearly full.</div>
+                </div>
+
+                <div class="field">
+                    <label for="streamProtocol">STREAM TRANSPORT</label>
+                    <div class="field-row">
+                        <select id="streamProtocol" autocomplete="off">
+                            <option value="udp">UDP (DEFAULT)</option>
+                            <option value="tcp">TCP (RTP OVER RTSP)</option>
+                        </select>
+                        <span class="saved" id="protocolSaved">OK</span>
+                    </div>
+                    <div class="hint">Switch to TCP if the RTSP feed shows tearing or dropped frames.</div>
+                </div>
+
+                <div class="field">
+                    <label for="snapshotUrl">SNAPSHOT URL</label>
+                    <div class="field-row">
+                        <input type="text" id="snapshotUrl" placeholder="http://192.168.2.10/cgi-bin/onesnap.cgi" autocomplete="off">
+                        <button class="btn" id="snapshotSave">SAVE</button>
+                        <span class="saved" id="snapshotSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Set the camera to maximum quality before a survey: RadCam at
+                        <code>192.168.2.10</code> (<code>admin</code> / <code>blue</code>) &rsaquo;
+                        Configuration &rsaquo; Video &amp; Audio &rsaquo; resolution
+                        <code>3840&times;2160</code>, coding quality all the way right.
+                    </div>
+                </div>
+            </div>
         </div>
-        <div class="timelapse-stats" id="timelapseStats">Idle</div>
-    </div>
 
-    <div class="transect-section">
-        <h3>Transect Auto (mavlink-triggered .ts segments)</h3>
-        <p style="font-size: 0.9em; color: #555; margin-bottom: 8px;">
-            When enabled, the recorder polls the tow vehicle's mission state via
-            <code>mavlink2rest</code> and produces one <code>.ts</code> file per waypoint leg.
-            The RTSP pipeline stays alive across leg boundaries (rolled via
-            <code>splitmuxsink split-now</code> at each <code>MISSION_CURRENT.seq</code> change),
-            so the only "missing" footage is the few hundred ms the muxer needs to rotate at
-            an IDR boundary. Per-leg metadata (start/end GPS, heading, <code>wp_dist</code>) is
-            written to a sibling <code>transect_&lt;TS&gt;_manifest.ndjson</code>.
-            Mutually exclusive with manual recording and timelapse.
-        </p>
-        <div class="config-row" style="margin-bottom: 8px;">
-            <label for="transectCaptureType">Capture as:</label>
-            <select id="transectCaptureType" autocomplete="off" onchange="saveTransectCaptureType()">
-                <option value="video">Video (.ts per leg)</option>
-                <option value="timelapse">Images (2 Hz JPEG per leg)</option>
-            </select>
-            <span class="config-saved" id="captureTypeSaved">Saved</span>
+        <!-- Parameter checker -->
+        <div class="section">
+            <div class="section-title">
+                <span>SURVEY PARAMETERS</span>
+                <span class="aux">EDIT A TARGET, THEN APPLY TO WRITE IT TO THE AUTOPILOT</span>
+            </div>
+
+            <div class="param-toolbar">
+                <button class="btn" id="paramCheckAll">CHECK ALL</button>
+                <button class="btn amber" id="paramApplyAll">APPLY MISMATCHED</button>
+                <button class="btn tiny" id="paramResetDefaults">RESET TARGETS TO DEFAULTS</button>
+                <span class="job" id="paramJob">Not checked yet</span>
+            </div>
+
+            <div id="paramGroups"></div>
         </div>
-        <div class="controls">
-            <button id="transectEnableBtn"  class="btn-transect" onclick="enableTransect()">Enable Transect Auto</button>
-            <button id="transectDisableBtn" class="btn-transect" onclick="disableTransect()" disabled>Disable Transect Auto</button>
+
+        <!-- File browser -->
+        <div class="section">
+            <div class="section-title">
+                <span>FILE BROWSER</span>
+                <span class="aux" id="browserPath"></span>
+            </div>
+            <iframe class="browser-frame" id="fileBrowser" title="Recordings file browser"></iframe>
         </div>
-        <div class="transect-stats" id="transectStats">Disabled</div>
     </div>
-
-    <h2>Recorded Videos</h2>
-    <ul id="videoList"></ul>
-
-    <h2>Timelapse Sessions</h2>
-    <ul id="timelapseList"></ul>
-
-    <!-- Iframe to embed the BlueOS file browser -->
-    <div class="file-manager-wrapper">
-        <iframe src="" style="width: 100%; height: 600px; border: none;"></iframe>
-    </div>
+</div>
 
 <script>
-let recordingTimer;
-let startTime;
-let fileListTimer;
-let telemetryTimer;
-let statusCheckTimer;
+// ── Small helpers ────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
 
-async function startRecording() {
-    try {
-        const response = await axios.get('/start');
-        if (response.data.success) {
-            document.getElementById("errorMessage").style.display = "none";
-            updateUIToRecording();
-        } else {
-            document.getElementById("errorMessage").textContent = response.data.message || "Failed to start recording";
-            document.getElementById("errorMessage").style.display = "block";
-        }
-    } catch (error) {
-        document.getElementById("errorMessage").textContent = error.response?.data?.message || "An unknown error occurred";
-        document.getElementById("errorMessage").style.display = "block";
+async function getJson(url) {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+async function postJson(url, body) {
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* empty body is fine */ }
+    if (!res.ok || data.success === false) {
+        throw new Error(data.message || `HTTP ${res.status}`);
     }
+    return data;
 }
 
-async function stopRecording() {
+function showError(message) {
+    const box = $('errorBox');
+    box.textContent = message;
+    box.classList.add('visible');
+}
+
+function clearError() {
+    $('errorBox').classList.remove('visible');
+}
+
+function flashSaved(id) {
+    const badge = $(id);
+    badge.classList.add('visible');
+    setTimeout(() => badge.classList.remove('visible'), 1800);
+}
+
+function setLamp(id, state, text) {
+    const lamp = $(id);
+    lamp.className = 'lamp' + (state ? ' ' + state : '');
+    lamp.querySelector('.text').textContent = text;
+}
+
+function fmt(value, decimals) {
+    if (value === null || value === undefined || Number.isNaN(value)) return '--';
+    return Number(value).toFixed(decimals);
+}
+
+// ── Status / storage / telemetry ─────────────────────────────────────────
+// This page is setup-only: recording is driven from the MFD widget, so the
+// mode lamp here is a read-only indication of what the recorder is doing.
+const MODE_LAMPS = {
+    idle: ['ok', 'RECORDER IDLE'],
+    video: ['live', 'RECORDING VIDEO'],
+    timelapse: ['live', 'TIMELAPSE'],
+    transect: ['live', 'TRANSECT AUTO'],
+};
+
+async function refreshStatus() {
+    let data;
     try {
-        const response = await axios.get('/stop');
-        if (response.data.success) {
-            document.getElementById("errorMessage").style.display = "none";
-            updateUIToStopped();
-            await fetchVideos();
-        }
-    } catch (error) {
-        document.getElementById("errorMessage").textContent = error.response?.data?.error || "An unknown error occurred";
-        document.getElementById("errorMessage").style.display = "block";
-    }
-}
-
-// New function to update UI when recording starts
-function updateUIToRecording() {
-    document.getElementById("recordingStatus").textContent = "Recording";
-    document.getElementById("recordingStatus").className = "recording";
-    document.getElementById("startButton").disabled = true;
-    document.getElementById("stopButton").disabled = false;
-    document.getElementById("containerFormat").disabled = true;
-    document.getElementById("streamProtocol").disabled = true;
-    document.getElementById("storagePreference").disabled = true;
-    // Mutually exclusive with timelapse and transect-auto.
-    document.getElementById("timelapseStartBtn").disabled = true;
-    document.getElementById("transectEnableBtn").disabled = true;
-    document.getElementById("transectCaptureType").disabled = true;
-
-    startTime = new Date();
-    document.getElementById("recordingTime").style.display = "inline";
-    clearInterval(recordingTimer);
-    recordingTimer = setInterval(updateRecordingTime, 1000);
-    
-    // Start more frequent telemetry updates when recording
-    clearInterval(telemetryTimer);
-    telemetryTimer = setInterval(fetchTelemetry, 1000);
-}
-
-// New function to update UI when recording stops
-function updateUIToStopped() {
-    document.getElementById("recordingStatus").textContent = "Stopped";
-    document.getElementById("recordingStatus").className = "";
-    document.getElementById("startButton").disabled = false;
-    document.getElementById("stopButton").disabled = true;
-    document.getElementById("containerFormat").disabled = false;
-    document.getElementById("streamProtocol").disabled = false;
-    document.getElementById("storagePreference").disabled = false;
-    document.getElementById("timelapseStartBtn").disabled = false;
-    document.getElementById("transectEnableBtn").disabled = false;
-    document.getElementById("transectCaptureType").disabled = false;
-
-    clearInterval(recordingTimer);
-    document.getElementById("recordingTime").style.display = "none";
-    
-    // Slow down telemetry updates when not recording
-    clearInterval(telemetryTimer);
-    telemetryTimer = setInterval(fetchTelemetry, 5000);
-}
-
-async function startTimelapse() {
-    try {
-        const res = await axios.get('/timelapse/start');
-        if (res.data.success) {
-            document.getElementById("errorMessage").style.display = "none";
-            updateUIToTimelapse();
-        } else {
-            document.getElementById("errorMessage").textContent = res.data.message || "Failed to start timelapse";
-            document.getElementById("errorMessage").style.display = "block";
-        }
+        data = await getJson('/status');
     } catch (e) {
-        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Timelapse error";
-        document.getElementById("errorMessage").style.display = "block";
+        setLamp('lampRecorder', 'bad', 'RECORDER OFFLINE');
+        return;
     }
-}
 
-async function stopTimelapse() {
-    try {
-        const res = await axios.get('/timelapse/stop');
-        if (res.data.success) {
-            document.getElementById("errorMessage").style.display = "none";
-            updateUIToIdle();
-            await fetchVideos();
-        }
-    } catch (e) {
-        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Timelapse stop error";
-        document.getElementById("errorMessage").style.display = "block";
+    const [state, label] = MODE_LAMPS[data.mode] || ['warn', String(data.mode || '?').toUpperCase()];
+    setLamp('lampRecorder', data.health === 'failed' ? 'bad' : state, label);
+
+    if (data.rtsp_endpoint) $('rtspEndpoint').textContent = data.rtsp_endpoint;
+
+    // Keep the dropdowns in sync with the server unless the operator is
+    // mid-interaction with one of them.
+    for (const [id, key] of [['storagePreference', 'storage_preference'],
+                             ['streamProtocol', 'stream_protocol']]) {
+        const el = $(id);
+        if (data[key] && el !== document.activeElement) el.value = data[key];
     }
+
+    renderStorage(data);
 }
 
-function updateUIToTimelapse() {
-    document.getElementById("recordingStatus").textContent = "Timelapse";
-    document.getElementById("recordingStatus").className = "recording";
-    document.getElementById("startButton").disabled = true;
-    document.getElementById("stopButton").disabled = true;
-    document.getElementById("timelapseStartBtn").disabled = true;
-    document.getElementById("timelapseStopBtn").disabled = false;
-    document.getElementById("transectEnableBtn").disabled = true;
-    document.getElementById("transectCaptureType").disabled = true;
-    document.getElementById("containerFormat").disabled = true;
-    document.getElementById("streamProtocol").disabled = true;
-    document.getElementById("storagePreference").disabled = true;
-}
-
-function updateUIToIdle() {
-    document.getElementById("recordingStatus").textContent = "Stopped";
-    document.getElementById("recordingStatus").className = "";
-    document.getElementById("startButton").disabled = false;
-    document.getElementById("stopButton").disabled = true;
-    document.getElementById("timelapseStartBtn").disabled = false;
-    document.getElementById("timelapseStopBtn").disabled = true;
-    document.getElementById("transectEnableBtn").disabled = false;
-    document.getElementById("transectDisableBtn").disabled = true;
-    document.getElementById("transectCaptureType").disabled = false;
-    document.getElementById("containerFormat").disabled = false;
-    document.getElementById("streamProtocol").disabled = false;
-    document.getElementById("storagePreference").disabled = false;
-    document.getElementById("timelapseStats").textContent = "Idle";
-    clearInterval(recordingTimer);
-    document.getElementById("recordingTime").style.display = "none";
-}
-
-// ── Transect Auto ────────────────────────────────────────────────────────
-async function enableTransect() {
-    try {
-        const res = await axios.get('/transect/enable');
-        if (res.data.success) {
-            document.getElementById("errorMessage").style.display = "none";
-            updateUIToTransectArmed();
-        } else {
-            document.getElementById("errorMessage").textContent = res.data.message || "Failed to enable transect";
-            document.getElementById("errorMessage").style.display = "block";
-        }
-    } catch (e) {
-        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Transect enable error";
-        document.getElementById("errorMessage").style.display = "block";
-    }
-}
-
-async function disableTransect() {
-    try {
-        const res = await axios.get('/transect/disable');
-        if (res.data.success) {
-            document.getElementById("errorMessage").style.display = "none";
-            updateUIToIdle();
-            document.getElementById("transectEnableBtn").disabled = false;
-            document.getElementById("transectDisableBtn").disabled = true;
-            document.getElementById("transectStats").textContent = "Disabled";
-            await fetchVideos();
-        }
-    } catch (e) {
-        document.getElementById("errorMessage").textContent = e.response?.data?.message || "Transect disable error";
-        document.getElementById("errorMessage").style.display = "block";
-    }
-}
-
-// "Armed" = monitor enabled (state == waiting or recording). Locks the
-// manual recording / timelapse buttons since the modes are mutually
-// exclusive; lets the user only disable the monitor.
-function updateUIToTransectArmed() {
-    document.getElementById("recordingStatus").textContent = "Transect Auto";
-    document.getElementById("recordingStatus").className = "recording";
-    document.getElementById("startButton").disabled = true;
-    document.getElementById("stopButton").disabled = true;
-    document.getElementById("timelapseStartBtn").disabled = true;
-    document.getElementById("timelapseStopBtn").disabled = true;
-    document.getElementById("transectEnableBtn").disabled = true;
-    document.getElementById("transectDisableBtn").disabled = false;
-    document.getElementById("transectCaptureType").disabled = true;
-    document.getElementById("containerFormat").disabled = true;
-    document.getElementById("streamProtocol").disabled = true;
-    document.getElementById("storagePreference").disabled = true;
-}
-
-function updateRecordingTime() {
-    const now = new Date();
-    const diff = now - startTime;
-    const hours = Math.floor(diff / 3600000);
-    const minutes = Math.floor((diff % 3600000) / 60000);
-    const seconds = Math.floor((diff % 60000) / 1000);
-    const timeString = ` (${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')})`;
-    document.getElementById("recordingTime").innerText = timeString;
-}
-
-// New function to check recording status from the server
-async function checkRecordingStatus() {
-    try {
-        const response = await axios.get('/status');
-        const serverMode = response.data.mode || (response.data.recording ? 'video' : 'idle');
-        const currentLabel = document.getElementById("recordingStatus").textContent;
-        const endpoint = response.data.rtsp_endpoint;
-        if (endpoint) {
-            document.getElementById("cameraEndpoint").textContent = endpoint;
-        }
-
-        // Keep dropdowns in sync with server
-        const fmtSelect = document.getElementById("containerFormat");
-        if (response.data.container_format && fmtSelect !== document.activeElement) {
-            fmtSelect.value = response.data.container_format;
-        }
-        const protoSelect = document.getElementById("streamProtocol");
-        if (response.data.stream_protocol && protoSelect !== document.activeElement) {
-            protoSelect.value = response.data.stream_protocol;
-        }
-        const storageSelect = document.getElementById("storagePreference");
-        if (response.data.storage_preference && storageSelect !== document.activeElement) {
-            storageSelect.value = response.data.storage_preference;
-        }
-
-        // Always refresh the storage card so the operator sees mount /
-        // free-space / failover state in real time.
-        try { renderStorageCard(response.data); } catch (e) { /* tolerate */ }
-
-        const tx = response.data.transect;
-        const transectOwned = !!(tx && tx.enabled);
-
-        if (serverMode === 'video' && !transectOwned) {
-            if (currentLabel !== "Recording") {
-                console.log("Detected recording started");
-                if (response.data.duration_seconds > 0) {
-                    startTime = new Date(Date.now() - response.data.duration_seconds * 1000);
-                } else {
-                    startTime = new Date();
-                }
-                updateUIToRecording();
-            }
-        } else if (serverMode === 'timelapse') {
-            if (currentLabel !== "Timelapse") {
-                console.log("Detected timelapse started");
-                updateUIToTimelapse();
-            }
-        } else if (transectOwned) {
-            // Cover both states: 'waiting' (monitor armed, no leg yet)
-            // and 'recording' (monitor has spun up a session). Both lock
-            // the manual buttons identically.
-            if (currentLabel !== "Transect Auto") {
-                console.log("Detected transect monitor armed");
-                updateUIToTransectArmed();
-            }
-        } else {
-            if (currentLabel === "Recording" || currentLabel === "Timelapse"
-                    || currentLabel === "Transect Auto") {
-                console.log("Mode returned to idle");
-                updateUIToIdle();
-                document.getElementById("transectEnableBtn").disabled = false;
-                document.getElementById("transectDisableBtn").disabled = true;
-                document.getElementById("transectStats").textContent = "Disabled";
-                await fetchVideos();
-            }
-        }
-
-        // Transect status line: state + mission seq + leg count +
-        // wp_dist + AUTO/armed flags + last event so the operator can
-        // see what's happening at a glance.
-        if (tx) {
-            if (tx.enabled) {
-                const cap = tx.capture_type || tx.configured_capture_type || 'video';
-                const parts = [`state: ${tx.state}`, `capture: ${cap === 'timelapse' ? 'images' : 'video'}`];
-                if (tx.mission_seq !== null && tx.mission_seq !== undefined) {
-                    parts.push(`seq: ${tx.mission_seq}`);
-                }
-                if (tx.leg_count) parts.push(`legs: ${tx.leg_count}`);
-                if (typeof tx.leg_images === 'number') parts.push(`imgs: ${tx.leg_images}`);
-                if (typeof tx.wp_dist === 'number' && tx.wp_dist > 0) {
-                    parts.push(`wp_dist: ${tx.wp_dist.toFixed(1)} m`);
-                }
-                if (typeof tx.groundspeed === 'number') {
-                    parts.push(`spd: ${tx.groundspeed.toFixed(2)} m/s`);
-                }
-                const flags = [];
-                if (tx.mode_num !== 10) flags.push(`mode=${tx.mode_num}`);
-                if (tx.armed === false) flags.push('disarmed');
-                if (flags.length) parts.push(flags.join(' '));
-                let line = parts.join(' · ');
-                if (tx.last_event) line += `\nlast: ${tx.last_event}`;
-                if (tx.current_leg_file) line += `\n${cap === 'timelapse' ? 'leg' : 'file'}: ${tx.current_leg_file}`;
-                document.getElementById("transectStats").textContent = line;
-            } else {
-                document.getElementById("transectStats").textContent = "Disabled";
-            }
-        }
-
-        // Refresh timelapse stats line whenever timelapse data is present.
-        const tl = response.data.timelapse;
-        if (tl) {
-            const last = tl.last_snap_path ? ` last: ${tl.last_snap_path}` : '';
-            // Surface snap-vs-GPS sync skew alongside snap counts so
-            // a configurator can spot mavlink2rest going sluggish
-            // without scraping telemetry.csv after the dive.
-            let skewStr = '';
-            if (typeof tl.last_sync_skew_ms === 'number' && tl.last_sync_skew_ms >= 0) {
-                skewStr = ` · sync: ${tl.last_sync_skew_ms.toFixed(0)} ms`;
-            }
-            const stats = serverMode === 'timelapse'
-                ? `snaps: ${tl.snap_count} · misses: ${tl.miss_count}${skewStr}${last}`
-                : (tl.snap_count > 0 ? `last session snaps: ${tl.snap_count}` : 'Idle');
-            document.getElementById("timelapseStats").textContent = stats;
-        }
-    } catch (error) {
-        console.error("Error checking recording status:", error);
-    }
-}
-
-async function fetchTelemetry() {
-    try {
-        console.log("Fetching telemetry data...");
-        const response = await axios.get('/telemetry');
-        console.log("Telemetry response:", response.data);
-        
-        if (response.data.success) {
-            document.getElementById("telemetryDepth").textContent = `${response.data.depth} m`;
-            document.getElementById("telemetryClimb").textContent = `${response.data.climb} m/s`;
-            document.getElementById("telemetryTemp").textContent = `${response.data.temperature} °C`;
-            document.getElementById("telemetryLights").textContent = `${response.data.lights}%`;
-            document.getElementById("telemetryTime").textContent = response.data.timestamp;
-        } else {
-            console.error("Telemetry request failed:", response.data.message);
-        }
-    } catch (error) {
-        console.error("Failed to fetch telemetry:", error);
-        // Don't show error on UI as this happens frequently and we don't want to alarm users
-    }
-}
-
-async function fetchVideos() {
-    try {
-        const response = await axios.get('/list');
-        const videoList = document.getElementById("videoList");
-        videoList.innerHTML = '';
-        // /list now returns objects {name, storage}; fall back to plain
-        // strings for backwards-compatibility with older backends.
-        (response.data.videos || []).forEach(video => {
-            const name = (typeof video === 'string') ? video : video.name;
-            const storage = (typeof video === 'string') ? 'local' : (video.storage || 'local');
-            const li = document.createElement('li');
-            const a = document.createElement('a');
-            a.href = `/download/${encodeURIComponent(name)}?storage=${storage}`;
-            a.textContent = name;
-            li.appendChild(a);
-            if (storage === 'usb') {
-                const tag = document.createElement('span');
-                tag.textContent = ' [USB]';
-                tag.style.color = '#1976d2';
-                tag.style.fontSize = '0.85em';
-                li.appendChild(tag);
-            }
-            videoList.appendChild(li);
-        });
-        const tlList = document.getElementById("timelapseList");
-        tlList.innerHTML = '';
-        (response.data.timelapses || []).forEach(t => {
-            const li = document.createElement('li');
-            const storage = t.storage || 'local';
-            li.textContent = `${t.name} — ${t.snap_count} snapshot${t.snap_count === 1 ? '' : 's'}`;
-            if (storage === 'usb') {
-                const tag = document.createElement('span');
-                tag.textContent = ' [USB]';
-                tag.style.color = '#1976d2';
-                tag.style.fontSize = '0.85em';
-                li.appendChild(tag);
-            }
-            tlList.appendChild(li);
-        });
-    } catch (error) {
-        console.error("Error fetching videos:", error);
-    }
-}
-
-async function loadConfig() {
-    try {
-        const response = await axios.get('/config', { params: { _: Date.now() } });
-        if (response.data.tow_vehicle_ip) {
-            document.getElementById("towVehicleIp").value = response.data.tow_vehicle_ip;
-        }
-        if (response.data.container_format) {
-            document.getElementById("containerFormat").value = response.data.container_format;
-        }
-        if (response.data.stream_protocol) {
-            document.getElementById("streamProtocol").value = response.data.stream_protocol;
-        }
-        if (response.data.snapshot_url) {
-            document.getElementById("snapshotUrl").value = response.data.snapshot_url;
-        }
-        if (response.data.transect_capture_type) {
-            document.getElementById("transectCaptureType").value = response.data.transect_capture_type;
-        }
-        if (response.data.storage_preference) {
-            document.getElementById("storagePreference").value = response.data.storage_preference;
-        }
-    } catch (error) {
-        console.error("Error loading config:", error);
-    }
-}
-
-async function saveStoragePreference() {
-    const pref = document.getElementById("storagePreference").value;
-    try {
-        const response = await axios.post('/config', { storage_preference: pref });
-        if (response.data.success) {
-            const badge = document.getElementById("storageSaved");
-            badge.classList.add("visible");
-            setTimeout(() => badge.classList.remove("visible"), 2000);
-        } else {
-            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save storage preference";
-            document.getElementById("errorMessage").style.display = "block";
-            loadConfig();
-        }
-    } catch (error) {
-        const msg = error.response?.data?.message || "Failed to save storage preference";
-        document.getElementById("errorMessage").textContent = msg;
-        document.getElementById("errorMessage").style.display = "block";
-        loadConfig();
-    }
-}
-
-// Render the storage status card from a /status response. Reads
-// usb_storage{ mounted, fstype, free_mb, usable, min_free_gb },
-// storage_preference, usb_recording, usb_failover_count, active_storage.
-function renderStorageCard(d) {
+function renderStorage(d) {
     const usb = d.usb_storage || {};
     const pref = d.storage_preference || 'usb';
-    const isRecording = (d.mode && d.mode !== 'idle');
-    const recTo = d.active_storage; // "usb" | "local" | null
+    const busy = d.mode && d.mode !== 'idle';
     const failovers = d.usb_failover_count || 0;
-    const sLabel = document.getElementById('storageLabel');
-    const sFree = document.getElementById('storageFree');
-    const sDevice = document.getElementById('storageDevice');
-    const sDetail = document.getElementById('storageDetail');
+    const usbFree = usb.free_mb != null ? `${(usb.free_mb / 1024).toFixed(1)} GB free on USB` : '';
+    const localFree = d.local_disk_free_mb != null ? `${(d.local_disk_free_mb / 1024).toFixed(1)} GB free on SD` : '';
 
-    // Free-space readout for whichever drive is most relevant.
-    const usbFreeText = (usb.free_mb != null)
-        ? `${(usb.free_mb / 1024).toFixed(1)} GB free`
-        : '';
-    const localFreeText = (d.local_disk_free_mb != null)
-        ? `${(d.local_disk_free_mb / 1024).toFixed(1)} GB free (local)`
-        : '';
-
-    if (isRecording && recTo === 'usb') {
-        sLabel.textContent = 'Recording to USB drive';
-        sFree.textContent = usbFreeText;
-        sDevice.textContent = usb.device || '';
-        sDetail.textContent = `Filesystem: ${usb.fstype || '?'}` +
-            (usb.fstype && /^(vfat|fat|msdos)$/i.test(usb.fstype)
-                ? ' (parts auto-roll at 3.5 GiB to stay under FAT32 4 GiB cap)'
-                : '');
-    } else if (isRecording && recTo === 'local' && failovers > 0) {
-        sLabel.textContent = 'Recording to local SD (USB failover)';
-        sFree.textContent = localFreeText;
-        sDevice.textContent = '';
-        sDetail.textContent = `USB drive lost mid-recording; continued on local storage. Failovers: ${failovers}.`;
-    } else if (isRecording) {
-        sLabel.textContent = 'Recording to local SD';
-        sFree.textContent = localFreeText;
-        sDevice.textContent = '';
-        sDetail.textContent = (pref === 'usb' && !usb.mounted)
-            ? 'USB preference set, but no USB drive detected.'
-            : (pref === 'usb' && usb.mounted && !usb.usable)
-                ? `USB detected but free space below ${usb.min_free_gb || 20} GB - using local.`
-                : 'Local SD selected.';
+    let primary, warn = false, free, detail;
+    if (busy && d.active_storage === 'usb') {
+        primary = 'RECORDING TO USB';
+        free = usbFree;
+        detail = /^(vfat|fat|msdos)$/i.test(usb.fstype || '')
+            ? 'FAT32 detected: parts roll at 3.5 GiB to stay under the 4 GiB file cap.'
+            : `Filesystem: ${usb.fstype || 'unknown'}.`;
+    } else if (busy && failovers > 0) {
+        primary = 'RECORDING TO SD (USB FAILOVER)';
+        warn = true;
+        free = localFree;
+        detail = `USB drive was lost mid-recording and the session continued on local storage. Failovers: ${failovers}.`;
+    } else if (busy) {
+        primary = 'RECORDING TO LOCAL SD';
+        free = localFree;
+        detail = pref === 'usb' ? 'USB preferred but unavailable.' : 'Local SD selected.';
     } else if (pref === 'local') {
-        sLabel.textContent = 'Storage: local SD (preferred)';
-        sFree.textContent = localFreeText;
-        sDevice.textContent = '';
-        sDetail.textContent = (usb.mounted && usb.usable)
-            ? 'USB drive detected, but local SD is selected.'
-            : '';
+        primary = 'LOCAL SD (PREFERRED)';
+        free = localFree;
+        detail = usb.mounted && usb.usable ? 'A usable USB drive is attached but local SD is selected.' : '';
     } else if (usb.mounted && usb.usable) {
-        sLabel.textContent = 'Storage: USB drive';
-        sFree.textContent = usbFreeText;
-        sDevice.textContent = usb.device || '';
-        sDetail.textContent = `Recordings will go to USB (${usb.fstype || '?'}).`;
-    } else if (usb.mounted && !usb.usable) {
-        sLabel.textContent = 'Storage: local SD (USB nearly full)';
-        sFree.textContent = `USB ${usbFreeText} - ${localFreeText}`;
-        sDevice.textContent = usb.device || '';
-        sDetail.textContent = `USB free space below ${usb.min_free_gb || 20} GB threshold; falling back to local SD.`;
+        primary = 'USB DRIVE READY';
+        free = usbFree;
+        detail = `Recordings will be written to USB (${usb.fstype || 'unknown'}).`;
+    } else if (usb.mounted) {
+        primary = 'USB NEARLY FULL — USING SD';
+        warn = true;
+        free = `${usbFree} · ${localFree}`;
+        detail = `USB free space is below the ${usb.min_free_gb || 20} GB threshold.`;
     } else {
-        sLabel.textContent = 'Storage: local SD';
-        sFree.textContent = localFreeText;
-        sDevice.textContent = '';
-        sDetail.textContent = 'No USB drive detected. Insert a drive to record there.';
+        primary = 'NO USB DRIVE — USING SD';
+        warn = true;
+        free = localFree;
+        detail = 'Insert a USB drive to record there.';
+    }
+
+    $('storagePrimary').textContent = primary;
+    $('storagePrimary').className = 'primary' + (warn ? ' warn' : '');
+    $('storageFree').textContent = free || '';
+    $('storageDevice').textContent = usb.device || '';
+    $('storageDetail').textContent = detail || '';
+}
+
+async function refreshTelemetry() {
+    let d;
+    try {
+        d = await getJson('/telemetry');
+    } catch (e) {
+        $('telemetryAge').textContent = 'NO DATA';
+        return;
+    }
+    if (!d.success) {
+        $('telemetryAge').textContent = 'NO DATA';
+        return;
+    }
+    $('telDepth').textContent = `${fmt(d.depth, 1)} m`;
+    $('telClimb').textContent = `${fmt(d.climb, 2)} m/s`;
+    $('telTemp').textContent = `${fmt(d.temperature, 1)} °C`;
+    $('telLights').textContent = `${d.lights ?? '--'}%`;
+    $('telHeading').textContent = d.towfish_heading != null ? `${fmt(d.towfish_heading, 0)}°` : '--';
+    $('telGps').textContent = (d.gps_lat != null && d.gps_lon != null)
+        ? `${d.gps_lat.toFixed(4)}, ${d.gps_lon.toFixed(4)}`
+        : '--';
+    $('telGps').classList.toggle('dim', d.gps_lat == null);
+    $('telemetryAge').textContent = d.timestamp || '';
+}
+
+// ── Configuration ────────────────────────────────────────────────────────
+async function loadConfig() {
+    try {
+        const d = await getJson(`/config?_=${Date.now()}`);
+        if (d.tow_vehicle_ip) $('towVehicleIp').value = d.tow_vehicle_ip;
+        if (d.snapshot_url) $('snapshotUrl').value = d.snapshot_url;
+        if (d.storage_preference) $('storagePreference').value = d.storage_preference;
+        if (d.stream_protocol) $('streamProtocol').value = d.stream_protocol;
+        if (d.rtsp_endpoint) $('rtspEndpoint').textContent = d.rtsp_endpoint;
+    } catch (e) {
+        showError(`Could not load configuration: ${e.message}`);
     }
 }
 
-async function saveTransectCaptureType() {
-    const captureType = document.getElementById("transectCaptureType").value;
+async function saveConfigField(payload, badgeId) {
     try {
-        const response = await axios.post('/config', { transect_capture_type: captureType });
-        if (response.data.success) {
-            const badge = document.getElementById("captureTypeSaved");
-            badge.classList.add("visible");
-            setTimeout(() => badge.classList.remove("visible"), 2000);
-        } else {
-            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save capture type";
-            document.getElementById("errorMessage").style.display = "block";
-            loadConfig();
-        }
-    } catch (error) {
-        const msg = error.response?.data?.message || "Failed to save capture type";
-        document.getElementById("errorMessage").textContent = msg;
-        document.getElementById("errorMessage").style.display = "block";
+        await postJson('/config', payload);
+        clearError();
+        flashSaved(badgeId);
+    } catch (e) {
+        showError(`Could not save: ${e.message}`);
         loadConfig();
     }
 }
 
-async function saveSnapshotUrl() {
-    const url = document.getElementById("snapshotUrl").value.trim();
-    if (!url) return;
-    try {
-        const response = await axios.post('/config', { snapshot_url: url });
-        if (response.data.success) {
-            const badge = document.getElementById("snapshotSaved");
-            badge.classList.add("visible");
-            setTimeout(() => badge.classList.remove("visible"), 2000);
-        } else {
-            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save snapshot URL";
-            document.getElementById("errorMessage").style.display = "block";
-            loadConfig();
-        }
-    } catch (error) {
-        const msg = error.response?.data?.message || "Failed to save snapshot URL";
-        document.getElementById("errorMessage").textContent = msg;
-        document.getElementById("errorMessage").style.display = "block";
-        loadConfig();
-    }
-}
-
-async function saveTowVehicleIp() {
-    const ip = document.getElementById("towVehicleIp").value.trim();
+$('towIpSave').addEventListener('click', () => {
+    const ip = $('towVehicleIp').value.trim();
     if (!ip) return;
-    try {
-        const response = await axios.post('/config', { tow_vehicle_ip: ip });
-        if (response.data.success) {
-            const badge = document.getElementById("configSaved");
-            badge.classList.add("visible");
-            setTimeout(() => badge.classList.remove("visible"), 2000);
-        }
-    } catch (error) {
-        console.error("Error saving tow vehicle IP:", error);
-        document.getElementById("errorMessage").textContent = "Failed to save tow vehicle IP";
-        document.getElementById("errorMessage").style.display = "block";
-    }
-}
-
-async function saveStreamProtocol() {
-    const proto = document.getElementById("streamProtocol").value;
-    try {
-        const response = await axios.post('/config', { stream_protocol: proto });
-        if (response.data.success) {
-            const badge = document.getElementById("protocolSaved");
-            badge.classList.add("visible");
-            setTimeout(() => badge.classList.remove("visible"), 2000);
-        } else {
-            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save protocol";
-            document.getElementById("errorMessage").style.display = "block";
-            loadConfig();
-        }
-    } catch (error) {
-        const msg = error.response?.data?.message || "Failed to save stream protocol";
-        document.getElementById("errorMessage").textContent = msg;
-        document.getElementById("errorMessage").style.display = "block";
-        loadConfig();
-    }
-}
-
-async function saveContainerFormat() {
-    const fmt = document.getElementById("containerFormat").value;
-    try {
-        const response = await axios.post('/config', { container_format: fmt });
-        if (response.data.success) {
-            const badge = document.getElementById("formatSaved");
-            badge.classList.add("visible");
-            setTimeout(() => badge.classList.remove("visible"), 2000);
-        } else {
-            document.getElementById("errorMessage").textContent = response.data.message || "Failed to save format";
-            document.getElementById("errorMessage").style.display = "block";
-            loadConfig();
-        }
-    } catch (error) {
-        const msg = error.response?.data?.message || "Failed to save container format";
-        document.getElementById("errorMessage").textContent = msg;
-        document.getElementById("errorMessage").style.display = "block";
-        loadConfig();
-    }
-}
-
-// Initial setup
-loadConfig();
-fetchVideos();
-fetchTelemetry();
-checkRecordingStatus();  // Check initial status
-
-// Set up periodic refreshes
-fileListTimer = setInterval(fetchVideos, 5000);
-telemetryTimer = setInterval(fetchTelemetry, 5000);
-statusCheckTimer = setInterval(checkRecordingStatus, 2000);  // Check status every 2 seconds
-
-// Set the iframe source dynamically based on the current host
-window.addEventListener('load', () => {
-    const iframe = document.querySelector('iframe');
-    iframe.src = `http://${window.location.hostname}:7777/files/extensions/videorecorder`;
+    saveConfigField({ tow_vehicle_ip: ip }, 'towIpSaved');
+});
+$('towVehicleIp').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('towIpSave').click();
+});
+$('snapshotSave').addEventListener('click', () => {
+    const url = $('snapshotUrl').value.trim();
+    if (!url) return;
+    saveConfigField({ snapshot_url: url }, 'snapshotSaved');
+});
+$('snapshotUrl').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('snapshotSave').click();
+});
+$('storagePreference').addEventListener('change', (e) => {
+    saveConfigField({ storage_preference: e.target.value }, 'storageSaved');
+});
+$('streamProtocol').addEventListener('change', (e) => {
+    saveConfigField({ stream_protocol: e.target.value }, 'protocolSaved');
 });
 
-// Clean up timers when page is unloaded
-window.addEventListener('unload', () => {
-    clearInterval(fileListTimer);
-    clearInterval(recordingTimer);
-    clearInterval(telemetryTimer);
-    clearInterval(statusCheckTimer);  // Clean up new timer
+// ── Parameter checker ────────────────────────────────────────────────────
+// Cards are built once and then updated in place, so a poll landing while
+// the operator is typing a target never clobbers the field.
+const VEHICLE_LABELS = {
+    boat: ['TOW BOAT', 'ArduRover'],
+    towfish: ['TOWFISH', 'ArduSub'],
+};
+
+const paramEls = {};      // name -> {refs}
+const dirtyTargets = {};  // name -> unsaved numeric value
+let paramSpecs = [];      // last /params payload, keyed access via byName
+let paramByName = {};
+let paramPollTimer = null;
+let paramJobRunning = false;
+
+function buildParamCard(p) {
+    const card = document.createElement('div');
+    card.className = 'pcard';
+
+    const head = document.createElement('div');
+    head.className = 'pcard-head';
+    const name = document.createElement('span');
+    name.className = 'pcard-name';
+    name.textContent = p.name;
+    const badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = 'UNKNOWN';
+    head.append(name, badge);
+
+    const desc = document.createElement('div');
+    desc.className = 'pcard-desc';
+    desc.textContent = p.desc;
+
+    const values = document.createElement('div');
+    values.className = 'pcard-values';
+
+    const currentWrap = document.createElement('div');
+    const currentLabel = document.createElement('div');
+    currentLabel.className = 'label';
+    currentLabel.textContent = 'ON VEHICLE';
+    const current = document.createElement('div');
+    current.className = 'pcard-current dim';
+    current.textContent = '--';
+    currentWrap.append(currentLabel, current);
+
+    const targetWrap = document.createElement('div');
+    const targetLabel = document.createElement('div');
+    targetLabel.className = 'label';
+    targetLabel.textContent = 'TARGET';
+    const targetRow = document.createElement('div');
+    targetRow.className = 'pcard-target';
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.step = Math.pow(10, -p.decimals).toFixed(Math.max(p.decimals, 1));
+    input.min = p.min;
+    input.max = p.max;
+    input.value = fmt(p.target, p.decimals);
+    targetRow.append(input);
+    if (p.unit) {
+        const unit = document.createElement('span');
+        unit.className = 'unit';
+        unit.textContent = p.unit;
+        targetRow.append(unit);
+    }
+    targetWrap.append(targetLabel, targetRow);
+    values.append(currentWrap, targetWrap);
+
+    const actions = document.createElement('div');
+    actions.className = 'pcard-actions';
+    const presets = document.createElement('div');
+    presets.className = 'presets';
+    const presetButtons = [];
+    (p.presets || []).forEach((value) => {
+        const btn = document.createElement('button');
+        btn.className = 'btn preset';
+        btn.textContent = fmt(value, p.decimals);
+        btn.addEventListener('click', () => {
+            input.value = fmt(value, p.decimals);
+            commitTarget(p.name);
+        });
+        presetButtons.push({ value, btn });
+        presets.append(btn);
+    });
+    const spacer = document.createElement('span');
+    spacer.className = 'spacer';
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'btn amber tiny';
+    applyBtn.textContent = 'APPLY';
+    applyBtn.addEventListener('click', () => applyParams([p.name]));
+    actions.append(presets, spacer, applyBtn);
+
+    card.append(head, desc, values, actions);
+
+    input.addEventListener('input', () => {
+        dirtyTargets[p.name] = input.value;
+        input.classList.add('dirty');
+    });
+    input.addEventListener('change', () => commitTarget(p.name));
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commitTarget(p.name); }
+    });
+
+    paramEls[p.name] = { card, badge, current, input, applyBtn, presetButtons };
+    return card;
+}
+
+function updateParamCard(p) {
+    const els = paramEls[p.name];
+    if (!els) return;
+
+    const hasError = !!p.error;
+    const known = p.current !== null && p.current !== undefined;
+    let badgeClass = '', badgeText = 'UNKNOWN', cardClass = '';
+
+    if (hasError) {
+        badgeClass = 'error'; badgeText = 'NO READ'; cardClass = 'error';
+    } else if (p.matches === true) {
+        badgeClass = 'ok'; badgeText = 'OK';
+    } else if (p.matches === false) {
+        badgeClass = 'mismatch'; badgeText = 'MISMATCH'; cardClass = 'mismatch';
+    }
+    els.badge.className = 'badge' + (badgeClass ? ' ' + badgeClass : '');
+    els.badge.textContent = badgeText;
+    els.card.className = 'pcard' + (cardClass ? ' ' + cardClass : '');
+
+    if (hasError) {
+        els.current.className = 'pcard-current error';
+        els.current.textContent = p.error;
+    } else if (known) {
+        els.current.className = 'pcard-current' + (p.matches === false ? ' mismatch' : '');
+        els.current.innerHTML = '';
+        els.current.append(document.createTextNode(fmt(p.current, p.decimals)));
+        if (p.unit) {
+            const unit = document.createElement('span');
+            unit.className = 'unit';
+            unit.textContent = p.unit;
+            els.current.append(unit);
+        }
+    } else {
+        els.current.className = 'pcard-current dim';
+        els.current.textContent = '--';
+    }
+
+    // Never overwrite a field the operator is editing or has not saved yet.
+    const editing = els.input === document.activeElement || (p.name in dirtyTargets);
+    if (!editing) {
+        els.input.value = fmt(p.target, p.decimals);
+        els.input.classList.remove('dirty');
+    }
+
+    els.presetButtons.forEach(({ value, btn }) => {
+        btn.classList.toggle('selected',
+            p.target != null && Math.abs(value - p.target) < 1e-9);
+    });
+    els.applyBtn.disabled = paramJobRunning;
+}
+
+function renderParamGroups(params) {
+    const host = $('paramGroups');
+    host.innerHTML = '';
+    for (const vehicle of ['boat', 'towfish']) {
+        const group = params.filter((p) => p.vehicle === vehicle);
+        if (!group.length) continue;
+
+        const [title, firmware] = VEHICLE_LABELS[vehicle];
+        const section = document.createElement('div');
+        section.className = 'vehicle-group';
+
+        const head = document.createElement('div');
+        head.className = 'vehicle-head';
+        const titleEl = document.createElement('span');
+        titleEl.className = 'title';
+        titleEl.textContent = title;
+        const fw = document.createElement('span');
+        fw.textContent = firmware;
+        const endpoint = document.createElement('span');
+        endpoint.id = `paramEndpoint_${vehicle}`;
+        head.append(titleEl, fw, endpoint);
+
+        const grid = document.createElement('div');
+        grid.className = 'param-grid';
+        group.forEach((p) => grid.append(buildParamCard(p)));
+
+        section.append(head, grid);
+        host.append(section);
+    }
+}
+
+function renderParamState(state) {
+    paramSpecs = state.params;
+    paramByName = Object.fromEntries(state.params.map((p) => [p.name, p]));
+    paramJobRunning = !!state.job.running;
+
+    if (!Object.keys(paramEls).length) renderParamGroups(state.params);
+    state.params.forEach(updateParamCard);
+
+    for (const vehicle of ['boat', 'towfish']) {
+        const el = $(`paramEndpoint_${vehicle}`);
+        if (el) {
+            el.textContent = vehicle === 'boat' ? state.boat_url : state.towfish_url;
+        }
+    }
+
+    const links = state.links || {};
+    for (const [vehicle, lampId] of [['towfish', 'lampTowfish'], ['boat', 'lampBoat']]) {
+        const label = vehicle === 'boat' ? 'TOW BOAT' : 'TOWFISH';
+        const reachable = (links[vehicle] || {}).reachable;
+        if (reachable === true) setLamp(lampId, 'ok', `${label} LINK`);
+        else if (reachable === false) setLamp(lampId, 'bad', `${label} NO LINK`);
+        else setLamp(lampId, '', `${label} ?`);
+    }
+
+    const job = state.job;
+    const jobEl = $('paramJob');
+    jobEl.classList.toggle('busy', paramJobRunning);
+    if (paramJobRunning) {
+        const verb = job.kind === 'apply' ? 'Applying' : 'Checking';
+        jobEl.textContent = `${verb} ${Math.min(job.done + 1, job.total)}/${job.total}` +
+            (job.current ? ` — ${job.current}` : '');
+    } else {
+        jobEl.textContent = job.message || 'Not checked yet';
+    }
+
+    for (const id of ['paramCheckAll', 'paramApplyAll', 'paramResetDefaults']) {
+        $(id).disabled = paramJobRunning;
+    }
+
+    // Poll fast while a batch is in flight, then settle back down.
+    scheduleParamPoll(paramJobRunning ? 600 : 6000);
+}
+
+function scheduleParamPoll(delayMs) {
+    clearTimeout(paramPollTimer);
+    paramPollTimer = setTimeout(refreshParams, delayMs);
+}
+
+async function refreshParams() {
+    try {
+        renderParamState(await getJson('/params'));
+    } catch (e) {
+        scheduleParamPoll(6000);
+    }
+}
+
+async function commitTarget(name) {
+    const els = paramEls[name];
+    const spec = paramByName[name];
+    if (!els || !spec) return true;
+
+    const raw = els.input.value;
+    const value = Number(raw);
+    if (raw === '' || Number.isNaN(value)) {
+        els.input.value = fmt(spec.target, spec.decimals);
+        els.input.classList.remove('dirty');
+        delete dirtyTargets[name];
+        return true;
+    }
+
+    const clamped = Math.min(spec.max, Math.max(spec.min, value));
+    try {
+        await postJson('/params/targets', { targets: { [name]: clamped } });
+        delete dirtyTargets[name];
+        els.input.value = fmt(clamped, spec.decimals);
+        els.input.classList.remove('dirty');
+        spec.target = clamped;
+        clearError();
+        await refreshParams();
+        return true;
+    } catch (e) {
+        showError(`Could not save target for ${name}: ${e.message}`);
+        return false;
+    }
+}
+
+async function applyParams(names) {
+    // Flush any pending edits first: /params/apply writes the *saved*
+    // targets, so an unsaved field would otherwise push a stale value.
+    for (const name of names) {
+        if (name in dirtyTargets && !(await commitTarget(name))) return;
+    }
+    try {
+        await postJson('/params/apply', { names });
+        clearError();
+        await refreshParams();
+    } catch (e) {
+        showError(`Could not apply parameters: ${e.message}`);
+    }
+}
+
+$('paramCheckAll').addEventListener('click', async () => {
+    try {
+        await postJson('/params/check', {});
+        clearError();
+        await refreshParams();
+    } catch (e) {
+        showError(`Could not start check: ${e.message}`);
+    }
 });
+
+$('paramApplyAll').addEventListener('click', () => {
+    // Anything not confirmed matching is worth writing, including params
+    // we have never managed to read.
+    const names = paramSpecs.filter((p) => p.matches !== true).map((p) => p.name);
+    if (!names.length) {
+        $('paramJob').textContent = 'All parameters already match their targets';
+        return;
+    }
+    applyParams(names);
+});
+
+$('paramResetDefaults').addEventListener('click', async () => {
+    const targets = Object.fromEntries(paramSpecs.map((p) => [p.name, p.default]));
+    try {
+        await postJson('/params/targets', { targets });
+        Object.keys(dirtyTargets).forEach((k) => delete dirtyTargets[k]);
+        clearError();
+        await refreshParams();
+    } catch (e) {
+        showError(`Could not reset targets: ${e.message}`);
+    }
+});
+
+// ── Boot ─────────────────────────────────────────────────────────────────
+// The logo is whatever the operator drops into static/, so walk the
+// plausible filenames and keep the placeholder if none of them load.
+const LOGO_CANDIDATES = ['/static/logo.png', '/static/logo.svg',
+                         '/static/logo.jpg', '/static/logo.webp'];
+
+function loadLogo(index = 0) {
+    if (index >= LOGO_CANDIDATES.length) return;
+    const img = $('brandLogo');
+    img.onload = () => $('logoSlot').classList.remove('empty');
+    img.onerror = () => loadLogo(index + 1);
+    img.src = LOGO_CANDIDATES[index];
+}
+
+function tickClock() {
+    $('headClock').textContent = new Date().toLocaleTimeString([], { hour12: false });
+}
+
+(async function init() {
+    loadLogo();
+    tickClock();
+    setInterval(tickClock, 1000);
+
+    const host = window.location.hostname;
+    const browserUrl = `http://${host}:7777/files/extensions/videorecorder`;
+    $('fileBrowser').src = browserUrl;
+    $('browserPath').textContent = '/extensions/videorecorder';
+
+    await loadConfig();
+    refreshStatus();
+    refreshTelemetry();
+    setInterval(refreshStatus, 3000);
+    setInterval(refreshTelemetry, 5000);
+
+    // Read both autopilots on load so the operator lands on a page that
+    // already says whether the rig is configured correctly.
+    await refreshParams();
+    try {
+        await postJson('/params/check', {});
+        await refreshParams();
+    } catch (e) { /* the CHECK ALL button is always there as a fallback */ }
+})();
 </script>
 </body>
 </html>
