@@ -537,6 +537,16 @@
             letter-spacing: 0.14em;
         }
 
+        /* Context that applies to a whole vehicle's gains rather than any one
+           of them, so it sits above the grid instead of repeating per card. */
+        .vehicle-note {
+            font-size: 12.5px;
+            line-height: 1.5;
+            color: var(--ink-dim);
+            margin: -4px 0 10px;
+            max-width: 96ch;
+        }
+
         .param-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
@@ -1205,6 +1215,19 @@ const VEHICLE_LABELS = {
     towfish: ['TOWFISH', 'ArduSub'],
 };
 
+// Why these gains are exposed at all, and why the bench lies about them.
+// Applies to every towfish gain, so it belongs above the grid.
+const VEHICLE_NOTES = {
+    towfish:
+        'The towfish stabilises on servo-driven control surfaces, not the '
+        + 'thrusters ArduSub assumes. The fins make their corrective force out '
+        + 'of drag, so they only have authority above a minimum speed through '
+        + 'the water. Expect raised gains to visibly oscillate the servos on '
+        + 'the bench: in air there is no water load and no resulting body '
+        + 'movement to close the loop, so static behaviour is a poor guide to '
+        + 'how a value behaves under tow.',
+};
+
 const paramEls = {};      // name -> {refs}
 const dirtyTargets = {};  // name -> unsaved numeric value
 let paramSpecs = [];      // last /params payload, keyed access via byName
@@ -1380,7 +1403,14 @@ function renderParamGroups(params) {
         grid.className = 'param-grid';
         group.forEach((p) => grid.append(buildParamCard(p)));
 
-        section.append(head, grid);
+        section.append(head);
+        if (VEHICLE_NOTES[vehicle]) {
+            const note = document.createElement('div');
+            note.className = 'vehicle-note';
+            note.textContent = VEHICLE_NOTES[vehicle];
+            section.append(note);
+        }
+        section.append(grid);
         host.append(section);
     }
 }
