@@ -91,18 +91,22 @@ ts_utc = datetime(2026, 7, 29, 1, 45, 30, 250000, tzinfo=timezone.utc)
 
 
 def check_embedding():
+    # alt_m is now height above the seabed, so it is positive-up.
     out = pm.embed_metadata(
         tiny_jpeg(),
-        lat=19.312648, lon=-155.888358, alt_m=-3.5, heading_deg=127.4,
+        lat=19.312648, lon=-155.888358, alt_m=8.25, heading_deg=127.4,
         ts_local=ts_local, ts_utc=ts_utc,
-        tilt_deg=-88.0, depth_m=3.5, temp_c=24.6, roll_deg=1.5, pitch_deg=-2.0,
+        tilt_deg=-70.0, depth_m=3.5, temp_c=24.6, roll_deg=1.5, pitch_deg=-2.0,
+        mount_pitch_deg=-68.0, sonar_depth_m=11.75,
+        xy_accuracy_m=4.75, z_accuracy_m=0.5,
     )
     exif = piexif.load(out)
     gps = exif["GPS"]
     check("GPSLatitudeRef N", gps[piexif.GPSIFD.GPSLatitudeRef] == b"N")
     check("GPSLongitudeRef W", gps[piexif.GPSIFD.GPSLongitudeRef] == b"W")
-    check("GPSAltitudeRef=1 below sea", gps[piexif.GPSIFD.GPSAltitudeRef] == 1)
-    check("GPSAltitude 3.5 m", gps[piexif.GPSIFD.GPSAltitude] == (3500, 1000))
+    check("GPSAltitudeRef=0 above the seabed",
+          gps[piexif.GPSIFD.GPSAltitudeRef] == 0)
+    check("GPSAltitude 8.25 m", gps[piexif.GPSIFD.GPSAltitude] == (8250, 1000))
     check("GPSImgDirectionRef true", gps[piexif.GPSIFD.GPSImgDirectionRef] == b"T")
     check("GPSImgDirection 127.4", gps[piexif.GPSIFD.GPSImgDirection] == (12740, 100))
     check("GPSVersionID present", piexif.GPSIFD.GPSVersionID in gps)
@@ -114,22 +118,77 @@ def check_embedding():
     comment = exif["Exif"][piexif.ExifIFD.UserComment]
     check("UserComment carries depth", b"depth=3.50m" in comment)
     check("UserComment carries roll", b"roll=+1.5deg" in comment)
-    check("UserComment carries tilt", b"tilt=-88.0deg" in comment)
+    check("UserComment carries tilt", b"tilt=-70.0deg" in comment)
+    check("UserComment carries mount angle", b"mount=-68.0deg" in comment)
+    check("UserComment carries the sonar sounding", b"sonar=11.75m" in comment)
+    check("UserComment carries altitude", b"alt=8.25m" in comment)
 
     xmp = find_xmp(out)
     check("XMP packet present", xmp is not None)
     if xmp:
         check("XMP uses Pix4D namespace", "http://pix4d.com/camera/1.0/" in xmp)
         check("Camera:Yaw is heading", "<Camera:Yaw>127.40</Camera:Yaw>" in xmp, xmp)
-        # Nadir camera: -90 plus the body pitch of -2.0.
-        check("Camera:Pitch is nadir+body",
-              "<Camera:Pitch>-92.00</Camera:Pitch>" in xmp, xmp)
+        # Pix4D/Metashape measure pitch from nadir, so a camera tilted to
+        # -70 deg earth-frame is 20 deg off nadir -- not -70, and not -92.
+        check("Camera:Pitch is degrees off nadir",
+              "<Camera:Pitch>20.00</Camera:Pitch>" in xmp, xmp)
         check("Camera:Roll is body roll", "<Camera:Roll>1.50</Camera:Roll>" in xmp, xmp)
+        check("GPSXYAccuracy written",
+              "<Camera:GPSXYAccuracy>4.75</Camera:GPSXYAccuracy>" in xmp, xmp)
+        check("GPSZAccuracy written",
+              "<Camera:GPSZAccuracy>0.50</Camera:GPSZAccuracy>" in xmp, xmp)
+        check("Towfish namespace declared", pm.TOWFISH_XMP_NS in xmp)
+        check("body-frame mount angle recorded",
+              "<Towfish:MountPitchBody>-68.00</Towfish:MountPitchBody>" in xmp, xmp)
+        check("depth below surface recorded",
+              "<Towfish:DepthBelowSurface>3.50</Towfish:DepthBelowSurface>" in xmp, xmp)
+        check("sonar bottom depth recorded",
+              "<Towfish:SonarBottomDepth>11.75</Towfish:SonarBottomDepth>" in xmp, xmp)
+
+
+def check_pitch_convention():
+    check("nadir tilt gives pitch 0",
+          approx(pm.camera_pitch_from_tilt(-90.0), 0.0))
+    check("mount at -70 gives 20 off nadir",
+          approx(pm.camera_pitch_from_tilt(-70.0), 20.0))
+    # No tilt reading: fall back to assuming a nadir-fixed mount, so the
+    # camera pitch is just the body pitch.
+    check("falls back to body pitch without a tilt",
+          approx(pm.camera_pitch_from_tilt(None, -2.0), -2.0))
+    check("no tilt and no body pitch is unknown",
+          pm.camera_pitch_from_tilt(None, None) is None)
+
+
+def check_nan_does_not_strip_metadata():
+    """A NaN used to raise before any tag was written, losing everything."""
+    out = pm.embed_metadata(
+        tiny_jpeg(),
+        lat=19.312648, lon=-155.888358, alt_m=float("nan"), heading_deg=127.4,
+        ts_local=ts_local, ts_utc=ts_utc,
+        tilt_deg=-70.0, depth_m=float("nan"), temp_c=24.6,
+        roll_deg=1.5, pitch_deg=-2.0,
+    )
+    gps = piexif.load(out)["GPS"]
+    check("NaN altitude does not lose the GPS fix",
+          piexif.GPSIFD.GPSLatitude in gps)
+    check("NaN altitude is simply omitted",
+          piexif.GPSIFD.GPSAltitude not in gps)
+    check("NaN altitude does not lose the XMP", find_xmp(out) is not None)
+
+
+def check_accuracy_model():
+    xy_near, z_alt = pm.reference_accuracy_m(7.0, 8.0)
+    xy_far, z_none = pm.reference_accuracy_m(30.0, None)
+    check("XY accuracy degrades with layback", xy_far > xy_near,
+          f"{xy_far} vs {xy_near}")
+    check("Z is tighter than XY", z_alt < xy_near)
+    check("depth-only Z is tighter than a differenced altitude",
+          z_none < z_alt)
 
 
 def check_no_orientation():
     bare = pm.embed_metadata(
-        tiny_jpeg(), lat=19.3, lon=-155.8, alt_m=-2.0, heading_deg=None,
+        tiny_jpeg(), lat=19.3, lon=-155.8, alt_m=2.0, heading_deg=None,
         ts_local=ts_local, ts_utc=ts_utc, roll_deg=None, pitch_deg=None,
         depth_m=2.0,
     )
@@ -137,11 +196,23 @@ def check_no_orientation():
     check("no XMP when nothing was measured", find_xmp(bare) is None)
 
 
+print("\ncamera pitch convention (nadir = 0)")
+check_pitch_convention()
+
+print("\nreference accuracy priors")
+check_accuracy_model()
+
 print("\nEXIF + XMP embedding")
 if Image is None:
     print("  SKIPPED -- needs Pillow (pip3 install Pillow)")
 else:
     check_embedding()
+
+print("\nnon-finite telemetry does not strip all metadata")
+if Image is None:
+    print("  SKIPPED -- needs Pillow (pip3 install Pillow)")
+else:
+    check_nan_does_not_strip_metadata()
 
 print("\nno orientation -> no XMP claim")
 if Image is None:
@@ -170,6 +241,7 @@ reader_columns = {
     "video_time_s", "timestamp", "lat", "lon", "towfish_altitude_m",
     "towfish_heading_deg", "towfish_roll_deg", "towfish_pitch_deg",
     "depth_m", "temperature_c", "camera_tilt_deg",
+    "camera_mount_pitch_body_deg", "sonar_bottom_depth_m",
 }
 if video_header:
     missing = reader_columns - set(video_header)
@@ -193,14 +265,17 @@ with tempfile.TemporaryDirectory() as td:
                 "lat": "" if blank_gps else f"{lat:.6f}",
                 "lon": "" if blank_gps else f"{lon:.6f}",
                 "altitude_m": "0.30",
-                "towfish_altitude_m": "-3.50",
+                "towfish_altitude_m": "8.25",
                 "towfish_heading_deg": f"{heading:.1f}",
                 "towfish_roll_deg": "1.5",
                 "towfish_pitch_deg": "-2.0",
                 "depth_m": "3.50",
                 "temperature_c": "24.60",
-                "camera_tilt_deg": "-88.0",
+                "camera_tilt_deg": "-70.0",
                 "telem_ms": "42.0",
+                "camera_mount_pitch_body_deg": "-68.0",
+                "sonar_bottom_depth_m": "11.75",
+                "tow_delay_s": "6.0",
             }
             w.writerow([values.get(c, "") for c in video_header])
 
@@ -223,9 +298,11 @@ with tempfile.TemporaryDirectory() as td:
           f"got {mid['lat']}")
     check("orientation preserved during GPS gap", approx(mid["heading"], 0.0, 1e-9)
           or approx(mid["heading"], 360.0, 1e-9), f"got {mid['heading']}")
-    check("altitude from towfish column", approx(mid["alt"], -3.5, 1e-9))
+    check("altitude from towfish column", approx(mid["alt"], 8.25, 1e-9))
     check("depth read", approx(mid["depth"], 3.5, 1e-9))
-    check("tilt read", approx(mid["tilt"], -88.0, 1e-9))
+    check("tilt read", approx(mid["tilt"], -70.0, 1e-9))
+    check("body-frame mount angle read", approx(mid["mount_pitch"], -68.0, 1e-9))
+    check("sonar bottom depth read", approx(mid["sonar_depth"], 11.75, 1e-9))
 
     at2 = track.sample(2.0)
     check("heading at last sample is 10", approx(at2["heading"], 10.0, 1e-9))

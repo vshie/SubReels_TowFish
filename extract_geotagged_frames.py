@@ -28,10 +28,12 @@ Two sidecar formats are understood, preferred in this order:
    never carried it.
 
 Each output JPEG gets whatever the sidecar supports:
-    * GPSLatitude / GPSLongitude / GPSAltitude (with AltitudeRef=1 below sea)
+    * GPSLatitude / GPSLongitude / GPSAltitude (height above the seabed)
     * GPSImgDirection (true heading) -- CSV only
     * XMP Camera:Yaw/Pitch/Roll in the Pix4D namespace, read by Agisoft
       Metashape, Pix4D and OpenDroneMap/WebODM -- CSV only
+    * XMP Camera:GPSXYAccuracy / GPSZAccuracy reference priors -- CSV only
+    * XMP Towfish:MountPitchBody / DepthBelowSurface / SonarBottomDepth
     * UserComment / ImageDescription with roll, pitch, tilt, depth, temp
     * GPSTimeStamp / GPSDateStamp in UTC
     * DateTimeOriginal / DateTimeDigitized in local time
@@ -73,7 +75,7 @@ _POS_RE = re.compile(r"latitude:\s*(-?\d+(?:\.\d+)?)\s+"
 # the ones in ANGULAR_FIELDS, which are directions in degrees and must
 # be interpolated the short way around the circle.
 FIELDS = ("lat", "lon", "alt", "heading", "roll", "pitch",
-          "depth", "temp", "tilt")
+          "depth", "temp", "tilt", "mount_pitch", "sonar_depth")
 ANGULAR_FIELDS = frozenset({"heading"})
 
 
@@ -175,6 +177,8 @@ class TelemetryTrack:
             "depth": "depth_m",
             "temp": "temperature_c",
             "tilt": "camera_tilt_deg",
+            "mount_pitch": "camera_mount_pitch_body_deg",
+            "sonar_depth": "sonar_bottom_depth_m",
         }
         series: dict[str, list[tuple[float, float]]] = {f: [] for f in FIELDS}
         start_local = None
@@ -322,6 +326,10 @@ def main() -> int:
     ap.add_argument("--rename-by-time", action="store_true",
                     help="Rename outputs to frame_<sec>.jpg "
                          "instead of frame_<seq>.jpg")
+    ap.add_argument("--tow-offset", type=float, default=7.0,
+                    help="Layback used during the recording, metres. Only "
+                         "affects the GPSXYAccuracy prior written for "
+                         "photogrammetry (default: 7.0)")
     args = ap.parse_args()
 
     video: Path = args.video.resolve()
@@ -392,6 +400,7 @@ def main() -> int:
             ts_local_naive = datetime(1970, 1, 1) + timedelta(seconds=t)
             ts_utc = ts_local_naive.replace(tzinfo=timezone.utc)
 
+        xy_acc, z_acc = pm.reference_accuracy_m(args.tow_offset, s["alt"])
         try:
             data = pm.embed_metadata(
                 jpg.read_bytes(),
@@ -399,6 +408,9 @@ def main() -> int:
                 ts_local_naive, ts_utc,
                 tilt_deg=s["tilt"], depth_m=s["depth"], temp_c=s["temp"],
                 roll_deg=s["roll"], pitch_deg=s["pitch"],
+                mount_pitch_deg=s["mount_pitch"],
+                sonar_depth_m=s["sonar_depth"],
+                xy_accuracy_m=xy_acc, z_accuracy_m=z_acc,
                 software=pm.SOFTWARE_EXTRACT,
             )
             jpg.write_bytes(data)

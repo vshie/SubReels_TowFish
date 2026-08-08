@@ -862,6 +862,24 @@
                         BOAT when the fish yaws on the tether, AVERAGE as a compromise.
                     </div>
                 </div>
+
+                <div class="field">
+                    <label for="altitudeOffset">ALTITUDE OFFSET</label>
+                    <div class="field-row">
+                        <input type="number" id="altitudeOffset" step="0.05" min="-5" max="5" placeholder="0.00" autocomplete="off">
+                        <span class="unit">m</span>
+                        <button class="btn" id="altitudeOffsetSave">SAVE</button>
+                        <span class="saved" id="altitudeOffsetSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Height above the seabed is <code>boat sonar &minus; towfish depth
+                        &minus; offset</code>, and lands in each image's EXIF altitude for
+                        photogrammetry. Set this to how deep the boat's sonar transducer sits
+                        below the waterline &mdash; its range starts at the transducer face,
+                        not the surface. Add any height of the camera above the towfish
+                        pressure sensor.
+                    </div>
+                </div>
             </div>
 
             <div class="calc">
@@ -1102,6 +1120,7 @@ async function loadConfig() {
         if (d.rtsp_endpoint) $('rtspEndpoint').textContent = d.rtsp_endpoint;
         if (d.tow_offset_m != null) $('towOffset').value = Number(d.tow_offset_m).toFixed(1);
         if (d.tow_heading_source) markHeadingSource(d.tow_heading_source);
+        if (d.altitude_offset_m != null) $('altitudeOffset').value = Number(d.altitude_offset_m).toFixed(2);
     } catch (e) {
         showError(`Could not load configuration: ${e.message}`);
     }
@@ -1168,6 +1187,18 @@ $('towOffsetSave').addEventListener('click', () => {
 });
 $('towOffset').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') $('towOffsetSave').click();
+});
+
+$('altitudeOffsetSave').addEventListener('click', () => {
+    const value = parseFloat($('altitudeOffset').value);
+    if (!Number.isFinite(value) || value < -5 || value > 5) {
+        showError('Altitude offset must be a number of metres between -5 and 5.');
+        return;
+    }
+    saveConfigField({ altitude_offset_m: value }, 'altitudeOffsetSaved');
+});
+$('altitudeOffset').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('altitudeOffsetSave').click();
 });
 
 // Right triangle: tether is the hypotenuse, depth the vertical leg, and

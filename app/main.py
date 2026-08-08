@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from flask import Flask, jsonify, request, send_file
 import asyncio
+import collections
 import errno
 import json
 import os
@@ -144,8 +145,9 @@ DATA_LAKE_WS_HOST = "0.0.0.0"
 DATA_LAKE_WS_PORT = 8765
 DATA_LAKE_RECORDING_VAR = "video-recorder-recording"
 
-# Mavlink URLs (local vehicle)
-ahrs2_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/AHRS2'
+# Mavlink URLs (local vehicle). AHRS2 is deliberately absent: this
+# towfish never populates AHRS2.altitude (it reports NaN), so depth and
+# altitude both come from VFR_HUD instead.
 vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/VFR_HUD'
 baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2'
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
@@ -198,6 +200,34 @@ VALID_TOW_HEADING_SOURCES = ("towfish", "boat", "average")
 # a fat-fingered entry from throwing fixes a kilometre off.
 TOW_OFFSET_MIN_M = 0.0
 TOW_OFFSET_MAX_M = 300.0
+
+# ── Altitude above the seabed ────────────────────────────────────────────
+# The towfish carries no altimeter, so its height above the bottom is
+# reconstructed from two other vehicles' sensors:
+#
+#     altitude = boat_sonar_depth - towfish_pressure_depth - offset
+#
+# The offset is a single lumped constant the operator sets alongside the
+# layback, because it absorbs two fixed geometry terms that are easier to
+# measure once than to model: how far the boat's Ping transducer sits
+# below the waterline (its range starts at the transducer face, not the
+# surface -- RNGFND_POS_Z is 0), and any vertical offset between the
+# towfish pressure sensor and the camera. Both push the answer the same
+# way, so one number covers them.
+DEFAULT_ALTITUDE_OFFSET_M = 0.0
+ALTITUDE_OFFSET_MIN_M = -5.0
+ALTITUDE_OFFSET_MAX_M = 5.0
+
+# The boat sounds the bottom the fish has not reached yet: the transducer
+# leads the camera by the layback distance. Pairing the two instruments at
+# the same wall-clock instant therefore reads the wrong patch of seabed
+# whenever the bottom slopes, so soundings are buffered and replayed at
+# the tow delay (layback / boat speed).
+_SONAR_HISTORY_S = 120.0        # ring buffer span
+_SONAR_SAMPLE_PERIOD_S = 0.5    # 2 Hz, matching the timelapse cadence
+_SONAR_MATCH_TOLERANCE_S = 3.0  # reject if no sounding lands this close
+_TOW_DELAY_MIN_SPEED_MS = 0.15  # below this the delay is meaningless
+_TOW_DELAY_MAX_S = 60.0
 
 # One-push white-balance loop that runs while the transect monitor is
 # enabled. The operator can flip this off from the widget for scenes
@@ -359,6 +389,22 @@ def _sanitize_tow_offset_m(raw, fallback=DEFAULT_TOW_OFFSET_M):
     return max(TOW_OFFSET_MIN_M, min(TOW_OFFSET_MAX_M, num))
 
 
+def _sanitize_altitude_offset_m(raw, fallback=DEFAULT_ALTITUDE_OFFSET_M):
+    """Coerce a saved/posted altitude offset to a clamped float.
+
+    Unlike the layback this one is signed: a transducer below the
+    waterline makes it positive, a camera mounted above the pressure
+    sensor pushes it the other way.
+    """
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if num != num or num in (float("inf"), float("-inf")):
+        return fallback
+    return max(ALTITUDE_OFFSET_MIN_M, min(ALTITUDE_OFFSET_MAX_M, num))
+
+
 def _sanitize_tow_heading_source(raw, fallback=DEFAULT_TOW_HEADING_SOURCE):
     """Coerce a saved/posted heading-source name to a known mode."""
     if not isinstance(raw, str):
@@ -380,6 +426,7 @@ def load_config():
         "param_targets": dict(DEFAULT_PARAM_TARGETS),
         "tow_offset_m": DEFAULT_TOW_OFFSET_M,
         "tow_heading_source": DEFAULT_TOW_HEADING_SOURCE,
+        "altitude_offset_m": DEFAULT_ALTITUDE_OFFSET_M,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -406,6 +453,8 @@ def load_config():
         defaults.get("tow_offset_m"))
     defaults["tow_heading_source"] = _sanitize_tow_heading_source(
         defaults.get("tow_heading_source"))
+    defaults["altitude_offset_m"] = _sanitize_altitude_offset_m(
+        defaults.get("altitude_offset_m"))
     return defaults
 
 def save_config(cfg):
@@ -527,6 +576,150 @@ def get_ping_sonar_snapshot():
     }
 
 
+class SonarHistory:
+    """Timestamped ring buffer of boat soundings, read back at a delay.
+
+    The Ping transducer is at the tow point and the camera is ``layback``
+    metres astern, so a sounding taken now describes seabed the fish
+    reaches ``layback / speed`` seconds later. Sampling into a buffer and
+    reading it back at that delay lines the two instruments up over the
+    same patch of ground; using the instantaneous reading instead biases
+    every altitude by the local bottom slope.
+
+    Sampling runs on its own thread so the capture loop's per-frame
+    telemetry fetch stays a lock-free lookup and gains no HTTP latency.
+    """
+
+    def __init__(self):
+        self._samples = collections.deque()  # (monotonic_ts, depth_m)
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop = threading.Event()
+        self._speed_ms = None
+        self._last_error = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="sonar-history")
+        self._thread.start()
+        logger.info("Sonar history sampler started (%.1f Hz, %.0fs window)",
+                    1.0 / _SONAR_SAMPLE_PERIOD_S, _SONAR_HISTORY_S)
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                snap = get_ping_sonar_snapshot()
+                speed = get_blueboat_speed()
+                now = time.monotonic()
+                with self._lock:
+                    # NaN compares false against itself, which is how a
+                    # bad speed would otherwise slip past the guard and
+                    # poison every subsequent delay.
+                    if isinstance(speed, (int, float)) and speed == speed:
+                        self._speed_ms = float(speed)
+                    # Only in-range soundings are stored. Ping1D emits
+                    # wild values when it loses bottom lock, and a bad
+                    # sample here would silently corrupt an altitude.
+                    if snap and snap.get("in_range") and snap.get("distance_m"):
+                        self._samples.append((now, float(snap["distance_m"])))
+                    cutoff = now - _SONAR_HISTORY_S
+                    while self._samples and self._samples[0][0] < cutoff:
+                        self._samples.popleft()
+                self._last_error = None
+            except Exception as e:  # never let the sampler die
+                self._last_error = str(e)
+                logger.debug("Sonar history sample failed: %s", e)
+            self._stop.wait(max(0.0, _SONAR_SAMPLE_PERIOD_S - (time.monotonic() - t0)))
+
+    def tow_delay_s(self):
+        """Seconds between the boat sounding a point and the fish reaching it.
+
+        ``None`` when there is no usable speed: at a standstill the fish
+        is not over anything the boat has recently sounded, so refusing
+        to guess is better than inventing a delay.
+        """
+        with self._lock:
+            speed = self._speed_ms
+        if tow_offset_m <= 0:
+            return 0.0
+        if speed is None or speed < _TOW_DELAY_MIN_SPEED_MS:
+            return None
+        return min(_TOW_DELAY_MAX_S, tow_offset_m / speed)
+
+    def depth_at_tow_delay(self):
+        """Boat sounding for the patch the towfish is over *now*.
+
+        Returns ``(depth_m, delay_s, age_error_s)`` or ``None`` when no
+        sounding lands close enough to the target instant -- a gap in the
+        buffer must produce no altitude rather than a stale one.
+        """
+        delay = self.tow_delay_s()
+        if delay is None:
+            return None
+        target = time.monotonic() - delay
+        with self._lock:
+            if not self._samples:
+                return None
+            best = min(self._samples, key=lambda s: abs(s[0] - target))
+        err = abs(best[0] - target)
+        if err > _SONAR_MATCH_TOLERANCE_S:
+            return None
+        return (best[1], delay, err)
+
+    def snapshot(self):
+        with self._lock:
+            n = len(self._samples)
+            newest = self._samples[-1][1] if n else None
+            speed = self._speed_ms
+        return {"samples": n, "latest_depth_m": newest,
+                "tow_speed_ms": (round(speed, 2) if speed is not None else None),
+                "tow_delay_s": self.tow_delay_s(),
+                "last_error": self._last_error}
+
+
+_sonar_history = SonarHistory()
+
+
+def compute_towfish_altitude(depth_m):
+    """Height of the towfish above the seabed, in metres.
+
+    ``altitude = boat_sonar_depth - towfish_depth - altitude_offset_m``,
+    where the sonar reading is replayed at the tow delay so both numbers
+    describe the same patch of ground.
+
+    Returns ``(altitude_m, detail)``. ``altitude_m`` is ``None`` whenever
+    any input is missing or the result is non-physical (the fish cannot
+    be below the bottom); ``detail`` always reports what was used so the
+    CSV can record why an altitude is absent.
+    """
+    detail = {"sonar_depth_m": None, "tow_delay_s": None,
+              "sonar_age_err_s": None, "altitude_m": None}
+    if depth_m is None:
+        return (None, detail)
+    hit = _sonar_history.depth_at_tow_delay()
+    if hit is None:
+        return (None, detail)
+    sonar_depth, delay, err = hit
+    detail["sonar_depth_m"] = round(sonar_depth, 2)
+    detail["tow_delay_s"] = round(delay, 1)
+    detail["sonar_age_err_s"] = round(err, 2)
+    alt = sonar_depth - depth_m - altitude_offset_m
+    # A negative altitude means the geometry disagrees with itself
+    # (bad lock, wrong offset, fish deeper than the sounding). Publishing
+    # it would put a physically impossible camera Z into the EXIF.
+    if alt < 0:
+        return (None, detail)
+    detail["altitude_m"] = round(alt, 2)
+    return (alt, detail)
+
+
 def _decode_statustext(msg):
     """Assemble the array-of-chars STATUSTEXT payload into a Python string.
 
@@ -597,6 +790,7 @@ awb_loop_enabled = _cfg["awb_loop_enabled"]
 param_targets = _cfg["param_targets"]
 tow_offset_m = _cfg["tow_offset_m"]
 tow_heading_source = _cfg["tow_heading_source"]
+altitude_offset_m = _cfg["altitude_offset_m"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -611,6 +805,7 @@ def _persist_config():
         "param_targets": param_targets,
         "tow_offset_m": tow_offset_m,
         "tow_heading_source": tow_heading_source,
+        "altitude_offset_m": altitude_offset_m,
     })
 
 # Recording-storage state
@@ -669,18 +864,17 @@ TILT_MOUNT_PITCH_MAX_DEG = 70.0   # MNT1_PITCH_MAX (camera fully up)
 camera_isp_url = 'http://192.168.2.10/action/getISPInfo'
 
 def get_depth_data():
-    """Get depth data from AHRS2 message (altitude is negative underwater). Returns 0.0 on failure."""
-    try:
-        response = requests.get(ahrs2_url, timeout=1)
-        if response.status_code == 200:
-            # In ArduSub, altitude is negative for depth underwater
-            altitude = response.json()['message'].get('altitude', 0.0)
-            # Convert altitude to depth (positive value for underwater)
-            depth = -altitude if altitude < 0 else 0.0
-            return depth
-    except Exception as e:
-        logger.debug(f"Error fetching depth data: {str(e)}")
-    return 0.0
+    """Towfish depth in metres, positive-down. Returns 0.0 on failure.
+
+    Delegates to :func:`_get_towfish_depth_m` (VFR_HUD). This used to read
+    ``AHRS2.altitude``, which this towfish never populates -- it logs as
+    NaN -- so every depth reported to the overlay and the telemetry
+    endpoint was silently zero. Callers that need to distinguish "at the
+    surface" from "no data" should use ``_get_towfish_depth_m`` directly,
+    which returns ``None``.
+    """
+    depth = _get_towfish_depth_m()
+    return depth if depth is not None else 0.0
 
 def get_vfr_hud_data():
     """Get climb rate from VFR_HUD message. Returns 0.0 on failure."""
@@ -1037,14 +1231,16 @@ def create_srt_file(video_path):
 #
 # ``altitude_m`` is the tow vehicle's GPS altitude above MSL (matching
 # the timelapse column of that name); ``towfish_altitude_m`` is the
-# towfish AHRS2 altitude, which is the value that lands in EXIF
+# towfish height above the seabed, which is the value that lands in EXIF
 # ``GPSAltitude``. Both are recorded because they are not the same
-# quantity and photogrammetry needs the latter.
+# quantity and photogrammetry needs the latter. The trailing columns
+# mirror the timelapse CSV's additions.
 _VIDEO_CSV_HEADER = [
     'timestamp', 'video_time_s', 'video_file', 'wp',
     'lat', 'lon', 'altitude_m', 'towfish_altitude_m', 'towfish_heading_deg',
     'towfish_roll_deg', 'towfish_pitch_deg',
     'depth_m', 'temperature_c', 'camera_tilt_deg', 'telem_ms',
+    'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
 ]
 
 _WP_LABEL_RE = re.compile(r'_(wp\d+)(?:_|$)')
@@ -1286,17 +1482,6 @@ def adjust_srt_timing(srt_path, video_duration):
         logger.error(f"Error adjusting SRT timing: {str(e)}")
         return False
 
-def get_towfish_altitude():
-    """Get altitude from towfish AHRS2 message. Returns altitude in meters (negative underwater)."""
-    try:
-        response = requests.get(ahrs2_url, timeout=1)
-        if response.status_code == 200:
-            altitude = response.json()['message'].get('altitude', 0.0)
-            return altitude
-    except Exception as e:
-        logger.debug(f"Error fetching towfish altitude: {str(e)}")
-    return 0.0
-
 def tilt_pwm_to_body_deg(pwm):
     """Map a raw SERVO16 PWM to the body-frame mount pitch (degrees).
 
@@ -1323,7 +1508,7 @@ def tilt_pwm_to_body_deg(pwm):
     return max(lo, min(hi, angle))
 
 
-def get_towfish_camera_tilt(vehicle_pitch_deg=None):
+def get_towfish_camera_tilt(vehicle_pitch_deg=None, with_body=False):
     """Camera tilt (degrees), world-relative (earth-frame). Negative = down.
 
     The mount runs earth-frame stabilised, so the servo continuously
@@ -1336,6 +1521,12 @@ def get_towfish_camera_tilt(vehicle_pitch_deg=None):
     ``vehicle_pitch_deg`` should be the towfish ATTITUDE pitch in degrees;
     if omitted it is fetched here (one extra mavlink2rest GET). Returns
     ``None`` when the servo PWM is unavailable (e.g. disarmed, channel 0).
+
+    With ``with_body`` the return becomes ``(world_deg, body_deg)``. The
+    body-frame angle is the raw servo deflection -- how the camera is
+    aimed relative to the fish itself -- which is recorded alongside the
+    earth-frame value because it is the quantity that describes the
+    physical install rather than the attitude of the moment.
     """
     try:
         response = requests.get(servo_output_url, timeout=1)
@@ -1344,14 +1535,14 @@ def get_towfish_camera_tilt(vehicle_pitch_deg=None):
             pwm = message.get(f'servo{TILT_SERVO_CHANNEL}_raw', None)
             body_deg = tilt_pwm_to_body_deg(pwm)
             if body_deg is None:
-                return None
+                return (None, None) if with_body else None
             if vehicle_pitch_deg is None:
                 vehicle_pitch_deg = get_towfish_attitude().get('pitch')
             world_deg = body_deg + (vehicle_pitch_deg or 0.0)
-            return world_deg
+            return (world_deg, body_deg) if with_body else world_deg
     except Exception as e:
         logger.debug(f"Error fetching camera tilt: {str(e)}")
-    return None
+    return (None, None) if with_body else None
 
 def create_ass_file(video_path):
     """Create a new .ass (Advanced SubStation Alpha) subtitle file for full telemetry overlay."""
@@ -1535,12 +1726,18 @@ def fetch_telemetry_block():
         roll = att.get('roll')
         pitch = att.get('pitch')
         gps_lat, gps_lon = offset_towed_position(bb_lat, bb_lon, heading)
-        tow_alt = get_towfish_altitude()
-        depth = get_depth_data()
+        # Pressure depth from VFR_HUD, not AHRS2: AHRS2.altitude is not
+        # populated on this towfish (it logs as NaN), which used to make
+        # every depth and altitude read zero.
+        depth = _get_towfish_depth_m()
         temp = get_baro_data()
-        # World-relative camera pitch: reuse the ATTITUDE pitch we
-        # already fetched instead of a second round-trip.
-        tilt = get_towfish_camera_tilt(vehicle_pitch_deg=pitch)
+        # World-relative camera pitch plus the raw body-frame mount
+        # angle. Both come from one SERVO_OUTPUT_RAW read.
+        tilt, mount_pitch = get_towfish_camera_tilt(
+            vehicle_pitch_deg=pitch, with_body=True)
+        # Height above the seabed, from the boat's sounder replayed at
+        # the tow delay. This is what lands in EXIF GPSAltitude.
+        tow_alt, alt_detail = compute_towfish_altitude(depth)
     except Exception:
         logger.exception("Telemetry fetch raised")
         bb_lat = bb_lon = bb_alt = None
@@ -1552,12 +1749,18 @@ def fetch_telemetry_block():
         depth = None
         temp = None
         tilt = None
+        mount_pitch = None
+        alt_detail = {"sonar_depth_m": None, "tow_delay_s": None,
+                      "sonar_age_err_s": None, "altitude_m": None}
     return {
         'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
         'gps_lat': gps_lat, 'gps_lon': gps_lon,
         'heading': heading, 'roll': roll, 'pitch': pitch,
         'tow_alt': tow_alt,
         'depth': depth, 'temp': temp, 'tilt': tilt,
+        'mount_pitch': mount_pitch,
+        'sonar_depth': alt_detail['sonar_depth_m'],
+        'tow_delay_s': alt_detail['tow_delay_s'],
         'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
     }
 
@@ -1676,6 +1879,9 @@ def _video_csv_row(ts_local, elapsed, csv_path, wp_label, telem):
         num(telem['temp'], '.2f'),
         num(telem['tilt'], '.1f'),
         f"{telem['fetch_ms']:.1f}",
+        num(telem.get('mount_pitch'), '.1f'),
+        num(telem.get('sonar_depth'), '.2f'),
+        num(telem.get('tow_delay_s'), '.1f'),
     ]
 
 async def data_lake_handler(websocket):
@@ -2647,17 +2853,24 @@ class RecordingSession:
 _TIMELAPSE_PERIOD_S = 0.5  # 2 Hz
 _TIMELAPSE_HTTP_TIMEOUT_S = 1.5
 
-# ``towfish_altitude_m`` is appended at the end rather than slotted in
-# next to ``altitude_m`` so readers that index this CSV positionally keep
-# working against surveys recorded before it existed. It holds the
-# towfish AHRS2 altitude -- the value written to EXIF GPSAltitude --
-# whereas ``altitude_m`` is the tow vehicle's GPS altitude above MSL.
+# New columns are appended rather than slotted in beside related ones so
+# readers that index this CSV positionally keep working against surveys
+# recorded before those columns existed.
+#
+# ``altitude_m`` is the tow vehicle's GPS altitude above MSL.
+# ``towfish_altitude_m`` is the towfish height above the seabed -- the
+# value written to EXIF GPSAltitude -- and ``sonar_bottom_depth_m`` plus
+# ``depth_m`` are the two measurements it was derived from, kept so any
+# altitude can be audited (or recomputed with a corrected offset)
+# afterwards. ``tow_delay_s`` records how far back the sounding was
+# replayed to line the two instruments up over the same ground.
 _TIMELAPSE_CSV_HEADER = [
     'timestamp', 'seq', 'filename', 'source_tag', 'wp', 'frame', 'size_bytes',
     'lat', 'lon', 'altitude_m', 'towfish_heading_deg',
     'towfish_roll_deg', 'towfish_pitch_deg',
     'depth_m', 'temperature_c', 'camera_tilt_deg',
     'snap_ms', 'telem_ms', 'sync_skew_ms', 'towfish_altitude_m',
+    'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
 ]
 
 
@@ -2913,6 +3126,9 @@ class TimelapseSession:
                 depth = None
                 temp = None
                 tilt = None
+                mount_pitch = None
+                sonar_depth = None
+                tow_delay_s = None
             else:
                 bb_lat = telemetry['bb_lat']
                 bb_lon = telemetry['bb_lon']
@@ -2926,6 +3142,11 @@ class TimelapseSession:
                 depth = telemetry['depth']
                 temp = telemetry['temp']
                 tilt = telemetry['tilt']
+                mount_pitch = telemetry.get('mount_pitch')
+                sonar_depth = telemetry.get('sonar_depth')
+                tow_delay_s = telemetry.get('tow_delay_s')
+            xy_acc, z_acc = photogrammetry_meta.reference_accuracy_m(
+                tow_offset_m, tow_alt)
 
             # Embed GPS+heading+tilt+timestamp into EXIF and the camera
             # orientation into Pix4D-namespace XMP before writing, so the
@@ -2938,6 +3159,8 @@ class TimelapseSession:
                 jpeg, gps_lat, gps_lon, tow_alt, heading, ts_local, ts_utc,
                 tilt_deg=tilt, depth_m=depth, temp_c=temp,
                 roll_deg=roll, pitch_deg=pitch,
+                mount_pitch_deg=mount_pitch, sonar_depth_m=sonar_depth,
+                xy_accuracy_m=xy_acc, z_accuracy_m=z_acc,
             )
 
             # Claim the global day sequence + per-waypoint frame number
@@ -3018,6 +3241,9 @@ class TimelapseSession:
                         f"{telem_ms:.1f}" if telem_ms >= 0 else "",
                         f"{sync_skew_ms:.1f}" if sync_skew_ms >= 0 else "",
                         f"{tow_alt:.2f}" if tow_alt is not None else "",
+                        f"{mount_pitch:.1f}" if mount_pitch is not None else "",
+                        f"{sonar_depth:.2f}" if sonar_depth is not None else "",
+                        f"{tow_delay_s:.1f}" if tow_delay_s is not None else "",
                     ])
             except Exception:
                 logger.exception("TIMELAPSE CSV write failed")
@@ -3050,7 +3276,7 @@ def register_service():
 def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
     global transect_capture_type, storage_preference, awb_loop_enabled
-    global tow_offset_m, tow_heading_source
+    global tow_offset_m, tow_heading_source, altitude_offset_m
 
     if request.method == 'POST':
         # The AWB-loop toggle is safe to change while a mode is active
@@ -3141,6 +3367,19 @@ def config():
             tow_offset_m = _sanitize_tow_offset_m(offset_val)
             changed = True
 
+        new_alt_offset = data.get('altitude_offset_m')
+        if new_alt_offset is not None:
+            try:
+                alt_offset_val = float(new_alt_offset)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "altitude_offset_m must be a number"}), 400
+            if not (ALTITUDE_OFFSET_MIN_M <= alt_offset_val <= ALTITUDE_OFFSET_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"altitude_offset_m must be between {ALTITUDE_OFFSET_MIN_M} and {ALTITUDE_OFFSET_MAX_M} m"}), 400
+            altitude_offset_m = _sanitize_altitude_offset_m(alt_offset_val)
+            changed = True
+
         new_heading_src = data.get('tow_heading_source')
         if new_heading_src is not None:
             new_heading_src = str(new_heading_src).strip().lower()
@@ -3158,10 +3397,10 @@ def config():
             "Config updated: tow_vehicle_ip=%s, container_format=%s, "
             "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s, "
             "storage_preference=%s, awb_loop_enabled=%s, tow_offset_m=%s, "
-            "tow_heading_source=%s",
+            "tow_heading_source=%s, altitude_offset_m=%s",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
             transect_capture_type, storage_preference, awb_loop_enabled,
-            tow_offset_m, tow_heading_source,
+            tow_offset_m, tow_heading_source, altitude_offset_m,
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
@@ -3172,7 +3411,8 @@ def config():
                         "storage_preference": storage_preference,
                         "awb_loop_enabled": awb_loop_enabled,
                         "tow_offset_m": tow_offset_m,
-                        "tow_heading_source": tow_heading_source})
+                        "tow_heading_source": tow_heading_source,
+                        "altitude_offset_m": altitude_offset_m})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -3188,6 +3428,9 @@ def config():
         "tow_heading_sources": list(VALID_TOW_HEADING_SOURCES),
         "tow_offset_min_m": TOW_OFFSET_MIN_M,
         "tow_offset_max_m": TOW_OFFSET_MAX_M,
+        "altitude_offset_m": altitude_offset_m,
+        "altitude_offset_min_m": ALTITUDE_OFFSET_MIN_M,
+        "altitude_offset_max_m": ALTITUDE_OFFSET_MAX_M,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -4778,6 +5021,11 @@ def get_status():
             # BlueBoat Ping sonar (DISTANCE_SENSOR) -- water depth under
             # the surface craft. Null when the boat is unreachable.
             "ping_sonar": get_ping_sonar_snapshot(),
+            # Buffered soundings behind the altitude calculation. An
+            # empty buffer or a null delay is why EXIF altitude would be
+            # missing, so surface it rather than making the operator
+            # discover it in the CSV after the survey.
+            "sonar_history": _sonar_history.snapshot(),
             # Live tilt / focus / zoom PWM readouts so the OPTICS tab
             # can render a phosphor readout without a separate call.
             "optics": get_optics_snapshot(),
@@ -5470,6 +5718,14 @@ if __name__ == '__main__':
         _kick_off_startup_optics()
     except Exception as e:
         logger.warning(f"Startup optics init failed to start: {e}")
+
+    # Soundings have to be buffered continuously, not just while
+    # recording: the altitude for the very first frame of a leg needs a
+    # sounding taken one tow-delay before that frame existed.
+    try:
+        _sonar_history.start()
+    except Exception as e:
+        logger.warning(f"Sonar history sampler failed to start: {e}")
 
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)

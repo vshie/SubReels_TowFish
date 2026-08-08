@@ -70,10 +70,17 @@ scope, tow speed and depth. Planned work:
 - **Transect auto capture** — watches the tow boat's mission over `mavlink2rest`
   and rolls a new file or image folder at every `MISSION_CURRENT.seq` change,
   keeping the RTSP pipeline alive across leg boundaries.
-- **Geotagged stills** — 2 Hz JPEGs with GPS position, altitude and full towfish
-  attitude written into EXIF plus Pix4D-namespace XMP (`Camera:Yaw/Pitch/Roll`,
-  read by Agisoft Metashape, Pix4D and WebODM), and a `telemetry.csv` sidecar
-  per session.
+- **Geotagged stills** — 2 Hz JPEGs with GPS position, height above the seabed
+  and full towfish attitude written into EXIF plus Pix4D-namespace XMP
+  (`Camera:Yaw/Pitch/Roll` and `GPSXYAccuracy`/`GPSZAccuracy`, read by Agisoft
+  Metashape, Pix4D and WebODM), and a `telemetry.csv` sidecar per session.
+- **Height above the seabed** — the towfish has no altimeter, so altitude is
+  `boat sonar − towfish depth − offset`, with the sounding replayed at the tow
+  delay (layback ÷ boat speed) so both instruments describe the same patch of
+  ground. The offset is set under TOW GEOMETRY and absorbs the sonar
+  transducer's depth below the waterline. This is what lands in EXIF
+  `GPSAltitude`; because it follows the bathymetry rather than a fixed datum,
+  `GPSZAccuracy` is published alongside so the solver does not over-trust it.
 - **Telemetry sidecars for video** — every recording gets a `*_telemetry.csv`
   at 5 Hz carrying the same fields as the stills path, so frames extracted
   later with `extract_geotagged_frames.py` come out with identical metadata.
