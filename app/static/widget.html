@@ -308,7 +308,14 @@
             color: var(--ink-dim);
         }
         /* Depth-jog activity flag -- always visible so the operator sees
-           the simulated pilot input regardless of which tab is open. */
+           the simulated pilot input regardless of which tab is open.
+
+           The flag lives inside a depth cell, so its box is load-bearing:
+           anything that makes it taller grows the status strip and shoves
+           every panel below it down, out from under the finger holding a
+           jog button. It only has the cell's leftover width, so a longer
+           label wrapped to three lines and moved the buttons 14px. Hence
+           nowrap here and a constant-length label in the render loop. */
         .jog-flag {
             margin-left: 6px;
             font-size: 12.5px;
@@ -319,6 +326,8 @@
             border: 1px solid transparent;
             color: var(--off);
             visibility: hidden;
+            white-space: nowrap;
+            text-align: center;
         }
         .jog-flag.up, .jog-flag.down {
             visibility: visible;
@@ -769,7 +778,7 @@
                     <span class="dlabel">DEPTH</span>
                     <span class="dvalue dim" id="depthValue">--</span>
                     <span class="dunit">m</span>
-                    <span class="jog-flag" id="jogFlag">JOG</span>
+                    <span class="jog-flag" id="jogFlag">· JOG</span>
                 </div>
                 <div class="depth-cell ping">
                     <span class="dlabel">PING</span>
@@ -1157,6 +1166,11 @@ function bindHold(el, direction) {
         e.preventDefault();
         if (active) return;
         active = true;
+        // Capture the pointer so the hold belongs to this button until
+        // it is released, wherever the finger actually ends up. Without
+        // it a jog dies the moment the pointer slips off the edge, which
+        // on a small MFD is most of the time.
+        try { el.setPointerCapture(e.pointerId); } catch (_) { /* pre-capture browsers */ }
         el.classList.add('held');
         const send = () => postJson('/vehicle/thrust', { direction, pwm: jogPwmFor(direction) });
         send();
@@ -1164,10 +1178,11 @@ function bindHold(el, direction) {
     };
     el.addEventListener('pointerdown', start);
     // Release anywhere, not just on the button, so a pointer that drifts
-    // off or a swallowed pointerup can't leave the jog latched on.
+    // off or a swallowed pointerup can't leave the jog latched on. There
+    // is deliberately no pointerleave stop: it cannot tell a deliberate
+    // release from a wobble, and pointerup here already covers both.
     window.addEventListener('pointerup', stop);
     window.addEventListener('pointercancel', stop);
-    el.addEventListener('pointerleave', stop);
     // Safety: release if the tab hides (user swipes away) or focus is lost.
     document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
     window.addEventListener('blur', stop);
@@ -1195,19 +1210,29 @@ document.querySelectorAll('[data-zoom]').forEach(btn => {
 document.querySelectorAll('[data-focus-delta]').forEach(btn => {
     let iv = null;
     const step = () => focusPost({ delta_pct: parseFloat(btn.dataset.focusDelta) });
+    const stop = () => {
+        if (!iv) return;
+        clearInterval(iv); iv = null;
+        btn.classList.remove('held');
+    };
     const start = (e) => {
         e.preventDefault();
+        if (iv) return;
+        // Same hold semantics as the depth jog: capture the pointer so a
+        // finger that drifts off the button keeps nudging.
+        try { btn.setPointerCapture(e.pointerId); } catch (_) { /* pre-capture browsers */ }
         step();
         // Hold-repeat at ~8 Hz so a long press nudges smoothly without
         // saturating mavlink2rest with duplicate ACCEPTED cmds.
         iv = setInterval(step, 130);
         btn.classList.add('held');
     };
-    const stop = () => { clearInterval(iv); iv = null; btn.classList.remove('held'); };
     btn.addEventListener('pointerdown', start);
-    btn.addEventListener('pointerup', stop);
-    btn.addEventListener('pointerleave', stop);
-    btn.addEventListener('pointercancel', stop);
+    // Release is watched on the window, not the button: a pointerup that
+    // lands anywhere else would otherwise leave the repeat running until
+    // the tab closed, walking focus off its mark.
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
 });
 $('focusTrimBtn').addEventListener('click', () => focusPost({ trim: true }));
 $('focusRefreshBtn').addEventListener('click', () => {
@@ -1331,8 +1356,11 @@ async function pollStatus() {
         const jogPwm = thr.pwm != null ? thr.pwm : 1500;
         const jogFlag = $('jogFlag');
         jogFlag.className = 'jog-flag' + (dir ? ' ' + dir : '');
-        jogFlag.textContent = dir === 'up' ? '\u25B2 JOG UP'
-                            : dir === 'down' ? '\u25BC JOG DOWN' : 'JOG';
+        // Every state is the same character count so the flag's box never
+        // changes size. The arrow already carries the direction, and the
+        // DEPTH JOG title below spells it out in full.
+        jogFlag.textContent = dir === 'up' ? '\u25B2 JOG'
+                            : dir === 'down' ? '\u25BC JOG' : '\u00B7 JOG';
         const jogState = $('jogState');
         if (jogState) {
             jogState.textContent = dir
