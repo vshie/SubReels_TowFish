@@ -751,6 +751,98 @@
             border-color: var(--amber);
             box-shadow: 0 0 5px var(--amber-glow);
         }
+
+        /* Surf-track target-altitude cell and status readout. Same
+           two-column grid the depth strip uses so the widget's visual
+           rhythm matches. The engaged/tracking/holding tint on
+           #surfState is applied by JS via classes below. */
+        .surf-target-cell {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            padding: 4px 6px;
+            border: 1px solid #14313a;
+            border-radius: 3px;
+            background: var(--panel-inset);
+        }
+        .surf-target-label {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            color: var(--ink-dim);
+        }
+        .surf-target {
+            font-family: 'Orbitron', var(--mono);
+            font-weight: 800;
+            font-size: 22px;
+            color: var(--sky);
+            text-shadow: 0 0 6px var(--sky-glow);
+        }
+        .surf-target-unit {
+            font-size: 12px;
+            color: var(--ink-dim);
+            letter-spacing: 0.06em;
+        }
+        .surf-readout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .surf-cell {
+            display: flex;
+            align-items: baseline;
+            gap: 4px;
+            padding: 4px 6px;
+            background: var(--panel-inset);
+            border: 1px solid #14261d;
+            border-radius: 3px;
+        }
+        .surf-label {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            color: var(--ink-dim);
+        }
+        .surf-value {
+            font-family: 'Orbitron', var(--mono);
+            font-weight: 700;
+            font-size: 18px;
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            min-width: 2ch;
+            text-align: right;
+        }
+        .surf-value.dim {
+            color: var(--ink-dim);
+            text-shadow: none;
+        }
+        .surf-unit {
+            font-size: 11px;
+            color: var(--ink-dim);
+            letter-spacing: 0.06em;
+        }
+        /* SURF TRACK state pill in the section title. Amber while
+           holding (loop is off the stick but engaged), phosphor while
+           tracking, sky-glow while lit but disabled/inactive. */
+        #surfState {
+            padding: 1px 6px;
+            border-radius: 2px;
+            border: 1px solid transparent;
+        }
+        #surfState.tracking {
+            color: var(--phosphor);
+            border-color: #1e402c;
+            background: #071410;
+        }
+        #surfState.holding {
+            color: var(--amber);
+            border-color: #4a3a16;
+            background: #191207;
+        }
+        /* Small nudge buttons -- share the .btn.small footprint from
+           the optics tab. */
     </style>
 </head>
 <body>
@@ -832,10 +924,40 @@
             </div>
             <div class="section">
                 <div class="section-title">FLIGHT MODE</div>
-                <div class="row">
+                <div class="row three">
                     <button class="btn" id="vehStabilizeBtn">STABILIZE</button>
                     <button class="btn" id="vehAltHoldBtn">ALT_HOLD</button>
+                    <button class="btn sky" id="vehSurfTrackBtn">SURF TRACK</button>
                 </div>
+                <div class="hint">
+                    SURF TRACK holds a set altitude over the seabed using the
+                    boat's Ping sonar. Autopilot is put in ALT_HOLD; the
+                    extension biases RC3.
+                </div>
+            </div>
+            <div class="section" id="surfTrackSection">
+                <div class="section-title">SURF TRACK <span class="aux" id="surfState">DISABLED</span></div>
+                <div class="row three">
+                    <button class="btn small" data-surf-target="-0.5">▼ 0.5</button>
+                    <div class="surf-target-cell">
+                        <span class="surf-target-label">TGT</span>
+                        <span class="surf-target" id="surfTargetVal">4.0</span>
+                        <span class="surf-target-unit">m</span>
+                    </div>
+                    <button class="btn small" data-surf-target="+0.5">▲ 0.5</button>
+                </div>
+                <div class="surf-readout">
+                    <div class="surf-cell">
+                        <span class="surf-label">ALT</span>
+                        <span class="surf-value" id="surfAlt">--</span>
+                        <span class="surf-unit">m</span>
+                    </div>
+                    <div class="surf-cell">
+                        <span class="surf-label">CMD</span>
+                        <span class="surf-value" id="surfCmd">--</span>
+                    </div>
+                </div>
+                <div class="hint" id="surfHint">Not engaged.</div>
             </div>
             <div class="section">
                 <div class="section-title">DEPTH JOG <span class="aux" id="jogState">RC3 NEUTRAL · 1500</span></div>
@@ -844,8 +966,8 @@
                     <button class="btn amber" id="thrustDownBtn">▼ DOWN</button>
                 </div>
                 <div class="jog-tune">
-                    <label>UP µs <input type="number" id="jogUpPwm" min="1500" max="1900" step="10" value="1600"></label>
-                    <label>DN µs <input type="number" id="jogDownPwm" min="1100" max="1500" step="10" value="1400"></label>
+                    <label>UP µs <input type="number" id="jogUpPwm" min="1501" max="1900" step="10" value="1600"></label>
+                    <label>DN µs <input type="number" id="jogDownPwm" min="1100" max="1499" step="10" value="1400"></label>
                 </div>
                 <div class="hint" id="jogHint">RELEASE TO HAND OFF TO ALT_HOLD</div>
             </div>
@@ -1119,9 +1241,12 @@ $('vehAltHoldBtn').addEventListener('click',   () => postJson('/vehicle/mode', {
 $('tiltDownBtn').addEventListener('click',     () => postJson('/vehicle/tilt-down', {}));
 
 // Operator-tunable jog PWM. The field value is what gets sent to the
-// autopilot on RC3 while a button is held; persisted so a survey keeps
-// its tuning across reloads. Clamped to the same band the backend
-// enforces (1100..1900) with a direction-sane split around neutral (1500).
+// autopilot on RC3 while a button is held, and the surf-track loop uses
+// the same two numbers as its full-scale authority so the arrows and
+// the loop push the stick with the same force. Persisted server-side
+// via /config (used to be browser localStorage; that was a wart because
+// tuning did not follow the survey to a different tablet, and the
+// backend had no copy for the automatic loop to read).
 function clampJog(v, direction) {
     v = Math.round(Number(v));
     if (!isFinite(v)) return direction === 'up' ? 1600 : 1400;
@@ -1132,17 +1257,79 @@ function jogPwmFor(direction) {
     const el = direction === 'up' ? $('jogUpPwm') : $('jogDownPwm');
     return clampJog(el.value, direction);
 }
+let _jogConfigLoaded = false;
+async function loadJogConfig() {
+    try {
+        const res = await fetch('/config?_=' + Date.now());
+        const d = await res.json();
+        if (d.jog_up_pwm   != null) $('jogUpPwm').value   = d.jog_up_pwm;
+        if (d.jog_down_pwm != null) $('jogDownPwm').value = d.jog_down_pwm;
+        if (d.surf_target_altitude_m != null) {
+            surfTargetVal.textContent = Number(d.surf_target_altitude_m).toFixed(1);
+        }
+    } catch (_) {}
+    _jogConfigLoaded = true;
+}
 ['jogUpPwm', 'jogDownPwm'].forEach(id => {
     const el = $(id);
     const dir = id === 'jogUpPwm' ? 'up' : 'down';
-    const saved = localStorage.getItem('towfish.' + id);
-    if (saved !== null) el.value = saved;
+    // Commit on change: normalise, then persist server-side. The
+    // widget does not touch localStorage anymore -- the /config POST
+    // is the source of truth.
     const commit = () => {
         el.value = clampJog(el.value, dir);
-        localStorage.setItem('towfish.' + id, el.value);
+        if (!_jogConfigLoaded) return;
+        const payload = {};
+        payload[id === 'jogUpPwm' ? 'jog_up_pwm' : 'jog_down_pwm'] = Number(el.value);
+        postJson('/config', payload);
     };
     el.addEventListener('change', commit);
 });
+
+// -- SURF TRACK ---------------------------------------------------------
+// The extension's own altitude-hold "flight mode" -- it drives RC3
+// through the same shared path the operator uses, so the widget just
+// treats it as a button that engages/disengages the loop. The loop's
+// current state comes back on /status.
+const surfTargetVal = $('surfTargetVal');
+const surfStateEl   = $('surfState');
+const surfAltEl     = $('surfAlt');
+const surfCmdEl     = $('surfCmd');
+const surfHintEl    = $('surfHint');
+let surfTrackEnabled = false;
+
+$('vehSurfTrackBtn').addEventListener('click', () => {
+    postJson('/vehicle/surftrack', { enabled: !surfTrackEnabled });
+});
+
+// Nudge target altitude in 0.5 m steps. Server clamps to the
+// SURF_TARGET_ALTITUDE_MIN/MAX band anyway, but we mirror it here so
+// the display doesn't briefly show an out-of-band value before the
+// POST reply lands.
+document.querySelectorAll('[data-surf-target]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+        const delta = parseFloat(btn.dataset.surfTarget);
+        const cur = parseFloat(surfTargetVal.textContent) || 4.0;
+        const wanted = Math.max(1.0, Math.min(6.0, cur + delta));
+        const data = await postJson('/vehicle/surftrack',
+                                    { target_altitude_m: wanted });
+        if (data && data.success && data.target_altitude_m != null) {
+            surfTargetVal.textContent = Number(data.target_altitude_m).toFixed(1);
+        }
+    });
+});
+
+// Human-readable holding reason. Kept out of the machine string so the
+// widget can be phrased for an operator without changing the API.
+const SURF_HOLD_REASONS = {
+    'no_depth':          'no towfish depth reading',
+    'at_surface':        'towfish at/near surface',
+    'disarmed':          'vehicle disarmed',
+    'mode_not_alt_hold': 'autopilot not in ALT_HOLD',
+    'sonar_stale':       'boat sonar has no bottom lock',
+    'not_underway':      'boat not underway',
+    'geometry_insane':   'bottom reads above fish (bad lock)',
+};
 
 // Hold-to-thrust: while pointer is down we ping /vehicle/thrust every
 // 200 ms with a keep-alive carrying the tuned PWM; on release we send
@@ -1354,6 +1541,7 @@ async function pollStatus() {
         const thr = data.thrust || {};
         const dir = thr.active ? thr.direction : null;
         const jogPwm = thr.pwm != null ? thr.pwm : 1500;
+        const jogSource = thr.source || null; // 'operator' | 'surftrack'
         const jogFlag = $('jogFlag');
         jogFlag.className = 'jog-flag' + (dir ? ' ' + dir : '');
         // Every state is the same character count so the flag's box never
@@ -1363,21 +1551,92 @@ async function pollStatus() {
                             : dir === 'down' ? '\u25BC JOG' : '\u00B7 JOG';
         const jogState = $('jogState');
         if (jogState) {
+            // Prefix with AUTO when the surf-track loop is the one
+            // driving. Operator-driven and neutral both read the same
+            // as before.
+            const label = jogSource === 'surftrack' ? 'AUTO' : 'RC3';
             jogState.textContent = dir
-                ? `RC3 ${dir.toUpperCase()} \u00B7 ${jogPwm}`
+                ? `${label} ${dir.toUpperCase()} \u00B7 ${jogPwm}`
                 : `RC3 NEUTRAL \u00B7 ${jogPwm}`;
         }
         // Mode-aware hint: only ALT_HOLD latches the new depth on release;
         // STABILIZE/MANUAL are direct thrust and just stop when released.
+        // Surf-track appends its own note so the operator can tell why the
+        // stick is moving when they aren't touching it.
         const jogHint = $('jogHint');
         if (jogHint) {
+            let base;
             if (veh.mode_label === 'ALT_HOLD') {
-                jogHint.textContent = 'RELEASE HANDS OFF TO ALT_HOLD (HOLDS DEPTH)';
+                base = 'RELEASE HANDS OFF TO ALT_HOLD (HOLDS DEPTH)';
             } else if (veh.mode_label === 'STABILIZE' || veh.mode_label === 'MANUAL') {
-                jogHint.textContent = `${veh.mode_label}: DIRECT THRUST \u2014 NO AUTO-HOLD ON RELEASE`;
+                base = `${veh.mode_label}: DIRECT THRUST \u2014 NO AUTO-HOLD ON RELEASE`;
             } else {
-                jogHint.textContent = 'RC3 OVERRIDE \u2014 RELEASE RETURNS STICK TO AUTOPILOT';
+                base = 'RC3 OVERRIDE \u2014 RELEASE RETURNS STICK TO AUTOPILOT';
             }
+            if (jogSource === 'surftrack') {
+                base = 'SURF TRACK IS FLYING RC3 \u2014 HOLD UP/DOWN TO INTERRUPT';
+            }
+            jogHint.textContent = base;
+        }
+
+        // -- SURF TRACK state --------------------------------------
+        const surf = data.surftrack || {};
+        surfTrackEnabled = !!surf.enabled;
+        if (surf.target_altitude_m != null
+                && document.activeElement !== surfTargetVal) {
+            surfTargetVal.textContent = Number(surf.target_altitude_m).toFixed(1);
+        }
+        const surfBtn = $('vehSurfTrackBtn');
+        surfBtn.classList.toggle('active', surfTrackEnabled);
+        // Status pill in the section title.
+        surfStateEl.className = '';
+        if (!surf.enabled) {
+            surfStateEl.textContent = 'DISABLED';
+        } else if (surf.state === 'holding') {
+            surfStateEl.textContent = 'HOLDING';
+            surfStateEl.classList.add('holding');
+        } else if (surf.state === 'tracking') {
+            surfStateEl.textContent = 'TRACKING';
+            surfStateEl.classList.add('tracking');
+        } else {
+            surfStateEl.textContent = surf.state ? surf.state.toUpperCase() : '--';
+        }
+        // ALT readout: true present altitude (delayed sounding), not
+        // the lookahead the loop is chasing.
+        if (typeof surf.altitude_m === 'number') {
+            surfAltEl.textContent = surf.altitude_m.toFixed(1);
+            surfAltEl.classList.remove('dim');
+        } else {
+            surfAltEl.textContent = '--';
+            surfAltEl.classList.add('dim');
+        }
+        // CMD readout: the loop's current RC3 command, or -- when
+        // inside the deadband and ALT_HOLD is holding on its own.
+        if (surf.enabled && surf.command) {
+            const arrow = surf.command.direction === 'down' ? '\u25BC'
+                        : surf.command.direction === 'up'   ? '\u25B2' : '\u00B7';
+            surfCmdEl.textContent = `${arrow} ${surf.command.pwm}`;
+            surfCmdEl.classList.remove('dim');
+        } else {
+            surfCmdEl.textContent = surf.enabled ? 'HOLD' : '--';
+            surfCmdEl.classList.toggle('dim', !surf.enabled);
+        }
+        // Human-readable hint that shows what the loop is doing right
+        // now, or why it is not doing anything.
+        if (!surf.enabled) {
+            surfHintEl.textContent = 'Not engaged. Requires ALT_HOLD and a boat sonar lock while underway.';
+        } else if (surf.state === 'holding') {
+            const why = SURF_HOLD_REASONS[surf.hold_reason] || surf.hold_reason || 'holding';
+            surfHintEl.textContent = `HOLDING: ${why}. RC3 released; ALT_HOLD keeps depth.`;
+        } else if (surf.state === 'tracking' && !surf.command) {
+            surfHintEl.textContent = 'On target. Inside the deadband; ALT_HOLD holds depth.';
+        } else if (surf.state === 'tracking' && surf.command) {
+            const err = typeof surf.error_m === 'number'
+                ? `${surf.error_m > 0 ? '+' : ''}${surf.error_m.toFixed(2)} m`
+                : '';
+            surfHintEl.textContent = `Tracking ${err}`;
+        } else {
+            surfHintEl.textContent = '';
         }
 
         // Rec lamp
@@ -1533,6 +1792,7 @@ async function pollFileSize() {
 }
 
 renderRecordUI();
+loadJogConfig();
 pollStatus();
 pollFileSize();
 setInterval(pollStatus,  2000);

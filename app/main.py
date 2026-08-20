@@ -218,6 +218,22 @@ DEFAULT_ALTITUDE_OFFSET_M = 0.0
 ALTITUDE_OFFSET_MIN_M = -5.0
 ALTITUDE_OFFSET_MAX_M = 5.0
 
+# ── Depth-jog PWM authority ──────────────────────────────────────────────
+# Operator-tunable "how hard to drive RC3" pair. Split around the 1500
+# neutral so a fat-fingered field entry cannot cross zero and command the
+# opposite direction of the button held. The widget used to keep these in
+# browser localStorage only, which meant a fresh tablet would forget the
+# operator's tuning *and* left the backend with no way to reuse the same
+# authority for the automatic surf-track loop -- the arrows and the loop
+# would push the stick with different force. Persisting them here makes
+# one number govern both. Bounds match the widget's existing clampJog().
+DEFAULT_JOG_UP_PWM = Z_PWM_ASCEND
+DEFAULT_JOG_DOWN_PWM = Z_PWM_DESCEND
+JOG_UP_PWM_MIN = Z_PWM_NEUTRAL + 1  # 1501: never let "up" cross neutral
+JOG_UP_PWM_MAX = Z_PWM_MAX
+JOG_DOWN_PWM_MIN = Z_PWM_MIN
+JOG_DOWN_PWM_MAX = Z_PWM_NEUTRAL - 1  # 1499: never let "down" cross neutral
+
 # The boat sounds the bottom the fish has not reached yet: the transducer
 # leads the camera by the layback distance. Pairing the two instruments at
 # the same wall-clock instant therefore reads the wrong patch of seabed
@@ -228,6 +244,76 @@ _SONAR_SAMPLE_PERIOD_S = 0.5    # 2 Hz, matching the timelapse cadence
 _SONAR_MATCH_TOLERANCE_S = 3.0  # reject if no sounding lands this close
 _TOW_DELAY_MIN_SPEED_MS = 0.15  # below this the delay is meaningless
 _TOW_DELAY_MAX_S = 60.0
+
+# ── Towfish surf-track control loop ──────────────────────────────────────
+# Backend altitude-hold controller. Drives the same RC3 depth-jog path the
+# widget's UP/DOWN buttons use, so at most one writer touches the channel.
+# The autopilot stays in ALT_HOLD -- surf-track just biases the depth the
+# autopilot holds, using the boat's Ping sounding read as a lookahead so
+# terrain changes are anticipated (the boat leads the fish by the layback).
+#
+# Two knobs shape the loop; both are persisted so a survey keeps its
+# tuning across restarts:
+#   * ``surf_deadband_m`` -- inside this altitude error the loop lets go
+#     of RC3 and ALT_HOLD's own depth hold keeps the fish where it is.
+#     Tighter over flat sand; looser over rubble to avoid chasing every
+#     boulder.
+#   * ``surf_full_scale_error_m`` -- the altitude error at which the loop
+#     asks for the operator's full jog authority. Smaller = more
+#     aggressive. This is the P gain in disguise.
+#
+# Safety rails (bad sounding is the only realistic route to flying the
+# fish into the bottom):
+#   * ``SURF_TARGET_SLEW_MPS`` -- max metres/sec the *commanded* depth
+#     can move, so a bottom-lock jump from 8 m to 40 m ramps rather than
+#     slamming a full-scale descent.
+#   * ``surf_max_depth_m`` -- absolute cap on the commanded depth. Even
+#     with a bogus sounding the loop cannot dive past this.
+DEFAULT_SURF_TARGET_ALTITUDE_M = 4.0
+SURF_TARGET_ALTITUDE_MIN_M = 1.0
+SURF_TARGET_ALTITUDE_MAX_M = 6.0
+
+DEFAULT_SURF_DEADBAND_M = 0.1
+SURF_DEADBAND_MIN_M = 0.02
+SURF_DEADBAND_MAX_M = 1.0
+
+DEFAULT_SURF_FULL_SCALE_ERROR_M = 1.0
+SURF_FULL_SCALE_ERROR_MIN_M = 0.2
+SURF_FULL_SCALE_ERROR_MAX_M = 5.0
+
+DEFAULT_SURF_MAX_DEPTH_M = 50.0
+SURF_MAX_DEPTH_MIN_M = 2.0
+SURF_MAX_DEPTH_MAX_M = 300.0
+
+# Minimum fraction of jog authority below which thruster deadband and tow
+# drag would swallow the command. Keeping the loop above this floor lets
+# it converge into the deadband instead of stalling just outside it.
+SURF_MIN_FRAC = 0.35
+# Slew limit on the commanded depth, m/s. Slow enough that a spurious
+# bottom-lock jump ramps rather than slams; fast enough that a real
+# terrain change is tracked before the fish is over it.
+SURF_TARGET_SLEW_MPS = 0.3
+# 2 Hz tick. Sonar samples at 2 Hz too, so a faster loop would only
+# repeat the same reading.
+SURF_TICK_S = 0.5
+# Ping1D freshness ceiling. Reuses the same tolerance the delayed altitude
+# lookup applies; the buffer only stores in-range samples, so freshness
+# doubles as a bottom-lock check.
+SURF_SONAR_MAX_AGE_S = _SONAR_MATCH_TOLERANCE_S
+# Depth below which we treat the fish as "not deployed" and refuse to
+# drive it deeper on our own -- an operator hand-flies from the surface.
+SURF_SURFACE_DEPTH_M = 0.5
+# Boat speed below which the tow geometry stops making sense.
+SURF_MIN_TOW_SPEED_MS = _TOW_DELAY_MIN_SPEED_MS
+# Manual UP/DOWN wins outright: on each operator input the surf-track
+# controller stops writing RC3 for this many seconds after the last hit,
+# so a brushed button briefly suspends rather than silently disengages
+# the mode mid-survey.
+SURF_OPERATOR_COOLDOWN_S = 2.0
+# Hold-conditions have to hold continuously for this long before the
+# loop resumes writing. Debounces a flickering bottom lock so the
+# controller does not chatter on the edge of a bad sample.
+SURF_RESUME_DEBOUNCE_S = 2.0
 
 # One-push white-balance loop that runs while the transect monitor is
 # enabled. The operator can flip this off from the widget for scenes
@@ -413,6 +499,62 @@ def _sanitize_tow_heading_source(raw, fallback=DEFAULT_TOW_HEADING_SOURCE):
     return value if value in VALID_TOW_HEADING_SOURCES else fallback
 
 
+def _sanitize_pwm(raw, lo, hi, fallback):
+    """Coerce a saved/posted PWM value into ``int`` and clamp to ``[lo, hi]``.
+
+    NaN/inf and unparseable strings fall back to the default. Values that
+    round to inside the neutral band the caller reserved (e.g. an "up"
+    PWM at 1500) are treated as clearly out of range and clamped up to
+    the minimum too, matching the widget's own ``clampJog``.
+    """
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return int(fallback)
+    if num != num or num in (float("inf"), float("-inf")):
+        return int(fallback)
+    return int(max(lo, min(hi, round(num))))
+
+
+def _sanitize_jog_up_pwm(raw, fallback=DEFAULT_JOG_UP_PWM):
+    return _sanitize_pwm(raw, JOG_UP_PWM_MIN, JOG_UP_PWM_MAX, fallback)
+
+
+def _sanitize_jog_down_pwm(raw, fallback=DEFAULT_JOG_DOWN_PWM):
+    return _sanitize_pwm(raw, JOG_DOWN_PWM_MIN, JOG_DOWN_PWM_MAX, fallback)
+
+
+def _sanitize_float(raw, lo, hi, fallback):
+    """Same shape as :func:`_sanitize_pwm` for continuous knobs."""
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if num != num or num in (float("inf"), float("-inf")):
+        return float(fallback)
+    return float(max(lo, min(hi, num)))
+
+
+def _sanitize_surf_target_altitude_m(raw, fallback=DEFAULT_SURF_TARGET_ALTITUDE_M):
+    return _sanitize_float(raw, SURF_TARGET_ALTITUDE_MIN_M,
+                           SURF_TARGET_ALTITUDE_MAX_M, fallback)
+
+
+def _sanitize_surf_deadband_m(raw, fallback=DEFAULT_SURF_DEADBAND_M):
+    return _sanitize_float(raw, SURF_DEADBAND_MIN_M,
+                           SURF_DEADBAND_MAX_M, fallback)
+
+
+def _sanitize_surf_full_scale_error_m(raw, fallback=DEFAULT_SURF_FULL_SCALE_ERROR_M):
+    return _sanitize_float(raw, SURF_FULL_SCALE_ERROR_MIN_M,
+                           SURF_FULL_SCALE_ERROR_MAX_M, fallback)
+
+
+def _sanitize_surf_max_depth_m(raw, fallback=DEFAULT_SURF_MAX_DEPTH_M):
+    return _sanitize_float(raw, SURF_MAX_DEPTH_MIN_M,
+                           SURF_MAX_DEPTH_MAX_M, fallback)
+
+
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
@@ -427,6 +569,12 @@ def load_config():
         "tow_offset_m": DEFAULT_TOW_OFFSET_M,
         "tow_heading_source": DEFAULT_TOW_HEADING_SOURCE,
         "altitude_offset_m": DEFAULT_ALTITUDE_OFFSET_M,
+        "jog_up_pwm": DEFAULT_JOG_UP_PWM,
+        "jog_down_pwm": DEFAULT_JOG_DOWN_PWM,
+        "surf_target_altitude_m": DEFAULT_SURF_TARGET_ALTITUDE_M,
+        "surf_deadband_m": DEFAULT_SURF_DEADBAND_M,
+        "surf_full_scale_error_m": DEFAULT_SURF_FULL_SCALE_ERROR_M,
+        "surf_max_depth_m": DEFAULT_SURF_MAX_DEPTH_M,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -455,6 +603,16 @@ def load_config():
         defaults.get("tow_heading_source"))
     defaults["altitude_offset_m"] = _sanitize_altitude_offset_m(
         defaults.get("altitude_offset_m"))
+    defaults["jog_up_pwm"] = _sanitize_jog_up_pwm(defaults.get("jog_up_pwm"))
+    defaults["jog_down_pwm"] = _sanitize_jog_down_pwm(defaults.get("jog_down_pwm"))
+    defaults["surf_target_altitude_m"] = _sanitize_surf_target_altitude_m(
+        defaults.get("surf_target_altitude_m"))
+    defaults["surf_deadband_m"] = _sanitize_surf_deadband_m(
+        defaults.get("surf_deadband_m"))
+    defaults["surf_full_scale_error_m"] = _sanitize_surf_full_scale_error_m(
+        defaults.get("surf_full_scale_error_m"))
+    defaults["surf_max_depth_m"] = _sanitize_surf_max_depth_m(
+        defaults.get("surf_max_depth_m"))
     return defaults
 
 def save_config(cfg):
@@ -653,6 +811,39 @@ class SonarHistory:
             return None
         return min(_TOW_DELAY_MAX_S, tow_offset_m / speed)
 
+    def latest(self, max_age_s):
+        """Newest in-range sounding, or ``None`` if it is too old.
+
+        Returned as ``(depth_m, age_s)`` where ``age_s`` is monotonic
+        seconds since the sample was taken. Used by the surf-track
+        controller as a *lookahead* -- the boat leads the fish by the
+        layback, so the instantaneous reading describes seabed the
+        fish will reach one tow delay from now. That is right for
+        control (early warning) and wrong for reporting altitude
+        (which stays on ``depth_at_tow_delay``).
+
+        Because :meth:`_run` only appends in-range samples, "too old"
+        also covers the bottom-lock loss case: as soon as Ping1D goes
+        out of range the buffer stops growing and the age of ``latest``
+        walks past ``max_age_s``.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if not self._samples:
+                return None
+            ts, depth = self._samples[-1]
+        age = now - ts
+        if age > max_age_s:
+            return None
+        return (depth, age)
+
+    def latest_speed_ms(self):
+        """Last observed boat groundspeed, or ``None`` before the first
+        sample. Read atomically so a running sampler cannot tear a float.
+        """
+        with self._lock:
+            return self._speed_ms
+
     def depth_at_tow_delay(self):
         """Boat sounding for the patch the towfish is over *now*.
 
@@ -791,6 +982,12 @@ param_targets = _cfg["param_targets"]
 tow_offset_m = _cfg["tow_offset_m"]
 tow_heading_source = _cfg["tow_heading_source"]
 altitude_offset_m = _cfg["altitude_offset_m"]
+jog_up_pwm = _cfg["jog_up_pwm"]
+jog_down_pwm = _cfg["jog_down_pwm"]
+surf_target_altitude_m = _cfg["surf_target_altitude_m"]
+surf_deadband_m = _cfg["surf_deadband_m"]
+surf_full_scale_error_m = _cfg["surf_full_scale_error_m"]
+surf_max_depth_m = _cfg["surf_max_depth_m"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -806,6 +1003,12 @@ def _persist_config():
         "tow_offset_m": tow_offset_m,
         "tow_heading_source": tow_heading_source,
         "altitude_offset_m": altitude_offset_m,
+        "jog_up_pwm": jog_up_pwm,
+        "jog_down_pwm": jog_down_pwm,
+        "surf_target_altitude_m": surf_target_altitude_m,
+        "surf_deadband_m": surf_deadband_m,
+        "surf_full_scale_error_m": surf_full_scale_error_m,
+        "surf_max_depth_m": surf_max_depth_m,
     })
 
 # Recording-storage state
@@ -3277,16 +3480,33 @@ def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
     global transect_capture_type, storage_preference, awb_loop_enabled
     global tow_offset_m, tow_heading_source, altitude_offset_m
+    global jog_up_pwm, jog_down_pwm
+    global surf_target_altitude_m, surf_deadband_m, surf_full_scale_error_m
+    global surf_max_depth_m
 
     if request.method == 'POST':
         # The AWB-loop toggle is safe to change while a mode is active
-        # (it only affects a 2-min background HTTP timer). Everything
-        # else still needs an idle/disabled monitor.
+        # (it only affects a 2-min background HTTP timer). The jog/surf
+        # tuning knobs are equally safe: they only shape the RC3 override
+        # the operator or the surf-track loop is *about* to write, they
+        # do not touch the recorder or the transect state machine. So a
+        # config touch made up entirely of those keys skips the
+        # mode-idle guard, and the widget can save the jog PWMs from the
+        # VEHICLE tab while a survey is in progress.
         data = request.get_json(silent=True) or {}
-        touches_only_awb = (
-            set(data.keys()) <= {"awb_loop_enabled"} and "awb_loop_enabled" in data
+        _live_editable_keys = {
+            "awb_loop_enabled",
+            "jog_up_pwm",
+            "jog_down_pwm",
+            "surf_target_altitude_m",
+            "surf_deadband_m",
+            "surf_full_scale_error_m",
+            "surf_max_depth_m",
+        }
+        touches_only_live_editable = (
+            bool(data) and set(data.keys()) <= _live_editable_keys
         )
-        if not touches_only_awb:
+        if not touches_only_live_editable:
             if mode != MODE_IDLE:
                 return jsonify({"success": False,
                                 "message": f"Cannot change config while {mode} active"}), 400
@@ -3389,6 +3609,89 @@ def config():
             tow_heading_source = new_heading_src
             changed = True
 
+        # Jog PWM authority: persisted so the arrows *and* the surf-track
+        # loop pull from the same two numbers. Bounds match _sanitize.
+        new_up_pwm = data.get('jog_up_pwm')
+        if new_up_pwm is not None:
+            try:
+                float(new_up_pwm)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "jog_up_pwm must be numeric"}), 400
+            if not (JOG_UP_PWM_MIN <= float(new_up_pwm) <= JOG_UP_PWM_MAX):
+                return jsonify({"success": False,
+                                "message": f"jog_up_pwm must be between {JOG_UP_PWM_MIN} and {JOG_UP_PWM_MAX} us"}), 400
+            jog_up_pwm = _sanitize_jog_up_pwm(new_up_pwm)
+            changed = True
+
+        new_down_pwm = data.get('jog_down_pwm')
+        if new_down_pwm is not None:
+            try:
+                float(new_down_pwm)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "jog_down_pwm must be numeric"}), 400
+            if not (JOG_DOWN_PWM_MIN <= float(new_down_pwm) <= JOG_DOWN_PWM_MAX):
+                return jsonify({"success": False,
+                                "message": f"jog_down_pwm must be between {JOG_DOWN_PWM_MIN} and {JOG_DOWN_PWM_MAX} us"}), 400
+            jog_down_pwm = _sanitize_jog_down_pwm(new_down_pwm)
+            changed = True
+
+        # Surf-track tuning knobs. Each has a hard clamp so a stale tab
+        # or a hand-edited config file cannot push a value that makes
+        # the loop dangerous.
+        new_target_alt = data.get('surf_target_altitude_m')
+        if new_target_alt is not None:
+            try:
+                v = float(new_target_alt)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "surf_target_altitude_m must be a number"}), 400
+            if not (SURF_TARGET_ALTITUDE_MIN_M <= v <= SURF_TARGET_ALTITUDE_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"surf_target_altitude_m must be between {SURF_TARGET_ALTITUDE_MIN_M} and {SURF_TARGET_ALTITUDE_MAX_M} m"}), 400
+            surf_target_altitude_m = _sanitize_surf_target_altitude_m(v)
+            changed = True
+
+        new_deadband = data.get('surf_deadband_m')
+        if new_deadband is not None:
+            try:
+                v = float(new_deadband)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "surf_deadband_m must be a number"}), 400
+            if not (SURF_DEADBAND_MIN_M <= v <= SURF_DEADBAND_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"surf_deadband_m must be between {SURF_DEADBAND_MIN_M} and {SURF_DEADBAND_MAX_M} m"}), 400
+            surf_deadband_m = _sanitize_surf_deadband_m(v)
+            changed = True
+
+        new_full_scale = data.get('surf_full_scale_error_m')
+        if new_full_scale is not None:
+            try:
+                v = float(new_full_scale)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "surf_full_scale_error_m must be a number"}), 400
+            if not (SURF_FULL_SCALE_ERROR_MIN_M <= v <= SURF_FULL_SCALE_ERROR_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"surf_full_scale_error_m must be between {SURF_FULL_SCALE_ERROR_MIN_M} and {SURF_FULL_SCALE_ERROR_MAX_M} m"}), 400
+            surf_full_scale_error_m = _sanitize_surf_full_scale_error_m(v)
+            changed = True
+
+        new_max_depth = data.get('surf_max_depth_m')
+        if new_max_depth is not None:
+            try:
+                v = float(new_max_depth)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "surf_max_depth_m must be a number"}), 400
+            if not (SURF_MAX_DEPTH_MIN_M <= v <= SURF_MAX_DEPTH_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"surf_max_depth_m must be between {SURF_MAX_DEPTH_MIN_M} and {SURF_MAX_DEPTH_MAX_M} m"}), 400
+            surf_max_depth_m = _sanitize_surf_max_depth_m(v)
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
@@ -3397,10 +3700,16 @@ def config():
             "Config updated: tow_vehicle_ip=%s, container_format=%s, "
             "stream_protocol=%s, snapshot_url=%s, transect_capture_type=%s, "
             "storage_preference=%s, awb_loop_enabled=%s, tow_offset_m=%s, "
-            "tow_heading_source=%s, altitude_offset_m=%s",
+            "tow_heading_source=%s, altitude_offset_m=%s, "
+            "jog_up_pwm=%s, jog_down_pwm=%s, "
+            "surf_target_altitude_m=%s, surf_deadband_m=%s, "
+            "surf_full_scale_error_m=%s, surf_max_depth_m=%s",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
             transect_capture_type, storage_preference, awb_loop_enabled,
             tow_offset_m, tow_heading_source, altitude_offset_m,
+            jog_up_pwm, jog_down_pwm,
+            surf_target_altitude_m, surf_deadband_m,
+            surf_full_scale_error_m, surf_max_depth_m,
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
@@ -3412,7 +3721,13 @@ def config():
                         "awb_loop_enabled": awb_loop_enabled,
                         "tow_offset_m": tow_offset_m,
                         "tow_heading_source": tow_heading_source,
-                        "altitude_offset_m": altitude_offset_m})
+                        "altitude_offset_m": altitude_offset_m,
+                        "jog_up_pwm": jog_up_pwm,
+                        "jog_down_pwm": jog_down_pwm,
+                        "surf_target_altitude_m": surf_target_altitude_m,
+                        "surf_deadband_m": surf_deadband_m,
+                        "surf_full_scale_error_m": surf_full_scale_error_m,
+                        "surf_max_depth_m": surf_max_depth_m})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -3431,6 +3746,24 @@ def config():
         "altitude_offset_m": altitude_offset_m,
         "altitude_offset_min_m": ALTITUDE_OFFSET_MIN_M,
         "altitude_offset_max_m": ALTITUDE_OFFSET_MAX_M,
+        "jog_up_pwm": jog_up_pwm,
+        "jog_up_pwm_min": JOG_UP_PWM_MIN,
+        "jog_up_pwm_max": JOG_UP_PWM_MAX,
+        "jog_down_pwm": jog_down_pwm,
+        "jog_down_pwm_min": JOG_DOWN_PWM_MIN,
+        "jog_down_pwm_max": JOG_DOWN_PWM_MAX,
+        "surf_target_altitude_m": surf_target_altitude_m,
+        "surf_target_altitude_min_m": SURF_TARGET_ALTITUDE_MIN_M,
+        "surf_target_altitude_max_m": SURF_TARGET_ALTITUDE_MAX_M,
+        "surf_deadband_m": surf_deadband_m,
+        "surf_deadband_min_m": SURF_DEADBAND_MIN_M,
+        "surf_deadband_max_m": SURF_DEADBAND_MAX_M,
+        "surf_full_scale_error_m": surf_full_scale_error_m,
+        "surf_full_scale_error_min_m": SURF_FULL_SCALE_ERROR_MIN_M,
+        "surf_full_scale_error_max_m": SURF_FULL_SCALE_ERROR_MAX_M,
+        "surf_max_depth_m": surf_max_depth_m,
+        "surf_max_depth_min_m": SURF_MAX_DEPTH_MIN_M,
+        "surf_max_depth_max_m": SURF_MAX_DEPTH_MAX_M,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -4545,11 +4878,25 @@ def _apply_awb_loop_state_change() -> None:
 # considers the override stale. We front the widget's button holds with a
 # backend thread so a dropped browser event still times out (i.e. the
 # thrust stops even if the client goes away).
+#
+# Two writers now share this path: the widget's operator hold (source
+# ``"operator"``) and the surf-track controller (source ``"surftrack"``).
+# Operator wins outright -- any operator hit while surf-track is
+# commanding RC3 replaces the command and starts the operator cooldown,
+# during which surf-track refuses to write. This means the arrows can
+# always take back the stick, and it means a brushed button briefly
+# suspends surf-track rather than silently disengaging it mid-survey.
 _thrust_thread: threading.Thread | None = None
 _thrust_stop_event = threading.Event()
 _thrust_direction: str | None = None
 _thrust_deadline: float | None = None
 _thrust_pwm: int = Z_PWM_NEUTRAL
+_thrust_source: str | None = None  # 'operator' | 'surftrack' | None
+# Monotonic timestamp of the last operator hit. Surf-track refuses to
+# write for ``SURF_OPERATOR_COOLDOWN_S`` after this, so an operator
+# UP/DOWN gets a clean handoff back to ALT_HOLD before the controller
+# tries to grab the stick again.
+_thrust_operator_last_hit: float | None = None
 _thrust_lock = threading.Lock()
 # Rolling release watchdog. Every /vehicle/thrust POST pushes the deadline
 # this many seconds into the future; the frontend re-hits the route every
@@ -4570,6 +4917,7 @@ _THRUST_NEUTRAL_GAP_S = 0.1
 
 def _thrust_worker() -> None:
     """Push RC3 override at ~5 Hz until the deadline lapses or stop is set."""
+    global _thrust_direction, _thrust_deadline, _thrust_source
     writer = get_default_writer()
     period = 1.0 / _THRUST_REFRESH_HZ
     logger.info("Thrust jog thread started")
@@ -4578,6 +4926,14 @@ def _thrust_worker() -> None:
             deadline = _thrust_deadline
             pwm = _thrust_pwm
         if deadline is None or time.monotonic() >= deadline:
+            # Clear the caller-facing state now that the override is
+            # about to be released. Without this the /status snapshot
+            # would keep reporting the last direction/source until the
+            # next command arrived.
+            with _thrust_lock:
+                _thrust_direction = None
+                _thrust_deadline = None
+                _thrust_source = None
             break
         writer.rc_channels_override({Z_CHANNEL: pwm})
         _thrust_stop_event.wait(period)
@@ -4613,16 +4969,75 @@ def _start_thrust_thread_if_needed() -> None:
 
 
 def _stop_thrust_thread() -> None:
-    global _thrust_thread, _thrust_direction, _thrust_deadline
+    global _thrust_thread, _thrust_direction, _thrust_deadline, _thrust_source
     _thrust_stop_event.set()
     with _thrust_lock:
         _thrust_direction = None
         _thrust_deadline = None
+        _thrust_source = None
     if _thrust_thread is not None:
         # Long enough to cover the worker's neutral-then-release tail, so a
         # caller that returns from here knows the stick is actually centred.
         _thrust_thread.join(timeout=2.0)
     _thrust_thread = None
+
+
+def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
+    """Extend/refresh the RC3 override, or release it.
+
+    ``direction`` is ``"up"``/``"down"``/``None``; ``None`` stops the
+    override (short-circuits to ``_stop_thrust_thread``). ``source`` is
+    ``"operator"`` or ``"surftrack"``.
+
+    Operator writes always win: they replace whatever the surf-track loop
+    was doing and stamp ``_thrust_operator_last_hit`` so the loop stays
+    off the channel for ``SURF_OPERATOR_COOLDOWN_S`` afterwards.
+    Surf-track writes are refused (returned as ``False``) while the
+    operator is either holding or in cooldown, so the two sources cannot
+    fight for the same channel.
+    """
+    global _thrust_direction, _thrust_deadline, _thrust_pwm
+    global _thrust_source, _thrust_operator_last_hit
+    if direction is None:
+        # A source-tagged stop lets the operator's release land without
+        # a stale surf-track write immediately reclaiming the channel;
+        # surf-track releases only clear its own state.
+        with _thrust_lock:
+            active_source = _thrust_source
+        if source == "operator":
+            _stop_thrust_thread()
+            with _thrust_lock:
+                _thrust_operator_last_hit = time.monotonic()
+        elif active_source == "surftrack":
+            _stop_thrust_thread()
+        return True
+    if direction not in ("up", "down"):
+        return False
+    pwm = int(max(Z_PWM_MIN, min(Z_PWM_MAX, pwm)))
+    now = time.monotonic()
+    with _thrust_lock:
+        if source == "operator":
+            _thrust_operator_last_hit = now
+        elif source == "surftrack":
+            # An operator hit or cooldown blocks the loop entirely, so
+            # it does not have to poll the state before writing -- the
+            # write itself checks.
+            if (_thrust_source == "operator"
+                    and _thrust_deadline is not None
+                    and now < _thrust_deadline):
+                return False
+            if (_thrust_operator_last_hit is not None
+                    and now - _thrust_operator_last_hit
+                    < SURF_OPERATOR_COOLDOWN_S):
+                return False
+        else:
+            return False
+        _thrust_direction = direction
+        _thrust_pwm = pwm
+        _thrust_source = source
+        _thrust_deadline = now + _THRUST_KEEPALIVE_S
+    _start_thrust_thread_if_needed()
+    return True
 
 
 def get_thrust_status_snapshot() -> dict:
@@ -4633,11 +5048,15 @@ def get_thrust_status_snapshot() -> dict:
     honest even if the button press came from another client or the
     keep-alive is one poll away from timing out. ``direction``/``pwm`` are
     null whenever no override is live (autopilot has the stick back).
+    ``source`` tells the widget whether the operator or the surf-track
+    loop is driving, so the JOG readout can be prefixed with AUTO when
+    it is the loop.
     """
     with _thrust_lock:
         direction = _thrust_direction
         deadline = _thrust_deadline
         pwm = _thrust_pwm
+        source = _thrust_source
     active = bool(direction and deadline is not None
                   and time.monotonic() < deadline)
     return {
@@ -4645,7 +5064,320 @@ def get_thrust_status_snapshot() -> dict:
         "direction": direction if active else None,
         "pwm": pwm if active else Z_PWM_NEUTRAL,
         "channel": Z_CHANNEL,
+        "source": source if active else None,
     }
+
+
+# --- Surf-track altitude-hold controller -----------------------------
+#
+# A backend "flight mode" the widget can turn on. It reads the boat's Ping
+# sounding as a lookahead (the boat leads the fish by the layback), computes
+# the depth the fish should be at once it reaches that patch of bottom, and
+# biases RC3 through the shared thrust path so the autopilot -- which must
+# be in ALT_HOLD -- carries the fish to that depth. Inside the deadband it
+# lets go of RC3 and ALT_HOLD's own depth hold keeps the fish put.
+#
+# The controller does *not* open its own RC3 override: everything goes
+# through :func:`_set_thrust_command` with ``source="surftrack"``, which is
+# how it stays cooperative with the operator's UP/DOWN buttons. An operator
+# hit briefly suspends the loop rather than disengaging it, so a brushed
+# touchscreen button cannot silently kill the mode mid-survey.
+class SurfTrackController:
+    """Altitude-over-bottom hold. States: disabled / tracking / holding.
+
+    ``holding`` means every condition for automatic control is *not*
+    currently satisfied. In that state the controller releases its
+    surf-track RC3 override and leaves the vehicle in ALT_HOLD, so the
+    autopilot holds whatever depth it last had. It resumes tracking only
+    once every condition has been satisfied continuously for
+    ``SURF_RESUME_DEBOUNCE_S`` -- flicker on the bottom-lock therefore
+    cannot chatter the loop.
+    """
+
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        # Public snapshot fields (all read under _lock).
+        self.state = "disabled"     # 'disabled' | 'tracking' | 'holding'
+        self.hold_reason: str | None = None
+        self.last_event: str | None = None
+        self.last_event_at: datetime | None = None
+        # Rolling readouts for the widget so it can display what the
+        # loop is *actually seeing* alongside the commanded target.
+        self._last_fish_depth_m: float | None = None
+        self._last_bottom_ahead_m: float | None = None
+        self._last_bottom_delayed_m: float | None = None
+        self._last_altitude_m: float | None = None
+        self._last_error_m: float | None = None
+        self._last_command: dict | None = None
+        # Internal state.
+        self._target_depth_m: float | None = None
+        self._last_tick_ts: float | None = None
+        # Monotonic timestamp at which all hold conditions first cleared,
+        # or None while any condition still fails. See _tick.
+        self._hold_ok_since: float | None = None
+
+    # -- lifecycle -----------------------------------------------------
+    def enable(self) -> None:
+        with self._lock:
+            if self.state != "disabled":
+                return
+            self._stop_event.clear()
+            # First tick will pick the real starting state based on
+            # sonar/mode; entering as 'tracking' lets the loop engage
+            # immediately when the conditions are already good, without
+            # burning the 2 s debounce every time it is turned on.
+            self.state = "tracking"
+            self.hold_reason = None
+            self._hold_ok_since = None
+            self._target_depth_m = None
+            self._last_tick_ts = None
+            self._last_command = None
+            self._note("enabled")
+        self._thread = threading.Thread(
+            target=self._run, name="surftrack", daemon=True,
+        )
+        self._thread.start()
+
+    def disable(self) -> None:
+        with self._lock:
+            if self.state == "disabled":
+                return
+            self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        # Release any surf-track override we still hold. Operator
+        # writes are untouched: _set_thrust_command with source
+        # ``surftrack`` only clears state that also carries the
+        # surftrack tag.
+        _set_thrust_command(None, Z_PWM_NEUTRAL, source="surftrack")
+        with self._lock:
+            self._thread = None
+            self.state = "disabled"
+            self.hold_reason = None
+            self._target_depth_m = None
+            self._last_command = None
+            self._note("disabled")
+
+    def set_target_altitude_m(self, target: float) -> float:
+        """Persist a new goal altitude, clamped to the configured band."""
+        global surf_target_altitude_m
+        clamped = _sanitize_surf_target_altitude_m(target)
+        surf_target_altitude_m = clamped
+        _persist_config()
+        with self._lock:
+            self._note(f"target={clamped:.2f} m")
+        return clamped
+
+    # -- background loop ----------------------------------------------
+    def _run(self) -> None:
+        logger.info("Surf-track controller started")
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.exception("SurfTrackController tick failed")
+            self._stop_event.wait(SURF_TICK_S)
+        logger.info("Surf-track controller exited")
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+
+        fish_depth = _get_towfish_depth_m()
+        latest = _sonar_history.latest(SURF_SONAR_MAX_AGE_S)
+        # The delayed sounding is only read here for the *reported*
+        # altitude; the control loop itself uses ``latest`` above so it
+        # gets a one-layback lookahead instead of the fish's present
+        # altitude.
+        delayed = _sonar_history.depth_at_tow_delay()
+        speed = _sonar_history.latest_speed_ms()
+        veh = get_vehicle_status_snapshot()
+        armed = veh.get("armed")
+        custom_mode = veh.get("custom_mode")
+
+        bottom_ahead: float | None = None
+        if latest is not None:
+            bottom_ahead = latest[0]
+        delayed_bottom = delayed[0] if delayed else None
+        reported_altitude: float | None = None
+        if (delayed_bottom is not None and fish_depth is not None):
+            candidate = delayed_bottom - fish_depth - altitude_offset_m
+            if candidate >= 0:
+                reported_altitude = candidate
+
+        # Which hold conditions are currently satisfied? Order matters
+        # only for the reason string -- the earliest match wins so the
+        # widget shows the most fundamental problem (no depth beats a
+        # stale sonar, a disarmed vehicle beats a slow boat, etc).
+        reason: str | None = None
+        if fish_depth is None:
+            reason = "no_depth"
+        elif fish_depth <= SURF_SURFACE_DEPTH_M:
+            reason = "at_surface"
+        elif armed is not True:
+            reason = "disarmed"
+        elif custom_mode != MODE_ALT_HOLD:
+            reason = "mode_not_alt_hold"
+        elif latest is None:
+            reason = "sonar_stale"
+        elif speed is None or speed < SURF_MIN_TOW_SPEED_MS:
+            reason = "not_underway"
+        elif bottom_ahead is not None and bottom_ahead < fish_depth:
+            reason = "geometry_insane"
+
+        with self._lock:
+            self._last_fish_depth_m = fish_depth
+            self._last_bottom_ahead_m = bottom_ahead
+            self._last_bottom_delayed_m = delayed_bottom
+            self._last_altitude_m = reported_altitude
+
+            if reason is not None:
+                # Conditions failing: enter/stay in holding. Reset the
+                # slew target so a resume starts from where the fish is
+                # rather than from a stale commanded depth.
+                self._hold_ok_since = None
+                if self.state != "holding":
+                    self._note(f"hold: {reason}")
+                self.state = "holding"
+                self.hold_reason = reason
+                self._target_depth_m = None
+                self._last_command = None
+                self._last_tick_ts = now
+                # Fall through to release RC3 outside the lock.
+                do_release = True
+                do_command = None
+            else:
+                # Conditions ok. If we were holding, wait out the
+                # debounce so a flickering bottom lock does not chatter.
+                if self.state == "holding":
+                    if self._hold_ok_since is None:
+                        self._hold_ok_since = now
+                    if now - self._hold_ok_since < SURF_RESUME_DEBOUNCE_S:
+                        self._last_tick_ts = now
+                        # Still debouncing; stay released.
+                        do_release = True
+                        do_command = None
+                    else:
+                        self._note("tracking")
+                        self.state = "tracking"
+                        self.hold_reason = None
+                        self._hold_ok_since = None
+                        self._target_depth_m = fish_depth
+                        do_release, do_command = self._plan_command(
+                            now, fish_depth, bottom_ahead)
+                else:
+                    # Steady state tracking.
+                    self._hold_ok_since = None
+                    self.hold_reason = None
+                    do_release, do_command = self._plan_command(
+                        now, fish_depth, bottom_ahead)
+
+        # Do the RC3 writes outside the state lock so a slow HTTP call
+        # cannot block the widget's status poll.
+        if do_release:
+            _set_thrust_command(None, Z_PWM_NEUTRAL, source="surftrack")
+        elif do_command is not None:
+            ok = _set_thrust_command(do_command["direction"],
+                                     do_command["pwm"],
+                                     source="surftrack")
+            if not ok:
+                # Operator has the stick (or cooldown active). Not an
+                # error -- record it so the widget can show why the
+                # loop's command is not landing.
+                with self._lock:
+                    self._last_command = None
+                    self._note("suspended: operator")
+
+    def _plan_command(self, now, fish_depth, bottom_ahead):
+        """Compute the RC3 command for this tick under normal tracking.
+
+        Runs while holding ``self._lock``. Returns ``(do_release, command)``
+        where ``command`` is ``None`` inside the deadband (RC3 released
+        so ALT_HOLD does the fine hold) or ``{"direction","pwm","frac"}``
+        outside it.
+        """
+        dt = SURF_TICK_S
+        if self._last_tick_ts is not None:
+            dt = max(0.0, min(1.0, now - self._last_tick_ts))
+        self._last_tick_ts = now
+
+        raw_target = (bottom_ahead - altitude_offset_m
+                      - surf_target_altitude_m)
+        # Hard clamp. Even a wildly stale/insane sounding cannot push
+        # the commanded depth past this envelope.
+        raw_target = max(SURF_SURFACE_DEPTH_M,
+                         min(surf_max_depth_m, raw_target))
+
+        if self._target_depth_m is None:
+            self._target_depth_m = fish_depth
+        # Slew-limit the commanded depth. Rate-limits a bottom-lock
+        # step change into a ramp the fish can actually follow instead
+        # of trying to slam a full-scale descent.
+        max_step = SURF_TARGET_SLEW_MPS * dt
+        delta = raw_target - self._target_depth_m
+        if abs(delta) > max_step:
+            delta = math.copysign(max_step, delta)
+        self._target_depth_m += delta
+
+        error = self._target_depth_m - fish_depth  # +ve => go deeper
+        self._last_error_m = error
+
+        if abs(error) <= surf_deadband_m:
+            self._last_command = None
+            return True, None
+
+        direction = "down" if error > 0 else "up"
+        raw_frac = abs(error) / max(surf_full_scale_error_m, 1e-6)
+        frac = max(SURF_MIN_FRAC, min(1.0, raw_frac))
+        if direction == "up":
+            pwm = int(round(Z_PWM_NEUTRAL
+                            + (jog_up_pwm - Z_PWM_NEUTRAL) * frac))
+        else:
+            pwm = int(round(Z_PWM_NEUTRAL
+                            - (Z_PWM_NEUTRAL - jog_down_pwm) * frac))
+        pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
+        cmd = {"direction": direction, "pwm": pwm,
+               "frac": round(frac, 3)}
+        self._last_command = cmd
+        return False, cmd
+
+    # -- diagnostics ---------------------------------------------------
+    def _note(self, event: str) -> None:
+        """Record a diagnostic event; call while holding ``self._lock``."""
+        self.last_event = event
+        self.last_event_at = datetime.now()
+
+    def snapshot(self) -> dict:
+        """JSON-serialisable status for /status."""
+        with self._lock:
+            def _round(v, n=2):
+                return round(v, n) if isinstance(v, (int, float)) else None
+            return {
+                "enabled": self.state != "disabled",
+                "state": self.state,
+                "hold_reason": self.hold_reason,
+                "target_altitude_m": round(surf_target_altitude_m, 2),
+                "target_altitude_min_m": SURF_TARGET_ALTITUDE_MIN_M,
+                "target_altitude_max_m": SURF_TARGET_ALTITUDE_MAX_M,
+                "deadband_m": round(surf_deadband_m, 3),
+                "full_scale_error_m": round(surf_full_scale_error_m, 2),
+                "max_depth_m": round(surf_max_depth_m, 1),
+                "fish_depth_m": _round(self._last_fish_depth_m),
+                "bottom_ahead_m": _round(self._last_bottom_ahead_m),
+                "bottom_delayed_m": _round(self._last_bottom_delayed_m),
+                "altitude_m": _round(self._last_altitude_m),
+                "commanded_depth_m": _round(self._target_depth_m),
+                "error_m": _round(self._last_error_m, 3),
+                "command": self._last_command,
+                "last_event": self.last_event,
+                "last_event_at": (self.last_event_at.isoformat()
+                                  if self.last_event_at else None),
+            }
+
+
+_surftrack = SurfTrackController()
 
 
 # --- Startup optics preset -------------------------------------------
@@ -4722,7 +5454,7 @@ def vehicle_tilt_down():
 
 @app.route('/vehicle/thrust', methods=['POST'])
 def vehicle_thrust():
-    """Start / keep-alive a Z-axis RC override (depth jog).
+    """Start / keep-alive an operator Z-axis RC override (depth jog).
 
     Body: ``{"direction": "up"|"down"|"stop", "pwm": <optional int>}``.
     Each POST extends the override lifetime by ``_THRUST_KEEPALIVE_S`` so
@@ -4731,21 +5463,26 @@ def vehicle_thrust():
     window and AltHold takes back over.
 
     ``pwm`` lets the operator tune the jog strength from the widget (how
-    hard to drive the vertical thrusters). It is clamped to
-    ``Z_PWM_MIN``..``Z_PWM_MAX``; when omitted the built-in
-    ascend/descend defaults are used.
+    hard to drive the vertical thrusters). It falls back to the persisted
+    ``jog_up_pwm`` / ``jog_down_pwm`` when omitted, so the widget only has
+    to send the direction; it is still clamped to ``Z_PWM_MIN``..
+    ``Z_PWM_MAX`` when supplied so a stale tab cannot exceed the
+    hardware envelope.
+
+    This is the *operator* path -- an operator hit here always beats
+    the surf-track controller and starts a cooldown so the loop stays
+    off the channel long enough for AltHold to catch the new depth.
     """
-    global _thrust_direction, _thrust_deadline, _thrust_pwm
     data = request.get_json(silent=True) or {}
     direction = str(data.get('direction', '')).strip().lower()
     if direction in ('', 'stop'):
-        _stop_thrust_thread()
+        _set_thrust_command(None, Z_PWM_NEUTRAL, source="operator")
         return jsonify({"success": True, "direction": "stop"})
     if direction not in ('up', 'down'):
         return jsonify({"success": False,
                         "message": "direction must be up/down/stop"}), 400
 
-    default_pwm = Z_PWM_ASCEND if direction == 'up' else Z_PWM_DESCEND
+    default_pwm = jog_up_pwm if direction == 'up' else jog_down_pwm
     pwm = default_pwm
     if data.get('pwm') is not None:
         try:
@@ -4755,18 +5492,63 @@ def vehicle_thrust():
                             "message": "pwm must be numeric"}), 400
     pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
 
-    with _thrust_lock:
-        _thrust_direction = direction
-        _thrust_pwm = pwm
-        _thrust_deadline = time.monotonic() + _THRUST_KEEPALIVE_S
-    _start_thrust_thread_if_needed()
+    _set_thrust_command(direction, pwm, source="operator")
     return jsonify({"success": True, "direction": direction, "pwm": pwm})
 
 
 @app.route('/vehicle/thrust/stop', methods=['POST'])
 def vehicle_thrust_stop():
-    _stop_thrust_thread()
+    _set_thrust_command(None, Z_PWM_NEUTRAL, source="operator")
     return jsonify({"success": True, "direction": "stop"})
+
+
+@app.route('/vehicle/surftrack', methods=['POST'])
+def vehicle_surftrack():
+    """Enable, disable, or re-tune the towfish surf-track altitude hold.
+
+    Body::
+
+        {"enabled": true|false,
+         "target_altitude_m": <optional float, 1..6>}
+
+    When ``enabled`` is true the endpoint first commands ALT_HOLD on the
+    autopilot (the loop only makes sense inside that mode -- RC3 there
+    biases a depth setpoint, not raw thrust), then starts the
+    controller. When false it stops the controller and releases any
+    RC3 override the controller was pushing; the operator's own jog
+    is left untouched.
+
+    ``target_altitude_m`` is persisted through :func:`_persist_config`
+    so the value survives an extension restart, and is applied whether
+    the loop is currently enabled or not so the widget can pre-set the
+    goal before engaging.
+    """
+    data = request.get_json(silent=True) or {}
+    if "target_altitude_m" in data:
+        try:
+            v = float(data["target_altitude_m"])
+        except (TypeError, ValueError):
+            return jsonify({"success": False,
+                            "message": "target_altitude_m must be a number"}), 400
+        if not (SURF_TARGET_ALTITUDE_MIN_M <= v <= SURF_TARGET_ALTITUDE_MAX_M):
+            return jsonify({"success": False,
+                            "message": f"target_altitude_m must be between {SURF_TARGET_ALTITUDE_MIN_M} and {SURF_TARGET_ALTITUDE_MAX_M} m"}), 400
+        _surftrack.set_target_altitude_m(v)
+
+    if "enabled" not in data:
+        return jsonify({"success": True, **_surftrack.snapshot()})
+
+    want_enabled = bool(data["enabled"])
+    if want_enabled:
+        # Force ALT_HOLD before enabling. If the vehicle rejects the
+        # mode change we still enable the controller -- it will report
+        # ``mode_not_alt_hold`` in its hold state, which is more useful
+        # than a silent no-op.
+        get_default_writer().set_mode(MODE_ALT_HOLD)
+        _surftrack.enable()
+    else:
+        _surftrack.disable()
+    return jsonify({"success": True, **_surftrack.snapshot()})
 
 
 @app.route('/optics/focus', methods=['POST'])
@@ -5018,6 +5800,10 @@ def get_status():
             # Live depth-jog RC3 override so the widget can show the
             # simulated pilot input the autopilot is actually receiving.
             "thrust": get_thrust_status_snapshot(),
+            # Surf-track altitude-hold controller state. Always present
+            # (populated by the module singleton) so the widget can
+            # render the state machine without null checks.
+            "surftrack": _surftrack.snapshot(),
             # BlueBoat Ping sonar (DISTANCE_SENSOR) -- water depth under
             # the surface craft. Null when the boat is unreachable.
             "ping_sonar": get_ping_sonar_snapshot(),

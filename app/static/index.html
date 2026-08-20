@@ -880,6 +880,37 @@
                         pressure sensor.
                     </div>
                 </div>
+
+                <div class="field">
+                    <label for="surfFullScaleError">SURF TRACK GAIN</label>
+                    <div class="field-row">
+                        <input type="number" id="surfFullScaleError" step="0.1" min="0.2" max="5" placeholder="1.0" autocomplete="off">
+                        <span class="unit">m</span>
+                        <button class="btn" id="surfFullScaleErrorSave">SAVE</button>
+                        <span class="saved" id="surfFullScaleErrorSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Altitude error at which the surf-track loop asks for the operator's
+                        full jog authority (the <code>UP&nbsp;&micro;s</code> / <code>DN&nbsp;&micro;s</code>
+                        values on the widget). Smaller = more aggressive. Set once during
+                        tuning; per-site adjustments happen on the widget.
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="surfMaxDepth">SURF TRACK MAX DEPTH</label>
+                    <div class="field-row">
+                        <input type="number" id="surfMaxDepth" step="1" min="2" max="300" placeholder="50" autocomplete="off">
+                        <span class="unit">m</span>
+                        <button class="btn" id="surfMaxDepthSave">SAVE</button>
+                        <span class="saved" id="surfMaxDepthSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Hard cap on the commanded depth. Even a wildly stale or insane
+                        sounding cannot fly the fish past this. Slightly deeper than the
+                        deepest survey water you expect to run in.
+                    </div>
+                </div>
             </div>
 
             <div class="calc">
@@ -1121,6 +1152,8 @@ async function loadConfig() {
         if (d.tow_offset_m != null) $('towOffset').value = Number(d.tow_offset_m).toFixed(1);
         if (d.tow_heading_source) markHeadingSource(d.tow_heading_source);
         if (d.altitude_offset_m != null) $('altitudeOffset').value = Number(d.altitude_offset_m).toFixed(2);
+        if (d.surf_full_scale_error_m != null) $('surfFullScaleError').value = Number(d.surf_full_scale_error_m).toFixed(1);
+        if (d.surf_max_depth_m != null) $('surfMaxDepth').value = Number(d.surf_max_depth_m).toFixed(0);
     } catch (e) {
         showError(`Could not load configuration: ${e.message}`);
     }
@@ -1199,6 +1232,30 @@ $('altitudeOffsetSave').addEventListener('click', () => {
 });
 $('altitudeOffset').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') $('altitudeOffsetSave').click();
+});
+
+$('surfFullScaleErrorSave').addEventListener('click', () => {
+    const value = parseFloat($('surfFullScaleError').value);
+    if (!Number.isFinite(value) || value < 0.2 || value > 5) {
+        showError('Surf-track gain must be a number of metres between 0.2 and 5.');
+        return;
+    }
+    saveConfigField({ surf_full_scale_error_m: value }, 'surfFullScaleErrorSaved');
+});
+$('surfFullScaleError').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('surfFullScaleErrorSave').click();
+});
+
+$('surfMaxDepthSave').addEventListener('click', () => {
+    const value = parseFloat($('surfMaxDepth').value);
+    if (!Number.isFinite(value) || value < 2 || value > 300) {
+        showError('Surf-track max depth must be a number of metres between 2 and 300.');
+        return;
+    }
+    saveConfigField({ surf_max_depth_m: value }, 'surfMaxDepthSaved');
+});
+$('surfMaxDepth').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('surfMaxDepthSave').click();
 });
 
 // Right triangle: tether is the hypotenuse, depth the vertical leg, and

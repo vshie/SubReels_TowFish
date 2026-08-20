@@ -26,7 +26,10 @@ at a fixed depth below the surface that either loses the bottom or risks
 striking it. Bottom depth comes from the boat's Ping sonar (`DISTANCE_SENSOR`
 over `mavlink2rest`) and the fish's depth from its own barometer; the widget
 shows the two side by side so the operator can fly the difference, with the
-depth jog and ALT_HOLD on the same panel.
+depth jog and ALT_HOLD on the same panel. The **SURF TRACK** button on the
+widget engages an extension-managed hold that closes that loop automatically,
+using the boat's sonar as a one-layback lookahead so the fish begins its
+vertical move before the terrain change arrives underneath it.
 
 Every capture — video frame or still — is tagged with where the camera was and
 where it was pointing: GPS position, altitude, towfish roll/pitch/yaw, and the
@@ -81,6 +84,18 @@ scope, tow speed and depth. Planned work:
   transducer's depth below the waterline. This is what lands in EXIF
   `GPSAltitude`; because it follows the bathymetry rather than a fixed datum,
   `GPSZAccuracy` is published alongside so the solver does not over-trust it.
+- **SURF TRACK altitude hold** — an extension-managed flight mode alongside
+  MANUAL, STABILIZE and ALT_HOLD that holds a set altitude over the bottom.
+  The boat's Ping sonar leads the fish by the layback, so the loop uses the
+  *instantaneous* sounding to command the depth the fish will need one tow
+  delay from now — the fish starts moving before the terrain change arrives.
+  Inside a configurable deadband it releases RC3 and lets the autopilot's
+  own ALT_HOLD keep the fish put. When the sonar loses bottom lock, the boat
+  drifts, the fish is at the surface or the autopilot leaves ALT_HOLD, the
+  loop cleanly hands the stick back to ALT_HOLD until the conditions clear
+  for a full 2 s. Operator UP/DOWN always wins outright: a hold briefly
+  suspends the loop rather than disengaging it, so a brushed touchscreen
+  button cannot silently kill the mode mid-survey.
 - **Telemetry sidecars for video** — every recording gets a `*_telemetry.csv`
   at 5 Hz carrying the same fields as the stills path, so frames extracted
   later with `extract_geotagged_frames.py` come out with identical metadata.
@@ -276,6 +291,7 @@ recordings.
 | GET | `/start`, `/stop` | Manual video recording |
 | GET | `/timelapse/start`, `/timelapse/stop` | 2 Hz snapshot capture |
 | GET/POST | `/transect/enable`, `/transect/disable` | Mission-triggered capture |
+| POST | `/vehicle/surftrack` | Enable/disable the altitude-over-bottom hold |
 | GET | `/params` | Parameter specs, targets, last readings and job state |
 | POST | `/params/check` | Read parameters from the vehicles |
 | POST | `/params/apply` | Write saved targets to the vehicles |
