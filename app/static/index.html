@@ -1564,7 +1564,15 @@ function renderParamState(state) {
     for (const vehicle of ['boat', 'towfish']) {
         const el = $(`paramEndpoint_${vehicle}`);
         if (el) {
-            el.textContent = vehicle === 'boat' ? state.boat_url : state.towfish_url;
+            if (vehicle === 'boat') {
+                const sys = state.boat_system_id;
+                const comp = state.boat_component_id;
+                el.textContent = (sys != null)
+                    ? `${state.boat_url}  (sys ${sys}/${comp ?? 1})`
+                    : (state.boat_url || '');
+            } else {
+                el.textContent = state.towfish_url;
+            }
         }
     }
 

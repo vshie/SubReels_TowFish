@@ -27,9 +27,11 @@ from gi.repository import Gst  # noqa: E402  (after require_version)
 import usb_storage
 import photogrammetry_meta
 from mavlink_params import (
+    BOAT_MAVTYPES,
     LOCAL_MAVLINK2REST_URL,
     ParamClient,
     ParamReadError,
+    discover_autopilot,
 )
 from mavlink_writer import (
     MavlinkWriter,
@@ -625,13 +627,68 @@ def save_config(cfg):
         logger.error(f"Could not save config file: {e}")
 
 def _blueboat_gps_url():
-    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/GLOBAL_POSITION_INT'
+    return _tow_mavlink_url('GLOBAL_POSITION_INT')
 
 def _blueboat_attitude_url():
-    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/ATTITUDE'
+    return _tow_mavlink_url('ATTITUDE')
 
 def _blueboat_vfr_hud_url():
-    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/VFR_HUD'
+    return _tow_mavlink_url('VFR_HUD')
+
+# The boat's SYSID_THISMAV is often 2 so it can share a MAVLink network
+# with the towfish (sysid 1) without colliding. mavlink2rest indexes
+# messages by that id, so hardcoding vehicles/1/components/1 looks like
+# "no link" even when the boat pings: vehicle 1 is just BlueOS companion
+# computers, and the ArduRover HEARTBEAT lives at 2/1. Cached so the
+# transect poll and GPS reads don't refetch the vehicle tree at 3 Hz.
+_BOAT_ID_TTL_S = 20.0
+_boat_ids_lock = threading.Lock()
+_boat_ids = {
+    "ip": None,
+    "sys": 1,
+    "comp": 1,
+    "checked_at": 0.0,
+    "discovered": False,
+}
+
+
+def _invalidate_boat_ids():
+    with _boat_ids_lock:
+        _boat_ids["checked_at"] = 0.0
+        _boat_ids["ip"] = None
+        _boat_ids["discovered"] = False
+
+
+def _boat_vehicle_ids():
+    """Return ``(system_id, component_id)`` for the tow-boat autopilot."""
+    now = time.monotonic()
+    with _boat_ids_lock:
+        ip = tow_vehicle_ip
+        cached = (
+            _boat_ids["ip"] == ip
+            and (now - _boat_ids["checked_at"]) < _BOAT_ID_TTL_S
+        )
+        if cached:
+            return _boat_ids["sys"], _boat_ids["comp"]
+
+    found = discover_autopilot(
+        f"http://{ip}/mavlink2rest",
+        prefer_mavtypes=BOAT_MAVTYPES,
+    )
+
+    with _boat_ids_lock:
+        _boat_ids["ip"] = ip
+        _boat_ids["checked_at"] = time.monotonic()
+        if found:
+            sysid, comp = found
+            if (not _boat_ids["discovered"]
+                    or (sysid, comp) != (_boat_ids["sys"], _boat_ids["comp"])):
+                logger.info("Tow boat autopilot at MAVLink %s/%s", sysid, comp)
+            _boat_ids["sys"], _boat_ids["comp"] = sysid, comp
+            _boat_ids["discovered"] = True
+        elif not _boat_ids["discovered"]:
+            _boat_ids["sys"], _boat_ids["comp"] = 1, 1
+        return _boat_ids["sys"], _boat_ids["comp"]
 
 def _tow_mavlink_url(msg_name):
     """Compose a mavlink2rest URL on the tow vehicle for one message name.
@@ -639,9 +696,12 @@ def _tow_mavlink_url(msg_name):
     Used by ``get_mission_state()`` to read mission/navigation messages
     from the ArduRover-based tow vehicle (HEARTBEAT, MISSION_CURRENT,
     NAV_CONTROLLER_OUTPUT, ...). Same host as the BlueBoat GPS / VFR_HUD
-    helpers above.
+    helpers above. Vehicle/component are discovered from the boat's
+    HEARTBEAT rather than assumed to be 1/1.
     """
-    return f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/1/components/1/messages/{msg_name}'
+    sysid, comp = _boat_vehicle_ids()
+    return (f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/'
+            f'{sysid}/components/{comp}/messages/{msg_name}')
 
 # ── ArduRover constants ──────────────────────────────────────────────────
 # Custom mode numbers for ArduRover (Plane / Sub / Copter use different
@@ -3522,6 +3582,7 @@ def config():
         if new_ip:
             tow_vehicle_ip = new_ip
             changed = True
+            _invalidate_boat_ids()
 
         new_capture = data.get('transect_capture_type')
         if new_capture is not None:
@@ -6226,7 +6287,12 @@ def _param_client(vehicle):
     ``tow_vehicle_ip`` from this very page between batches.
     """
     if vehicle == "boat":
-        return ParamClient(f'http://{tow_vehicle_ip}/mavlink2rest')
+        sysid, comp = _boat_vehicle_ids()
+        return ParamClient(
+            f'http://{tow_vehicle_ip}/mavlink2rest',
+            target_system=sysid,
+            target_component=comp,
+        )
     return ParamClient(LOCAL_MAVLINK2REST_URL)
 
 
@@ -6269,11 +6335,16 @@ def _param_snapshot():
             "read_at": reading.get("read_at"),
             "error": reading.get("error"),
         })
+    with _boat_ids_lock:
+        boat_sys = _boat_ids["sys"] if _boat_ids["discovered"] else None
+        boat_comp = _boat_ids["comp"] if _boat_ids["discovered"] else None
     return {
         "params": params,
         "job": job,
         "links": links,
         "boat_url": f'http://{tow_vehicle_ip}/mavlink2rest',
+        "boat_system_id": boat_sys,
+        "boat_component_id": boat_comp,
         "towfish_url": LOCAL_MAVLINK2REST_URL,
     }
 

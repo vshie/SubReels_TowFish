@@ -76,6 +76,97 @@ def str_to_chars(param_id: str, pad_len: int = PARAM_ID_LEN) -> list[str]:
     return chars
 
 
+# Heartbeats we treat as "this is an autopilot", as opposed to BlueOS
+# companion computers (MAV_AUTOPILOT_INVALID / ONBOARD_CONTROLLER) or
+# GCS nodes on system 255.
+_REAL_AUTOPILOTS = (
+    "MAV_AUTOPILOT_ARDUPILOTMEGA",
+    "MAV_AUTOPILOT_PX4",
+)
+
+# When a boat's mavlink2rest can also see the towfish (shared MAVLink
+# network), prefer the surface vehicle so parameters and GPS don't land
+# on the wrong autopilot.
+BOAT_MAVTYPES = (
+    "MAV_TYPE_SURFACE_BOAT",
+    "MAV_TYPE_GROUND_ROVER",
+    "MAV_TYPE_GROUND",
+)
+
+
+def _heartbeat_enum(message: dict, field: str) -> str:
+    """Pull a mavlink2rest enum ``type`` string out of a HEARTBEAT field."""
+    value = message.get(field)
+    if isinstance(value, dict):
+        return str(value.get("type") or "")
+    return str(value or "")
+
+
+def pick_autopilot(vehicles, prefer_mavtypes=None):
+    """Return ``(system_id, component_id)`` of a real autopilot, or None.
+
+    ``vehicles`` is the JSON object from ``GET /mavlink/vehicles``.
+    Companion computers and GCS nodes are ignored. When more than one
+    autopilot is visible, ``prefer_mavtypes`` (e.g. :data:`BOAT_MAVTYPES`)
+    picks the one whose HEARTBEAT.mavtype matches, in listed order.
+    """
+    if not isinstance(vehicles, dict):
+        return None
+    found = []
+    for vid, vehicle in vehicles.items():
+        if not isinstance(vehicle, dict):
+            continue
+        try:
+            sysid = int(vid)
+        except (TypeError, ValueError):
+            continue
+        components = vehicle.get("components") or {}
+        if not isinstance(components, dict):
+            continue
+        for cid, component in components.items():
+            if not isinstance(component, dict):
+                continue
+            try:
+                comp = int(cid)
+            except (TypeError, ValueError):
+                continue
+            heartbeat = (((component.get("messages") or {}).get("HEARTBEAT")
+                          or {}).get("message") or {})
+            if not isinstance(heartbeat, dict):
+                continue
+            if _heartbeat_enum(heartbeat, "autopilot") not in _REAL_AUTOPILOTS:
+                continue
+            found.append((sysid, comp, _heartbeat_enum(heartbeat, "mavtype")))
+    if not found:
+        return None
+    for preferred in tuple(prefer_mavtypes or ()):
+        for sysid, comp, mavtype in found:
+            if mavtype == preferred:
+                return sysid, comp
+    return found[0][0], found[0][1]
+
+
+def discover_autopilot(base_url: str, prefer_mavtypes=None,
+                       timeout_s: float = 2.0):
+    """Ask mavlink2rest which vehicle/component is the autopilot.
+
+    Returns ``(system_id, component_id)`` or ``None`` when the host is
+    down or isn't publishing an autopilot HEARTBEAT.
+    """
+    url = f"{base_url.rstrip('/')}/mavlink/vehicles"
+    try:
+        response = requests.get(url, timeout=timeout_s)
+        if response.status_code != 200 or not response.content:
+            return None
+        body = (response.text or "").strip()
+        if not body or body == "None":
+            return None
+        return pick_autopilot(response.json(), prefer_mavtypes=prefer_mavtypes)
+    except Exception as e:
+        logger.debug("autopilot discovery at %s failed: %s", url, e)
+        return None
+
+
 class ParamReadError(Exception):
     """Raised when a parameter could not be read or written in time."""
 
