@@ -76,7 +76,10 @@ scope, tow speed and depth. Planned work:
 - **Geotagged stills** — 2 Hz JPEGs with GPS position, height above the seabed
   and full towfish attitude written into EXIF plus Pix4D-namespace XMP
   (`Camera:Yaw/Pitch/Roll` and `GPSXYAccuracy`/`GPSZAccuracy`, read by Agisoft
-  Metashape, Pix4D and WebODM), and a `telemetry.csv` sidecar per session.
+  Metashape, Pix4D and WebODM), RadCam IMX678 lens tags (`FocalLength`
+  3.6–11 mm, 2.0 µm `FocalPlane` pitch, `FocalLengthIn35mmFilm`) so Metashape
+  does not assume a 50 mm 35 mm-equivalent lens, and a `telemetry.csv`
+  sidecar per session.
 - **Height above the seabed** — the towfish has no altimeter, so altitude is
   `boat sonar − towfish depth − offset`, with the sounding replayed at the tow
   delay (layback ÷ boat speed) so both instruments describe the same patch of

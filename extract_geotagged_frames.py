@@ -34,6 +34,9 @@ Each output JPEG gets whatever the sidecar supports:
       Metashape, Pix4D and OpenDroneMap/WebODM -- CSV only
     * XMP Camera:GPSXYAccuracy / GPSZAccuracy reference priors -- CSV only
     * XMP Towfish:MountPitchBody / DepthBelowSurface / SonarBottomDepth
+    * EXIF FocalLength / FocalPlane* / FocalLengthIn35mmFilm for the
+      RadCam IMX678 (3.6-11 mm, 2.0 um pitch) so Metashape does not
+      assume a 50 mm 35 mm-equivalent lens
     * UserComment / ImageDescription with roll, pitch, tilt, depth, temp
     * GPSTimeStamp / GPSDateStamp in UTC
     * DateTimeOriginal / DateTimeDigitized in local time
@@ -75,7 +78,8 @@ _POS_RE = re.compile(r"latitude:\s*(-?\d+(?:\.\d+)?)\s+"
 # the ones in ANGULAR_FIELDS, which are directions in degrees and must
 # be interpolated the short way around the circle.
 FIELDS = ("lat", "lon", "alt", "heading", "roll", "pitch",
-          "depth", "temp", "tilt", "mount_pitch", "sonar_depth")
+          "depth", "temp", "tilt", "mount_pitch", "sonar_depth",
+          "zoom_pct")
 ANGULAR_FIELDS = frozenset({"heading"})
 
 
@@ -179,6 +183,7 @@ class TelemetryTrack:
             "tilt": "camera_tilt_deg",
             "mount_pitch": "camera_mount_pitch_body_deg",
             "sonar_depth": "sonar_bottom_depth_m",
+            "zoom_pct": "camera_zoom_pct",
         }
         series: dict[str, list[tuple[float, float]]] = {f: [] for f in FIELDS}
         start_local = None
@@ -412,6 +417,8 @@ def main() -> int:
                 sonar_depth_m=s["sonar_depth"],
                 xy_accuracy_m=xy_acc, z_accuracy_m=z_acc,
                 software=pm.SOFTWARE_EXTRACT,
+                zoom_frac=(s["zoom_pct"] / 100.0
+                           if s["zoom_pct"] is not None else None),
             )
             jpg.write_bytes(data)
         except Exception as e:

@@ -1123,6 +1123,14 @@ TILT_SERVO_REVERSED = True    # SERVO16_REVERSED
 TILT_MOUNT_PITCH_MIN_DEG = -70.0  # MNT1_PITCH_MIN (camera fully down)
 TILT_MOUNT_PITCH_MAX_DEG = 70.0   # MNT1_PITCH_MAX (camera fully up)
 
+# Zoom is SERVO11. RANGE 0 (fully out, 3.6 mm, 94x62 deg) is the survey
+# preset; RANGE 100 is fully in (11 mm). PWM endpoints verified against
+# this vehicle. Used to write EXIF FocalLength so Metashape does not
+# assume a 50 mm 35 mm-equivalent lens.
+ZOOM_SERVO_CHANNEL = 11
+ZOOM_PWM_MIN = 935            # RANGE 0, fully out
+ZOOM_PWM_MAX = 1850           # RANGE 100, fully in
+
 # Camera ISP info endpoint
 camera_isp_url = 'http://192.168.2.10/action/getISPInfo'
 
@@ -1504,6 +1512,7 @@ _VIDEO_CSV_HEADER = [
     'towfish_roll_deg', 'towfish_pitch_deg',
     'depth_m', 'temperature_c', 'camera_tilt_deg', 'telem_ms',
     'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
+    'camera_zoom_pct',
 ]
 
 _WP_LABEL_RE = re.compile(r'_(wp\d+)(?:_|$)')
@@ -1745,6 +1754,32 @@ def adjust_srt_timing(srt_path, video_duration):
         logger.error(f"Error adjusting SRT timing: {str(e)}")
         return False
 
+def zoom_pwm_to_frac(pwm):
+    """Map SERVO11 PWM to zoom fraction: 0 = fully out (3.6 mm), 1 = 11 mm.
+
+    Returns ``None`` when the servo is not driven. Clamped to 0..1 so an
+    out-of-range PWM cannot invent a focal length outside the lens spec.
+    """
+    if not pwm:  # None or 0 -> servo not driven
+        return None
+    span = ZOOM_PWM_MAX - ZOOM_PWM_MIN
+    if span == 0:
+        return None
+    frac = (float(pwm) - ZOOM_PWM_MIN) / span
+    return max(0.0, min(1.0, frac))
+
+
+def _servo_output_message():
+    """One SERVO_OUTPUT_RAW fetch. Empty dict on any failure."""
+    try:
+        response = requests.get(servo_output_url, timeout=1)
+        if response.status_code == 200:
+            return response.json().get('message', {}) or {}
+    except Exception as e:
+        logger.debug("Error fetching SERVO_OUTPUT_RAW: %s", e)
+    return {}
+
+
 def tilt_pwm_to_body_deg(pwm):
     """Map a raw SERVO16 PWM to the body-frame mount pitch (degrees).
 
@@ -1771,7 +1806,8 @@ def tilt_pwm_to_body_deg(pwm):
     return max(lo, min(hi, angle))
 
 
-def get_towfish_camera_tilt(vehicle_pitch_deg=None, with_body=False):
+def get_towfish_camera_tilt(vehicle_pitch_deg=None, with_body=False,
+                            servo_msg=None):
     """Camera tilt (degrees), world-relative (earth-frame). Negative = down.
 
     The mount runs earth-frame stabilised, so the servo continuously
@@ -1790,19 +1826,20 @@ def get_towfish_camera_tilt(vehicle_pitch_deg=None, with_body=False):
     aimed relative to the fish itself -- which is recorded alongside the
     earth-frame value because it is the quantity that describes the
     physical install rather than the attitude of the moment.
+
+    ``servo_msg`` is an already-fetched SERVO_OUTPUT_RAW message, so a
+    caller that also wants zoom can share one HTTP round-trip.
     """
     try:
-        response = requests.get(servo_output_url, timeout=1)
-        if response.status_code == 200:
-            message = response.json().get('message', {})
-            pwm = message.get(f'servo{TILT_SERVO_CHANNEL}_raw', None)
-            body_deg = tilt_pwm_to_body_deg(pwm)
-            if body_deg is None:
-                return (None, None) if with_body else None
-            if vehicle_pitch_deg is None:
-                vehicle_pitch_deg = get_towfish_attitude().get('pitch')
-            world_deg = body_deg + (vehicle_pitch_deg or 0.0)
-            return (world_deg, body_deg) if with_body else world_deg
+        message = servo_msg if servo_msg is not None else _servo_output_message()
+        pwm = message.get(f'servo{TILT_SERVO_CHANNEL}_raw', None)
+        body_deg = tilt_pwm_to_body_deg(pwm)
+        if body_deg is None:
+            return (None, None) if with_body else None
+        if vehicle_pitch_deg is None:
+            vehicle_pitch_deg = get_towfish_attitude().get('pitch')
+        world_deg = body_deg + (vehicle_pitch_deg or 0.0)
+        return (world_deg, body_deg) if with_body else world_deg
     except Exception as e:
         logger.debug(f"Error fetching camera tilt: {str(e)}")
     return (None, None) if with_body else None
@@ -1994,10 +2031,14 @@ def fetch_telemetry_block():
         # every depth and altitude read zero.
         depth = _get_towfish_depth_m()
         temp = get_baro_data()
-        # World-relative camera pitch plus the raw body-frame mount
-        # angle. Both come from one SERVO_OUTPUT_RAW read.
+        # One SERVO_OUTPUT_RAW read yields tilt, body-frame mount angle
+        # and zoom, so EXIF FocalLength can track the 3.6-11 mm lens
+        # without a second mavlink2rest round-trip.
+        servos = _servo_output_message()
         tilt, mount_pitch = get_towfish_camera_tilt(
-            vehicle_pitch_deg=pitch, with_body=True)
+            vehicle_pitch_deg=pitch, with_body=True, servo_msg=servos)
+        zoom_frac = zoom_pwm_to_frac(
+            servos.get(f'servo{ZOOM_SERVO_CHANNEL}_raw'))
         # Height above the seabed, from the boat's sounder replayed at
         # the tow delay. This is what lands in EXIF GPSAltitude.
         tow_alt, alt_detail = compute_towfish_altitude(depth)
@@ -2013,6 +2054,7 @@ def fetch_telemetry_block():
         temp = None
         tilt = None
         mount_pitch = None
+        zoom_frac = None
         alt_detail = {"sonar_depth_m": None, "tow_delay_s": None,
                       "sonar_age_err_s": None, "altitude_m": None}
     return {
@@ -2022,6 +2064,7 @@ def fetch_telemetry_block():
         'tow_alt': tow_alt,
         'depth': depth, 'temp': temp, 'tilt': tilt,
         'mount_pitch': mount_pitch,
+        'zoom_frac': zoom_frac,
         'sonar_depth': alt_detail['sonar_depth_m'],
         'tow_delay_s': alt_detail['tow_delay_s'],
         'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
@@ -2145,6 +2188,8 @@ def _video_csv_row(ts_local, elapsed, csv_path, wp_label, telem):
         num(telem.get('mount_pitch'), '.1f'),
         num(telem.get('sonar_depth'), '.2f'),
         num(telem.get('tow_delay_s'), '.1f'),
+        num(None if telem.get('zoom_frac') is None
+            else telem['zoom_frac'] * 100.0, '.1f'),
     ]
 
 async def data_lake_handler(websocket):
@@ -3134,6 +3179,7 @@ _TIMELAPSE_CSV_HEADER = [
     'depth_m', 'temperature_c', 'camera_tilt_deg',
     'snap_ms', 'telem_ms', 'sync_skew_ms', 'towfish_altitude_m',
     'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
+    'camera_zoom_pct',
 ]
 
 
@@ -3392,6 +3438,7 @@ class TimelapseSession:
                 mount_pitch = None
                 sonar_depth = None
                 tow_delay_s = None
+                zoom_frac = None
             else:
                 bb_lat = telemetry['bb_lat']
                 bb_lon = telemetry['bb_lon']
@@ -3408,6 +3455,7 @@ class TimelapseSession:
                 mount_pitch = telemetry.get('mount_pitch')
                 sonar_depth = telemetry.get('sonar_depth')
                 tow_delay_s = telemetry.get('tow_delay_s')
+                zoom_frac = telemetry.get('zoom_frac')
             xy_acc, z_acc = photogrammetry_meta.reference_accuracy_m(
                 tow_offset_m, tow_alt)
 
@@ -3424,6 +3472,7 @@ class TimelapseSession:
                 roll_deg=roll, pitch_deg=pitch,
                 mount_pitch_deg=mount_pitch, sonar_depth_m=sonar_depth,
                 xy_accuracy_m=xy_acc, z_accuracy_m=z_acc,
+                zoom_frac=zoom_frac,
             )
 
             # Claim the global day sequence + per-waypoint frame number
@@ -3507,6 +3556,7 @@ class TimelapseSession:
                         f"{mount_pitch:.1f}" if mount_pitch is not None else "",
                         f"{sonar_depth:.2f}" if sonar_depth is not None else "",
                         f"{tow_delay_s:.1f}" if tow_delay_s is not None else "",
+                        f"{zoom_frac * 100.0:.1f}" if zoom_frac is not None else "",
                     ])
             except Exception:
                 logger.exception("TIMELAPSE CSV write failed")
@@ -4716,9 +4766,9 @@ _ALLOWED_MODE_NAMES = {
 }
 
 # Optics survey defaults verified against the RadCam on this vehicle:
-#   Zoom  -> RANGE 0   -> SERVO11 = 935  (fully out)
+#   Zoom  -> RANGE 0   -> SERVO11 = ZOOM_PWM_MIN  (fully out, 3.6 mm)
 #   Zoom  -> RANGE 50  -> SERVO11 ~ 1392 (half)
-#   Zoom  -> RANGE 100 -> SERVO11 = 1850 (full)
+#   Zoom  -> RANGE 100 -> SERVO11 = ZOOM_PWM_MAX (fully in, 11 mm)
 # Focus  -> RANGE 61.03 -> SERVO12 = 1639 (survey trim)
 ZOOM_PRESETS_PCT = {"out": 0.0, "half": 50.0, "full": 100.0}
 FOCUS_TRIM_PCT = 61.03  # matches SERVO12_TRIM=1639 the operator set
@@ -4752,7 +4802,7 @@ def get_optics_snapshot() -> dict:
     """
     tilt_pwm = _current_servo_pwm(TILT_SERVO_CHANNEL)
     focus_pwm = _current_servo_pwm(12)
-    zoom_pwm = _current_servo_pwm(11)
+    zoom_pwm = _current_servo_pwm(ZOOM_SERVO_CHANNEL)
     focus_pct = focus_pwm_to_pct(focus_pwm) if focus_pwm else None
     # World-relative (earth-frame) camera pitch: reuse the tilt PWM we
     # just read, then add the vehicle pitch from ATTITUDE.

@@ -145,6 +145,37 @@ def check_embedding():
         check("sonar bottom depth recorded",
               "<Towfish:SonarBottomDepth>11.75</Towfish:SonarBottomDepth>" in xmp, xmp)
 
+    exif_ifd = exif["Exif"]
+    image_ifd = exif["0th"]
+    check("Make is RadCam", image_ifd[piexif.ImageIFD.Make] == b"RadCam")
+    check("Model is IMX678", image_ifd[piexif.ImageIFD.Model] == b"IMX678")
+    check("FocalLength is 3.6 mm at default zoom",
+          exif_ifd[piexif.ExifIFD.FocalLength] == (36, 10))
+    check("FocalLengthIn35mmFilm is 17 mm",
+          exif_ifd[piexif.ExifIFD.FocalLengthIn35mmFilm] == 17)
+    check("FNumber is 1.5", exif_ifd[piexif.ExifIFD.FNumber] == (15, 10))
+    check("LensModel names the zoom",
+          exif_ifd[piexif.ExifIFD.LensModel] == b"3.6-11mm F1.5")
+    check("FocalPlaneResolutionUnit is inches",
+          exif_ifd[piexif.ExifIFD.FocalPlaneResolutionUnit] == 2)
+    # tiny_jpeg is 8x8 covering the same 7.68 mm FOV, so effective pitch
+    # is 0.96 mm and X resolution is 25.4/0.96 ppi.
+    ppi_x = exif_ifd[piexif.ExifIFD.FocalPlaneXResolution]
+    check("FocalPlaneXResolution scales with JPEG width",
+          abs(ppi_x[0] / ppi_x[1] - 25.4 / 0.96) < 0.01,
+          f"got {ppi_x[0] / ppi_x[1]}")
+    check("UserComment carries focal length", b"fl=3.6mm" in comment)
+
+    tele = pm.embed_metadata(
+        tiny_jpeg(),
+        lat=19.312648, lon=-155.888358, alt_m=8.25, heading_deg=127.4,
+        ts_local=ts_local, ts_utc=ts_utc, zoom_frac=1.0,
+    )
+    tele_fl = piexif.load(tele)["Exif"][piexif.ExifIFD.FocalLength]
+    check("fully zoomed-in FocalLength is 11.0 mm", tele_fl == (110, 10))
+    check("fully zoomed-in 35 mm-eq is 52 mm",
+          piexif.load(tele)["Exif"][piexif.ExifIFD.FocalLengthIn35mmFilm] == 52)
+
 
 def check_pitch_convention():
     check("nadir tilt gives pitch 0",
@@ -196,6 +227,20 @@ def check_no_orientation():
     check("no XMP when nothing was measured", find_xmp(bare) is None)
 
 
+print("\nIMX678 lens model")
+check("fully out is 3.6 mm", approx(pm.focal_length_mm(0.0), 3.6))
+check("omitted zoom is fully out", approx(pm.focal_length_mm(None), 3.6))
+check("fully in is 11.0 mm", approx(pm.focal_length_mm(1.0), 11.0))
+check("half zoom is 7.3 mm", approx(pm.focal_length_mm(0.5), 7.3))
+check("clamps above 1", approx(pm.focal_length_mm(2.0), 11.0))
+# 3.6 mm on a 7.68 mm-wide 4K IMX678 is 16.875 mm 35 mm-equivalent.
+check("wide end 35 mm-eq is 17 mm", pm.focal_length_35mm(3.6) == 17)
+check("tele end 35 mm-eq is 52 mm", pm.focal_length_35mm(11.0) == 52)
+# Native 2 um pitch: 25.4 mm/in / 0.002 mm = 12700 ppi.
+check("native focal-plane pitch is 12700 ppi",
+      approx(pm._focal_plane_ppi(3840, 3840), 12700.0, 0.01))
+
+
 print("\ncamera pitch convention (nadir = 0)")
 check_pitch_convention()
 
@@ -242,6 +287,7 @@ reader_columns = {
     "towfish_heading_deg", "towfish_roll_deg", "towfish_pitch_deg",
     "depth_m", "temperature_c", "camera_tilt_deg",
     "camera_mount_pitch_body_deg", "sonar_bottom_depth_m",
+    "camera_zoom_pct",
 }
 if video_header:
     missing = reader_columns - set(video_header)
@@ -276,6 +322,7 @@ with tempfile.TemporaryDirectory() as td:
                 "camera_mount_pitch_body_deg": "-68.0",
                 "sonar_bottom_depth_m": "11.75",
                 "tow_delay_s": "6.0",
+                "camera_zoom_pct": "0.0",
             }
             w.writerow([values.get(c, "") for c in video_header])
 
@@ -303,6 +350,7 @@ with tempfile.TemporaryDirectory() as td:
     check("tilt read", approx(mid["tilt"], -70.0, 1e-9))
     check("body-frame mount angle read", approx(mid["mount_pitch"], -68.0, 1e-9))
     check("sonar bottom depth read", approx(mid["sonar_depth"], 11.75, 1e-9))
+    check("zoom pct read", approx(mid["zoom_pct"], 0.0, 1e-9))
 
     at2 = track.sample(2.0)
     check("heading at last sample is 10", approx(at2["heading"], 10.0, 1e-9))

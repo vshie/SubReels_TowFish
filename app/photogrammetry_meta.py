@@ -27,6 +27,17 @@ Metashape reads ``Camera:*`` when "Load camera orientation angles from
 XMP meta data" and "Load camera location accuracy from XMP meta data"
 are enabled in Preferences -> Advanced. The ``Towfish:*`` tags are
 reachable from a Metashape Python script via ``camera.photo.meta``.
+
+Interior orientation is a separate EXIF set. Metashape seeds
+autocalibration from ``FocalLength`` plus sensor pixel size
+(``FocalPlaneXResolution`` / ``FocalPlaneYResolution``, falling back to
+``FocalLengthIn35mmFilm``). It does not read a field-of-view tag. With
+none of those present it assumes a 50 mm 35 mm-equivalent lens, which
+is a ~40 deg horizontal FOV -- a factor of three off this camera's
+94 deg wide end, and enough for alignment to fail. The RadCam's Sony
+IMX678 (2.0 um pitch, 3.6-11 mm F1.5 zoom, 94x62 deg at fully out) is
+therefore written into every JPEG so the solver starts from the real
+optics rather than that default.
 """
 from __future__ import annotations
 
@@ -57,6 +68,22 @@ GPS_XY_ACCURACY_BASE_M = 3.0         # boat GNSS + heading error at zero layback
 GPS_XY_ACCURACY_LAYBACK_FRAC = 0.25  # layback contributes 25% of its length
 GPS_Z_ACCURACY_DEPTH_M = 0.3         # pressure depth alone
 GPS_Z_ACCURACY_ALTITUDE_M = 0.5      # altitude = two sensors differenced
+
+# RadCam / Sony IMX678. Pixel pitch is physical and constant; focal
+# length is the 3.6-11 mm zoom, with 94 x 62 deg FOV at the wide end
+# (fully out -- the survey preset). 4K readout of 3840x2160 at 2.0 um
+# is a 7.68 x 4.32 mm active area, which at 3.6 mm is 93.7 x 61.9 deg
+# and matches the published FOV within the lens's +/-5% spec.
+CAMERA_MAKE = b"RadCam"
+CAMERA_MODEL = b"IMX678"
+LENS_MODEL = b"3.6-11mm F1.5"
+PIXEL_SIZE_MM = 0.002
+NATIVE_WIDTH_PX = 3840
+NATIVE_HEIGHT_PX = 2160
+FOCAL_MM_WIDE = 3.6
+FOCAL_MM_TELE = 11.0
+F_NUMBER = 1.5
+FF_WIDTH_MM = 36.0  # 35 mm full-frame width, for the integer fallback tag
 
 
 def _finite(value):
@@ -92,6 +119,110 @@ def reference_accuracy_m(tow_offset_m, altitude_m=None):
     return (round(xy, 2), z)
 
 
+def focal_length_mm(zoom_frac=None):
+    """Physical focal length in millimetres.
+
+    ``zoom_frac`` is 0 at fully out (3.6 mm, the survey default) and 1
+    at fully in (11 mm). Missing or non-finite zoom is treated as fully
+    out. Rounded to 0.1 mm so PWM jitter at a mechanical stop does not
+    fragment Metashape calibration groups, which split on exact
+    ``FocalLength``.
+    """
+    frac = _finite(zoom_frac)
+    if frac is None:
+        frac = 0.0
+    frac = max(0.0, min(1.0, frac))
+    return round(FOCAL_MM_WIDE + (FOCAL_MM_TELE - FOCAL_MM_WIDE) * frac, 1)
+
+
+def focal_length_35mm(focal_mm):
+    """Integer 35 mm-equivalent for the EXIF SHORT tag.
+
+    Crop factor is from the native 4K width (7.68 mm), not the JPEG
+    width: a scaled snapshot still covers the same field of view.
+    """
+    sensor_w = PIXEL_SIZE_MM * NATIVE_WIDTH_PX
+    eq = float(focal_mm) * FF_WIDTH_MM / sensor_w
+    return max(1, int(round(eq)))
+
+
+def jpeg_dimensions(jpeg_bytes):
+    """``(width, height)`` from the first SOF marker, or ``None``."""
+    data = jpeg_bytes or b""
+    if len(data) < 4 or data[0:2] != b"\xff\xd8":
+        return None
+    i = 2
+    n = len(data)
+    while i + 8 < n:
+        if data[i] != 0xFF:
+            return None
+        while i < n and data[i] == 0xFF:
+            i += 1
+        if i >= n:
+            return None
+        marker = data[i]
+        i += 1
+        if marker in (0xD8, 0xD9) or (0xD0 <= marker <= 0xD7):
+            continue
+        if i + 2 > n:
+            return None
+        seglen = int.from_bytes(data[i:i + 2], "big")
+        if seglen < 2:
+            return None
+        # SOF0..SOF3 / SOF5..SOF7 / SOF9..SOF11 / SOF13..SOF15
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            if i + 7 > n:
+                return None
+            height = int.from_bytes(data[i + 3:i + 5], "big")
+            width = int.from_bytes(data[i + 5:i + 7], "big")
+            if width > 0 and height > 0:
+                return width, height
+            return None
+        i += seglen
+    return None
+
+
+def _focal_plane_ppi(size_px, native_px):
+    """Pixels-per-inch along one axis, assuming the JPEG covers full FOV.
+
+    A 1920-wide snapshot of the same 7.68 mm sensor has 4 um effective
+    pixels; writing the native 2 um pitch would tell Metashape the lens
+    is twice as long as it is.
+    """
+    size = size_px if size_px else native_px
+    pixel_mm = PIXEL_SIZE_MM * (native_px / size)
+    return 25.4 / pixel_mm
+
+
+def _ppi_rational(ppi):
+    return (int(round(ppi * 1000)), 1000)
+
+
+def apply_lens_exif(exif_ifd, image_ifd, jpeg_bytes=None, zoom_frac=None):
+    """Stamp IMX678 Make/Model/focal-length/pixel-size into the IFDs.
+
+    Returns the millimetre focal length that was written, so the
+    UserComment can echo it.
+    """
+    focal_mm = focal_length_mm(zoom_frac)
+    image_ifd[piexif.ImageIFD.Make] = CAMERA_MAKE
+    image_ifd[piexif.ImageIFD.Model] = CAMERA_MODEL
+    exif_ifd[piexif.ExifIFD.FocalLength] = (int(round(focal_mm * 10)), 10)
+    exif_ifd[piexif.ExifIFD.FocalLengthIn35mmFilm] = focal_length_35mm(focal_mm)
+    exif_ifd[piexif.ExifIFD.FNumber] = (int(round(F_NUMBER * 10)), 10)
+    exif_ifd[piexif.ExifIFD.LensModel] = LENS_MODEL
+    dims = jpeg_dimensions(jpeg_bytes) if jpeg_bytes else None
+    width, height = dims if dims else (NATIVE_WIDTH_PX, NATIVE_HEIGHT_PX)
+    exif_ifd[piexif.ExifIFD.FocalPlaneXResolution] = _ppi_rational(
+        _focal_plane_ppi(width, NATIVE_WIDTH_PX))
+    exif_ifd[piexif.ExifIFD.FocalPlaneYResolution] = _ppi_rational(
+        _focal_plane_ppi(height, NATIVE_HEIGHT_PX))
+    # 2 = inch. Metashape prefers these over FocalLengthIn35mmFilm.
+    exif_ifd[piexif.ExifIFD.FocalPlaneResolutionUnit] = 2
+    return focal_mm
+
+
 def camera_pitch_from_tilt(tilt_deg, body_pitch_deg=None):
     """Camera pitch in the Pix4D/Metashape sense: degrees off nadir.
 
@@ -124,7 +255,8 @@ def decimal_deg_to_dms_rationals(deg):
 def build_user_comment(lat, lon, alt_m, heading_deg, ts_utc,
                        tilt_deg=None, depth_m=None, temp_c=None,
                        roll_deg=None, pitch_deg=None,
-                       mount_pitch_deg=None, sonar_depth_m=None):
+                       mount_pitch_deg=None, sonar_depth_m=None,
+                       focal_mm=None):
     """Human-readable telemetry bundle for UserComment/ImageDescription.
 
     Position and altitude have standard tags, but the rest do not, so
@@ -145,6 +277,7 @@ def build_user_comment(lat, lon, alt_m, heading_deg, ts_utc,
         ("pitch", pitch_deg, "{:+.1f}deg"),
         ("tilt", tilt_deg, "{:+.1f}deg"),
         ("mount", mount_pitch_deg, "{:+.1f}deg"),
+        ("fl", focal_mm, "{:.1f}mm"),
         ("depth", depth_m, "{:.2f}m"),
         ("sonar", sonar_depth_m, "{:.2f}m"),
         ("temp", temp_c, "{:.1f}C"),
@@ -160,7 +293,8 @@ def build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
                          tilt_deg=None, depth_m=None, temp_c=None,
                          roll_deg=None, pitch_deg=None,
                          mount_pitch_deg=None, sonar_depth_m=None,
-                         software=SOFTWARE_LIVE):
+                         software=SOFTWARE_LIVE, jpeg_bytes=None,
+                         zoom_frac=None):
     """Build piexif-encoded EXIF bytes embedding the towfish position.
 
     * ``lat`` / ``lon`` are the tow point's fix already laid back along
@@ -176,8 +310,11 @@ def build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
     * ``ts_local`` / ``ts_utc`` populate ``DateTimeOriginal`` (local
       wall-clock for the operator) and ``GPSDateStamp`` /
       ``GPSTimeStamp`` (always UTC, per EXIF spec).
+    * Lens identity (IMX678, 2.0 um pitch, 3.6-11 mm zoom) is always
+      written, because Metashape's interior-orientation seed comes from
+      those tags and is independent of whether this frame has a GPS fix.
 
-    Returns ``None`` when there's nothing useful to embed.
+    Returns ``None`` only if piexif itself refuses to serialise.
     """
     lat = _finite(lat)
     lon = _finite(lon)
@@ -186,11 +323,6 @@ def build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
 
     have_gps = lat is not None and lon is not None
     have_heading = heading_deg is not None
-    have_extra = any(_finite(v) is not None for v in
-                     (tilt_deg, depth_m, temp_c, roll_deg, pitch_deg,
-                      mount_pitch_deg, sonar_depth_m))
-    if not (have_gps or have_heading or have_extra):
-        return None
 
     gps_ifd = {piexif.GPSIFD.GPSVersionID: (2, 3, 0, 0)}
 
@@ -231,13 +363,16 @@ def build_gps_exif_bytes(lat, lon, alt_m, heading_deg, ts_local, ts_utc,
         piexif.ImageIFD.DateTime: dt_str,
         piexif.ImageIFD.Software: software,
     }
+    focal_mm = apply_lens_exif(exif_ifd, image_ifd, jpeg_bytes=jpeg_bytes,
+                               zoom_frac=zoom_frac)
 
     comment = build_user_comment(lat, lon, alt_m, heading_deg, ts_utc,
                                  tilt_deg=tilt_deg, depth_m=depth_m,
                                  temp_c=temp_c, roll_deg=roll_deg,
                                  pitch_deg=pitch_deg,
                                  mount_pitch_deg=mount_pitch_deg,
-                                 sonar_depth_m=sonar_depth_m)
+                                 sonar_depth_m=sonar_depth_m,
+                                 focal_mm=focal_mm)
     if comment:
         comment_bytes = comment.encode('ascii', 'replace')
         # EXIF UserComment needs an 8-byte character-code prefix.
@@ -338,16 +473,17 @@ def embed_metadata(jpeg_bytes, lat, lon, alt_m, heading_deg, ts_local, ts_utc,
                    roll_deg=None, pitch_deg=None,
                    mount_pitch_deg=None, sonar_depth_m=None,
                    xy_accuracy_m=None, z_accuracy_m=None,
-                   software=SOFTWARE_LIVE):
+                   software=SOFTWARE_LIVE, zoom_frac=None):
     """Stamp EXIF + Pix4D XMP into ``jpeg_bytes``, returning the new bytes.
 
     ``alt_m`` is height above the seabed. ``tilt_deg`` is the earth-frame
     camera tilt and ``pitch_deg`` the towfish body pitch; the conversion
     to a nadir-referenced ``Camera:Pitch`` happens here so every caller
-    gets the same convention. Failure is non-fatal -- the caller gets
-    back whatever was successfully stamped (possibly the untouched
-    input), because a frame with no metadata still beats losing the
-    frame.
+    gets the same convention. ``zoom_frac`` is 0 at 3.6 mm (fully out)
+    and 1 at 11 mm; omitted zoom is written as fully out. Failure is
+    non-fatal -- the caller gets back whatever was successfully stamped
+    (possibly the untouched input), because a frame with no metadata
+    still beats losing the frame.
     """
     try:
         exif_bytes = build_gps_exif_bytes(
@@ -355,7 +491,7 @@ def embed_metadata(jpeg_bytes, lat, lon, alt_m, heading_deg, ts_local, ts_utc,
             tilt_deg=tilt_deg, depth_m=depth_m, temp_c=temp_c,
             roll_deg=roll_deg, pitch_deg=pitch_deg,
             mount_pitch_deg=mount_pitch_deg, sonar_depth_m=sonar_depth_m,
-            software=software,
+            software=software, jpeg_bytes=jpeg_bytes, zoom_frac=zoom_frac,
         )
         if exif_bytes is not None:
             # piexif.insert with raw bytes requires either a path or a
