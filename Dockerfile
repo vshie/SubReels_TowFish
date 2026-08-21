@@ -45,13 +45,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends --no-install-su
 # USB filesystem support so the in-container ``mount`` can attach removable
 # drives the BlueOS host hot-plugs into the towfish.  vfat (FAT32) is built
 # into the kernel; exfat-utils + ntfs-3g cover the two other common formats
-# operators use on field USB sticks.  exfat-fuse is intentionally installed
+# operators use on field USB sticks.  dosfstools provides ``mkfs.vfat`` for
+# the setup-console wipe path.  exfat-fuse is intentionally installed
 # alongside the userspace utilities even though usb_storage.py prefers the
 # kernel exfat driver -- it's harmless when the kernel module is in use.
 RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
     exfat-fuse \
     exfat-utils \
     ntfs-3g \
+    dosfstools \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory

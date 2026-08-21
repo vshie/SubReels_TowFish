@@ -5666,6 +5666,48 @@ def stop():
             # path -- here we just surface the error to the caller.
             return jsonify({"success": False, "message": str(e)}), 500
 
+
+@app.route('/usb/wipe', methods=['POST'])
+def usb_wipe():
+    """Erase the attached USB drive and remount it empty.
+
+    Refuses while any recorder mode is active, or while the transect
+    monitor owns the session, so a wipe cannot yank the filesystem out
+    from under an in-flight file. Requires ``{"confirm": true}`` so a
+    stray POST cannot format the stick.
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get("confirm") is not True:
+        return jsonify({"success": False,
+                        "message": "confirm must be true"}), 400
+    if mode != MODE_IDLE:
+        return jsonify({"success": False,
+                        "message": f"Cannot wipe USB while {mode} active"}), 409
+    if _transect_monitor is not None and _transect_monitor.state != "disabled":
+        return jsonify({"success": False,
+                        "message": "Cannot wipe USB while transect monitor is enabled"}), 409
+    if usb_recording:
+        return jsonify({"success": False,
+                        "message": "Cannot wipe USB while recording to it"}), 409
+    try:
+        result = usb_storage.wipe()
+    except Exception as e:
+        logger.exception("USB wipe raised")
+        return jsonify({"success": False, "message": str(e)}), 500
+    if not result.get("ok"):
+        return jsonify({
+            "success": False,
+            "message": result.get("message") or "USB wipe failed",
+            "usb_storage": result.get("status"),
+        }), 500
+    logger.info("USB wipe complete: %s", result.get("message"))
+    return jsonify({
+        "success": True,
+        "message": result.get("message"),
+        "usb_storage": result.get("status"),
+    })
+
+
 @app.route('/status', methods=['GET'])
 def get_status():
     """Status of whichever mode is currently active.

@@ -117,6 +117,35 @@ with FakeFree(res * 2):
           st.get("min_free_mb_recording") == res)
 
 
+print("\nmkfs_command")
+check("exfat keeps TOWFISH",
+      usb_storage.mkfs_command("/dev/sda1", "exfat", "TOWFISH")
+      == ["mkfs.exfat", "-n", "TOWFISH", "/dev/sda1"])
+check("vfat is FAT32 and 11-char upper",
+      usb_storage.mkfs_command("/dev/sdb1", "vfat", "surveystick")
+      == ["mkfs.vfat", "-F", "32", "-n", "SURVEYSTICK", "/dev/sdb1"])
+check("empty label defaults to TOWFISH",
+      usb_storage.mkfs_command("/dev/sda1", "exfat", "")
+      == ["mkfs.exfat", "-n", "TOWFISH", "/dev/sda1"])
+check("unknown fstype formats as exfat",
+      usb_storage.mkfs_command("/dev/sda1", "", "DATA")[0] == "mkfs.exfat")
+check("unsafe chars are replaced",
+      usb_storage.mkfs_command("/dev/sda1", "exfat", "FOO/BAR")
+      == ["mkfs.exfat", "-n", "FOO_BAR", "/dev/sda1"])
+
+
+print("\nwipe with no drive")
+orig_scan = usb_storage._scan_usb_devices
+usb_storage._scan_usb_devices = lambda: []
+try:
+    wipe_res = usb_storage.wipe()
+    check("wipe reports not ok", wipe_res["ok"] is False)
+    check("wipe says no drive", "No USB" in wipe_res["message"])
+    check("wipe returns a status dict", isinstance(wipe_res.get("status"), dict))
+finally:
+    usb_storage._scan_usb_devices = orig_scan
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: {FAILURES}")

@@ -339,11 +339,12 @@
 
         .storage-line {
             display: flex;
-            align-items: baseline;
+            align-items: center;
             gap: 10px;
             flex-wrap: wrap;
             font-size: 14px;
         }
+        .storage-line .spacer { flex: 1; min-width: 8px; }
         .storage-line .primary {
             color: var(--phosphor);
             font-weight: 700;
@@ -436,6 +437,8 @@
         .btn:disabled { opacity: 0.35; cursor: not-allowed; text-shadow: none; }
         .btn.amber { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); border-color: #3a2d12; }
         .btn.amber:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--amber-glow); }
+        .btn.danger { color: var(--red); text-shadow: 0 0 4px var(--red-glow); border-color: #501313; }
+        .btn.danger:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--red-glow); }
         .btn.tiny { font-size: 11.5px; padding: 6px 9px; letter-spacing: 0.06em; }
 
         .saved {
@@ -727,6 +730,9 @@
                     <div class="storage-line">
                         <span class="primary" id="storagePrimary">--</span>
                         <span class="aux" id="storageFree"></span>
+                        <span class="spacer"></span>
+                        <button class="btn danger tiny" id="usbWipe" disabled>WIPE USB</button>
+                        <span class="saved" id="usbWipeSaved">WIPED</span>
                     </div>
                     <div class="hint" id="storageDetail"></div>
                 </div>
@@ -1096,12 +1102,12 @@ function renderStorage(d) {
     } else if (usb.mounted && usb.usable) {
         primary = 'USB DRIVE READY';
         free = usbFree;
-        detail = `Recordings will be written to USB (${usb.fstype || 'unknown'}).`;
+        detail = `Recordings will be written to USB (${usb.fstype || 'unknown'}). WIPE USB erases the whole stick, not just Towfish files.`;
     } else if (usb.mounted) {
         primary = 'USB NEARLY FULL — USING SD';
         warn = true;
         free = `${usbFree} · ${localFree}`;
-        detail = `USB free space is below the ${usb.min_free_gb || 20} GB threshold.`;
+        detail = `USB free space is below the ${usb.min_free_gb || 20} GB threshold. Wipe the stick or swap it before the next survey.`;
     } else {
         primary = 'NO USB DRIVE — USING SD';
         warn = true;
@@ -1114,6 +1120,14 @@ function renderStorage(d) {
     $('storageFree').textContent = free || '';
     $('storageDevice').textContent = usb.device || '';
     $('storageDetail').textContent = detail || '';
+
+    const wipeBtn = $('usbWipe');
+    // Leave the button alone while the operator is mid-confirm or a
+    // wipe is in flight -- a 3s status poll would otherwise reset the
+    // CONFIRM ERASE ALL label and re-enable a button we just disabled.
+    if (wipeBtn.dataset.armed !== '1' && wipeBtn.dataset.wiping !== '1') {
+        wipeBtn.disabled = busy || !usb.mounted;
+    }
 }
 
 async function refreshTelemetry() {
@@ -1188,6 +1202,42 @@ $('snapshotUrl').addEventListener('keydown', (e) => {
 });
 $('storagePreference').addEventListener('change', (e) => {
     saveConfigField({ storage_preference: e.target.value }, 'storageSaved');
+});
+
+// Two-click wipe: first press arms for 8s, second press formats the
+// stick. Recording-active / no-drive are already disabled in renderStorage.
+let usbWipeArmTimer = null;
+$('usbWipe').addEventListener('click', async () => {
+    const btn = $('usbWipe');
+    if (btn.dataset.wiping === '1') return;
+    if (btn.dataset.armed !== '1') {
+        btn.dataset.armed = '1';
+        btn.textContent = 'CONFIRM ERASE ALL';
+        clearTimeout(usbWipeArmTimer);
+        usbWipeArmTimer = setTimeout(() => {
+            if (btn.dataset.wiping === '1') return;
+            btn.dataset.armed = '0';
+            btn.textContent = 'WIPE USB';
+        }, 8000);
+        return;
+    }
+    clearTimeout(usbWipeArmTimer);
+    btn.dataset.armed = '0';
+    btn.dataset.wiping = '1';
+    btn.disabled = true;
+    btn.textContent = 'WIPING\u2026';
+    try {
+        await postJson('/usb/wipe', { confirm: true });
+        clearError();
+        flashSaved('usbWipeSaved');
+        await refreshStatus();
+    } catch (e) {
+        showError(`USB wipe failed: ${e.message}`);
+        await refreshStatus();
+    } finally {
+        btn.dataset.wiping = '0';
+        btn.textContent = 'WIPE USB';
+    }
 });
 $('streamProtocol').addEventListener('change', (e) => {
     saveConfigField({ stream_protocol: e.target.value }, 'protocolSaved');

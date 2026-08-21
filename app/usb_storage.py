@@ -204,21 +204,189 @@ def try_mount():
 
 def unmount():
     """Unmount USB storage if mounted."""
-    global _mounted, _device, _fstype
     with _lock:
-        if is_mounted():
-            try:
-                subprocess.run(
-                    ["umount", USB_MOUNT_POINT], capture_output=True, timeout=10,
-                )
-                logger.info("USB unmounted")
-            except subprocess.TimeoutExpired:
-                logger.warning("umount timed out after 10s; leaving state stale")
-            except Exception as e:
-                logger.warning(f"umount raised: {e}")
+        _unmount_unlocked()
+
+
+def _unmount_unlocked():
+    """Unmount USB_MOUNT_POINT. Caller must hold ``_lock``.
+
+    Returns ``(ok, message)``. A failed umount leaves ``_mounted`` alone
+    so the rest of the app still knows the drive is attached; a success
+    (or "already unmounted") clears the in-memory mount state.
+    """
+    global _mounted, _device, _fstype
+    if not is_mounted():
         _mounted = False
         _device = None
         _fstype = None
+        return True, ""
+    try:
+        result = subprocess.run(
+            ["umount", USB_MOUNT_POINT], capture_output=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("umount timed out after 15s; leaving state stale")
+        return False, "umount timed out"
+    except Exception as e:
+        logger.warning(f"umount raised: {e}")
+        return False, str(e)
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="replace").strip() or "umount failed"
+        logger.warning(f"umount failed: {err}")
+        return False, err
+    logger.info("USB unmounted")
+    _mounted = False
+    _device = None
+    _fstype = None
+    return True, ""
+
+
+def _read_label(dev):
+    """Return the volume label of a block device, or '' if unknown."""
+    try:
+        r = subprocess.run(
+            ["blkid", "-o", "value", "-s", "LABEL", dev],
+            capture_output=True, timeout=5, text=True,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception as e:
+        logger.debug(f"blkid LABEL {dev} failed: {e}")
+    return ""
+
+
+def mkfs_command(dev, fstype, label):
+    """Build the mkfs argv that wipes ``dev`` as ``fstype``.
+
+    Volume-label length is clipped to what each formatter accepts.
+    An empty label becomes ``TOWFISH`` so a wiped survey stick still
+    identifies itself in the host's file manager.
+    """
+    fstype = (fstype or "").lower()
+    name = (label or "").strip() or "TOWFISH"
+    # Keep labels to the portable FAT/exFAT subset so a name that was
+    # legal on NTFS cannot make mkfs.exfat / mkfs.vfat reject the call.
+    safe = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in name)
+    safe = safe.strip(" _") or "TOWFISH"
+    if fstype in ("vfat", "msdos", "fat"):
+        return ["mkfs.vfat", "-F", "32", "-n", safe[:11].upper(), dev]
+    if fstype == "ntfs":
+        return ["mkfs.ntfs", "-Q", "-F", "-L", safe[:32], dev]
+    # exfat, unknown, or anything else we can remount with the kernel
+    # exfat driver after a format. Survey sticks in this project are
+    # exFAT; falling back to it is the least-wrong wipe of a mystery FS.
+    return ["mkfs.exfat", "-n", safe[:15], dev]
+
+
+def _remount_unlocked(dev, fstype):
+    """Mount ``dev`` at USB_MOUNT_POINT. Caller must hold ``_lock``.
+
+    Returns True on success and updates ``_mounted`` / ``_device`` /
+    ``_fstype``. Mirrors the attempt loop in :func:`try_mount`.
+    """
+    global _mounted, _device, _fstype
+    os.makedirs(USB_MOUNT_POINT, exist_ok=True)
+    for cmd in _mount_commands(dev, fstype):
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+        except Exception as e:
+            logger.warning(f"remount {dev} via {' '.join(cmd)} raised: {e}")
+            continue
+        if result.returncode == 0:
+            _mounted = True
+            _device = dev
+            _fstype = _read_mount_fstype() or fstype or ""
+            logger.info(f"USB remounted: {dev} ({_fstype or 'auto'}) -> {USB_MOUNT_POINT}")
+            return True
+        logger.debug(
+            f"remount {dev} via {' '.join(cmd)} failed: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    _mounted = False
+    _device = None
+    _fstype = None
+    return False
+
+
+def wipe():
+    """Erase the currently attached USB partition and remount it empty.
+
+    Unmounts, recreates the filesystem (same type, preserving the volume
+    label when blkid can read one), remounts, and recreates the Towfish
+    folder. The probe lock is held for the whole operation so a hot-plug
+    scan cannot remount the old filesystem between umount and mkfs.
+
+    Returns ``{"ok": bool, "message": str, "status": dict}``.
+    """
+    with _lock:
+        partitions = _scan_usb_devices()
+        if not partitions:
+            return {
+                "ok": False,
+                "message": "No USB drive detected",
+                "status": get_status(),
+            }
+
+        # Prefer the partition we already had mounted; fall back to the
+        # first removable partition the kernel can see.
+        dev = _device if _device in partitions else partitions[0]
+        fstype = (_fstype or _detect_fstype(dev) or "exfat").lower()
+        label = _read_label(dev) or "TOWFISH"
+        cmd = mkfs_command(dev, fstype, label)
+
+        ok, err = _unmount_unlocked()
+        if not ok:
+            return {
+                "ok": False,
+                "message": f"Could not unmount USB: {err}",
+                "status": get_status(),
+            }
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            _remount_unlocked(dev, fstype)
+            return {
+                "ok": False,
+                "message": f"Format of {dev} timed out after 120s",
+                "status": get_status(),
+            }
+        except Exception as e:
+            _remount_unlocked(dev, fstype)
+            return {
+                "ok": False,
+                "message": f"Format of {dev} raised: {e}",
+                "status": get_status(),
+            }
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace").strip() or "mkfs failed"
+            logger.warning(f"wipe mkfs failed ({' '.join(cmd)}): {err}")
+            _remount_unlocked(dev, fstype)
+            return {
+                "ok": False,
+                "message": f"Format failed: {err}",
+                "status": get_status(),
+            }
+
+        if not _remount_unlocked(dev, fstype):
+            return {
+                "ok": False,
+                "message": f"Formatted {dev} but remount failed",
+                "status": get_status(),
+            }
+
+        try:
+            os.makedirs(os.path.join(USB_MOUNT_POINT, TOWFISH_DIR), exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not recreate {TOWFISH_DIR} after wipe: {e}")
+
+        logger.info(f"USB wiped: {dev} ({fstype}) label={label}")
+        return {
+            "ok": True,
+            "message": f"Wiped {dev} ({_fstype or fstype})",
+            "status": get_status(),
+        }
 
 
 # ── Health / space ───────────────────────────────────────────────────────
