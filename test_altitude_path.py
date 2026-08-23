@@ -39,7 +39,8 @@ def stub(name, **attrs):
 stub("flask", Flask=mock.MagicMock(), jsonify=mock.MagicMock(),
      request=mock.MagicMock(), send_file=mock.MagicMock())
 stub("requests", get=mock.MagicMock(), post=mock.MagicMock(),
-     exceptions=mock.MagicMock())
+     exceptions=mock.MagicMock(),
+     Session=mock.MagicMock(), adapters=mock.MagicMock())
 
 # gi insists on require_version before the repository import.
 gi = stub("gi", require_version=lambda *a, **k: None)

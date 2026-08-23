@@ -19,11 +19,14 @@ Endpoint conventions
 
 Threading
 ---------
-Callers may hit these helpers from arbitrary Flask threads. Each helper
-uses a fresh ``requests`` call (thread-safe) with a bounded timeout so a
-slow autopilot can never wedge the caller. On failure we log at DEBUG
-and return False -- writes are fire-and-forget from the UI's point of
-view, and every button that fires them is idempotent.
+Callers may hit these helpers from arbitrary Flask threads. POSTs go
+through a shared pooled ``requests.Session`` so a busy caller (e.g. the
+5..10 Hz thrust refresher) reuses keep-alive sockets instead of paying
+a TCP handshake per write. ``requests.Session`` is thread-safe for
+independent POSTs and each helper still has a bounded timeout so a slow
+autopilot cannot wedge the caller. On failure we log at DEBUG and
+return False -- writes are fire-and-forget from the UI's point of view,
+and every button that fires them is idempotent.
 """
 
 from __future__ import annotations
@@ -37,6 +40,15 @@ logger = logging.getLogger(__name__)
 
 # Default endpoint used from inside the BlueOS extension container.
 DEFAULT_MAVLINK2REST_URL = "http://host.docker.internal/mavlink2rest"
+
+# Module-level pooled session for all POSTs. ``max_retries=0`` matches
+# the "latest command or nothing" nature of these writes -- a retry
+# would stack latency inside a control-loop tick, and the callers all
+# accept an occasional dropped write.
+_HTTP = requests.Session()
+_HTTP.mount("http://", requests.adapters.HTTPAdapter(
+    pool_connections=2, pool_maxsize=4, max_retries=0,
+))
 
 # ---------------------------------------------------------------------------
 # Constants -- proven with COMMAND_ACK MAV_RESULT_ACCEPTED on vehicle
@@ -114,7 +126,7 @@ class MavlinkWriter:
             "message": message,
         }
         try:
-            r = requests.post(
+            r = _HTTP.post(
                 f"{self.base_url}/mavlink", json=payload,
                 timeout=self.timeout_s,
             )
@@ -154,6 +166,24 @@ class MavlinkWriter:
             "target_system": self.target_system,
             "target_component": self.target_component,
             "confirmation": int(confirmation),
+        })
+
+    def system_time(self, unix_usec: int, boot_ms: int) -> bool:
+        """POST a SYSTEM_TIME the autopilot can use to set its RTC.
+
+        ArduPilot's ``handle_system_time_message`` reads
+        ``time_unix_usec`` and feeds it into ``AP_RTC``. The fish's
+        GPS is dry, so its own ArduSub publishes ``time_unix_usec = 0``
+        forever and the dataflash logs open with an ``RTC`` epoch of 0
+        -- which is exactly what forced mission-241 log alignment
+        onto heading cross-correlation. Posting the boat's clock
+        here fixes that at source. Non-monotonic writes are cheap:
+        the autopilot picks the newest sample it has seen.
+        """
+        return self._post({
+            "type": "SYSTEM_TIME",
+            "time_unix_usec": int(unix_usec),
+            "time_boot_ms": int(boot_ms),
         })
 
     # -- vehicle --------------------------------------------------------

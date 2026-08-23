@@ -154,6 +154,22 @@ vfr_hud_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/compo
 baro_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2'
 rc_channels_url = 'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/RC_CHANNELS'
 
+# Pooled HTTP session for mavlink2rest reads. Every telemetry helper below
+# used to open a fresh TCP connection per GET, which cost tens of extra
+# connect()s per second once the surf-track loop runs at 10 Hz on top of
+# the 5 Hz sidecar writer and the RC3 refresher. One shared, pooled
+# ``Session`` collapses those into a small pool of keep-alive sockets.
+#
+# ``max_retries=0`` is deliberate: these are all "latest value or nothing"
+# reads bounded by a short timeout, so any retry would stack latency
+# inside a control-loop tick. Callers still catch exceptions individually
+# so a dropped connection returns None rather than raising up into the
+# tick.
+_HTTP = requests.Session()
+_HTTP.mount("http://", requests.adapters.HTTPAdapter(
+    pool_connections=4, pool_maxsize=8, max_retries=0,
+))
+
 # Persisted configuration — survives restarts
 CONFIG_FILE = "/app/videorecordings/subreels_towfish_config.json"
 DEFAULT_TOW_VEHICLE_IP = "192.168.2.12"
@@ -242,7 +258,12 @@ JOG_DOWN_PWM_MAX = Z_PWM_NEUTRAL - 1  # 1499: never let "down" cross neutral
 # whenever the bottom slopes, so soundings are buffered and replayed at
 # the tow delay (layback / boat speed).
 _SONAR_HISTORY_S = 120.0        # ring buffer span
-_SONAR_SAMPLE_PERIOD_S = 0.5    # 2 Hz, matching the timelapse cadence
+# Sample at 4 Hz so we never miss a publication from the 2.8 Hz Ping1D
+# driver (period ~0.36 s). Duplicates are cheap after the ``last_update``
+# dedup in :meth:`SonarHistory._classify_sample`; missing samples are
+# not, because a sub-Nyquist sampler on the terrain feed shows up as
+# stale sonar in the surf-track loop.
+_SONAR_SAMPLE_PERIOD_S = 0.25
 _SONAR_MATCH_TOLERANCE_S = 3.0  # reject if no sounding lands this close
 _TOW_DELAY_MIN_SPEED_MS = 0.15  # below this the delay is meaningless
 _TOW_DELAY_MAX_S = 60.0
@@ -275,29 +296,67 @@ DEFAULT_SURF_TARGET_ALTITUDE_M = 4.0
 SURF_TARGET_ALTITUDE_MIN_M = 1.0
 SURF_TARGET_ALTITUDE_MAX_M = 6.0
 
-DEFAULT_SURF_DEADBAND_M = 0.1
+# Deadband widened from 0.1 -> 0.3 so the loop lets go of RC3 through
+# a healthier band of terrain instead of chasing sub-metre error. The
+# tighter old value combined with a 100 us jog authority produced a
+# feel that read as bang-bang in the mission-241 review.
+DEFAULT_SURF_DEADBAND_M = 0.3
 SURF_DEADBAND_MIN_M = 0.02
 SURF_DEADBAND_MAX_M = 1.0
 
-DEFAULT_SURF_FULL_SCALE_ERROR_M = 1.0
+# Full-scale error 1.0 -> 2.0 m so the proportional band actually has
+# somewhere to live. With a 0.3 m deadband the old 1.0 m full-scale
+# only left 0.7 m of proportional band -- almost every survey error
+# was over it, pinning ``frac`` at 1.0 for the whole descent.
+DEFAULT_SURF_FULL_SCALE_ERROR_M = 2.0
 SURF_FULL_SCALE_ERROR_MIN_M = 0.2
 SURF_FULL_SCALE_ERROR_MAX_M = 5.0
 
-DEFAULT_SURF_MAX_DEPTH_M = 50.0
+DEFAULT_SURF_MAX_DEPTH_M = 5.0
 SURF_MAX_DEPTH_MIN_M = 2.0
 SURF_MAX_DEPTH_MAX_M = 300.0
 
-# Minimum fraction of jog authority below which thruster deadband and tow
-# drag would swallow the command. Keeping the loop above this floor lets
-# it converge into the deadband instead of stalling just outside it.
-SURF_MIN_FRAC = 0.35
-# Slew limit on the commanded depth, m/s. Slow enough that a spurious
-# bottom-lock jump ramps rather than slams; fast enough that a real
-# terrain change is tracked before the fish is over it.
-SURF_TARGET_SLEW_MPS = 0.3
-# 2 Hz tick. Sonar samples at 2 Hz too, so a faster loop would only
-# repeat the same reading.
-SURF_TICK_S = 0.5
+# Tether-derived ceiling on the commanded depth. The autopilot can
+# be told to hold a depth greater than the amount of cable the boat
+# has out, and the fish will happily try -- an unwinnable pull that
+# ends in a stalled thruster and a pissed-off operator. We cap the
+# commanded depth at 0.7 * tether length so there is always some
+# slack for scope. Zero means "no tether limit" (the operator flies
+# the boat and takes responsibility for scope themselves).
+DEFAULT_TETHER_LENGTH_M = 0.0
+TETHER_LENGTH_MIN_M = 0.0
+TETHER_LENGTH_MAX_M = 500.0
+TETHER_SAFE_SCOPE_FRAC = 0.7
+
+# Minimum fraction of jog authority below which thruster deadband and
+# tow drag would swallow the command. The old 0.35 floor was set so a
+# 0.35 m error would jump straight to 35 %, which is precisely the
+# step-feel the mission-241 review flagged; 0.08 lets the loop ramp
+# out of the deadband instead of stepping.
+SURF_MIN_FRAC = 0.08
+# Slew limits on the commanded depth, m/s. Split up vs down because
+# down is what stalls the fish (fighting drag) while up is essentially
+# free. A gentle down-slew of 0.15 m/s gives the vertical thruster
+# time to work through the water column without inducing a roll; the
+# up-slew can be faster since recovering altitude is not authority-
+# bound. Both are per-second so the 10 Hz tick and any future
+# refactor to a different period produce the same trajectory.
+SURF_TARGET_SLEW_DOWN_MPS = 0.15
+SURF_TARGET_SLEW_UP_MPS = 0.4
+# Legacy alias -- kept so existing tests / callers that referenced a
+# single "target slew" number still resolve. Prefer the split constants
+# above; this alias represents the tighter of the two so any bare use
+# behaves conservatively.
+SURF_TARGET_SLEW_MPS = SURF_TARGET_SLEW_DOWN_MPS
+# 10 Hz tick. Local sensors go faster than this on the fish
+# (``ATTITUDE`` 10 Hz, ``VFR_HUD`` 8 Hz) but the boat's sounding is only
+# ~2.8 Hz, so the terrain half of :meth:`SurfTrackController._tick` is
+# gated on a new DISTANCE_SENSOR arriving (via
+# :meth:`SonarHistory.last_update_id`) while the attitude/output half
+# runs every tick. That combination lets us react to a roll excursion
+# 5x faster than the old 2 Hz loop without asking the ring buffer to
+# reprocess the same sounding ten times a second.
+SURF_TICK_S = 0.1
 # Ping1D freshness ceiling. Reuses the same tolerance the delayed altitude
 # lookup applies; the buffer only stores in-range samples, so freshness
 # doubles as a bottom-lock check.
@@ -307,6 +366,39 @@ SURF_SONAR_MAX_AGE_S = _SONAR_MATCH_TOLERANCE_S
 SURF_SURFACE_DEPTH_M = 0.5
 # Boat speed below which the tow geometry stops making sense.
 SURF_MIN_TOW_SPEED_MS = _TOW_DELAY_MIN_SPEED_MS
+# Speed below which the loop refuses to command *down*. Up commands
+# stay allowed because the fish losing altitude is precisely what
+# starves the boat of speed; the asymmetry gives the boat a chance to
+# recover without the fish diving through the surface.
+SURF_MIN_DOWN_SPEED_MS = 0.7
+
+# --- Recovery state ---------------------------------------------------
+# Roll excursion outside the ArduSub STABILIZE_ROLL_LIMIT (which this
+# vehicle runs at 30 deg) is a clear sign the fish is not in the
+# attitude it thinks it is. We enter recovery well before that limit
+# so ALT_HOLD does not get to hunt itself into a full tumble the way
+# it did at 13:48 in mission 241.
+SURF_ROLL_ABORT_DEG = 20.0
+SURF_ROLL_CLEAR_DEG = 10.0  # exit hysteresis (half the entry limit)
+SURF_PITCH_ABORT_DEG = 25.0
+SURF_PITCH_CLEAR_DEG = 12.5
+
+# Attitude has to sit inside the clear window for this long before
+# we consider leaving recovery.
+SURF_RECOVERY_CLEAR_S = 3.0
+# Continuous down-command with less than this many metres of gain
+# counts as a stall (thruster fighting drag it cannot win).
+SURF_STALL_WINDOW_S = 8.0
+SURF_STALL_MIN_GAIN_M = 0.2
+# After exiting recovery the loop clamps down-slew to the down-slew /
+# this factor for a soft cooldown, so re-descending is done gently.
+SURF_RECOVERY_COOLDOWN_S = 10.0
+SURF_RECOVERY_COOLDOWN_SLEW_FRAC = 0.5
+# Fraction of RC3 authority to use while actively commanding *up*
+# out of a recovery. Full up beats "release RC3": releasing leaves
+# ALT_HOLD trying to hold the depth the fish stalled reaching, which
+# is what turned the 13:48 dive into a 176 deg tumble.
+SURF_RECOVERY_UP_FRAC = 1.0
 # Manual UP/DOWN wins outright: on each operator input the surf-track
 # controller stops writing RC3 for this many seconds after the last hit,
 # so a brushed button briefly suspends rather than silently disengages
@@ -557,6 +649,26 @@ def _sanitize_surf_max_depth_m(raw, fallback=DEFAULT_SURF_MAX_DEPTH_M):
                            SURF_MAX_DEPTH_MAX_M, fallback)
 
 
+def _sanitize_tether_length_m(raw, fallback=DEFAULT_TETHER_LENGTH_M):
+    return _sanitize_float(raw, TETHER_LENGTH_MIN_M,
+                           TETHER_LENGTH_MAX_M, fallback)
+
+
+def _effective_depth_ceiling_m():
+    """Return the effective ceiling depth in metres.
+
+    ``surf_max_depth_m`` is the operator's hard cap. When the tether
+    length is configured (> 0), the ceiling is additionally squeezed
+    by :data:`TETHER_SAFE_SCOPE_FRAC` so the fish cannot be flown
+    beyond the amount of cable available -- a common way to stall
+    the vertical thruster on the tether itself.
+    """
+    ceiling = float(surf_max_depth_m)
+    if tether_length_m and tether_length_m > 0:
+        ceiling = min(ceiling, TETHER_SAFE_SCOPE_FRAC * float(tether_length_m))
+    return max(SURF_MAX_DEPTH_MIN_M, ceiling)
+
+
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
@@ -577,6 +689,7 @@ def load_config():
         "surf_deadband_m": DEFAULT_SURF_DEADBAND_M,
         "surf_full_scale_error_m": DEFAULT_SURF_FULL_SCALE_ERROR_M,
         "surf_max_depth_m": DEFAULT_SURF_MAX_DEPTH_M,
+        "tether_length_m": DEFAULT_TETHER_LENGTH_M,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -615,6 +728,8 @@ def load_config():
         defaults.get("surf_full_scale_error_m"))
     defaults["surf_max_depth_m"] = _sanitize_surf_max_depth_m(
         defaults.get("surf_max_depth_m"))
+    defaults["tether_length_m"] = _sanitize_tether_length_m(
+        defaults.get("tether_length_m"))
     return defaults
 
 def save_config(cfg):
@@ -703,6 +818,145 @@ def _tow_mavlink_url(msg_name):
     return (f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/'
             f'{sysid}/components/{comp}/messages/{msg_name}')
 
+
+# Sonar source discovery -- see ``_boat_sonar_ids`` below. Held apart
+# from the autopilot cache because the Ping1D publishes DISTANCE_SENSOR
+# faster than the autopilot's echo (2.8 Hz at 1/194 vs 0.97 Hz at 2/1
+# on this rig) and lives on a different (system, component) pair, so
+# tying them together would force the sonar loop to re-inspect the
+# vehicle tree whenever the autopilot cache expired.
+_SONAR_ID_TTL_S = 60.0  # rarely changes; component-id migrations are rare
+_sonar_ids_lock = threading.Lock()
+_sonar_ids = {
+    "ip": None,
+    "sys": None,      # None while un-discovered so the sampler can tell
+    "comp": None,     # a discovery miss from a legitimate 1/1
+    "freq_hz": 0.0,
+    "checked_at": 0.0,
+    "discovered": False,
+}
+
+
+def _pick_fastest_distance_sensor(vehicles: dict):
+    """Return ``(sysid, compid, freq_hz)`` for the fastest DISTANCE_SENSOR.
+
+    ``vehicles`` is the JSON body of ``/mavlink2rest/mavlink/vehicles``.
+    We look at every (system, component) pair, keep the one whose
+    ``DISTANCE_SENSOR`` has the highest live ``frequency``, and return
+    ``None`` if nothing publishes one.
+
+    Discovering by measured rate rather than hardcoding ``1/194``
+    survives the Ping driver migrating to a different component id --
+    a real risk since BlueOS extensions renumber themselves on some
+    restarts.
+    """
+    if not isinstance(vehicles, dict):
+        return None
+    best = None
+    for sysid_str, veh in vehicles.items():
+        try:
+            sysid = int(sysid_str)
+        except (TypeError, ValueError):
+            continue
+        components = (veh or {}).get("components")
+        if not isinstance(components, dict):
+            continue
+        for compid_str, comp in components.items():
+            try:
+                compid = int(compid_str)
+            except (TypeError, ValueError):
+                continue
+            msgs = (comp or {}).get("messages")
+            if not isinstance(msgs, dict):
+                continue
+            ds = msgs.get("DISTANCE_SENSOR")
+            if not isinstance(ds, dict):
+                continue
+            freq = (((ds.get("status") or {}).get("time") or {})
+                    .get("frequency"))
+            if not isinstance(freq, (int, float)):
+                freq = 0.0
+            if best is None or freq > best[2]:
+                best = (sysid, compid, float(freq))
+    return best
+
+
+def _boat_sonar_ids():
+    """Return ``(system_id, component_id)`` for the fastest DISTANCE_SENSOR.
+
+    Falls back to the autopilot's (system, component) when nothing on
+    the boat publishes DISTANCE_SENSOR yet -- that path still reads a
+    valid rangefinder echo through the autopilot, just at 1 Hz instead
+    of the Ping driver's 2.8 Hz.
+    """
+    now = time.monotonic()
+    with _sonar_ids_lock:
+        ip = tow_vehicle_ip
+        cached = (
+            _sonar_ids["ip"] == ip
+            and _sonar_ids["sys"] is not None
+            and (now - _sonar_ids["checked_at"]) < _SONAR_ID_TTL_S
+        )
+        if cached:
+            return _sonar_ids["sys"], _sonar_ids["comp"]
+
+    freq_hz = 0.0
+    picked = None
+    try:
+        resp = _HTTP.get(f"http://{ip}/mavlink2rest/mavlink/vehicles",
+                         timeout=_MISSION_HTTP_TIMEOUT_S)
+        if resp.status_code == 200 and resp.content:
+            picked = _pick_fastest_distance_sensor(resp.json())
+    except Exception as e:
+        logger.debug("sonar discovery at %s failed: %s", ip, e)
+
+    if picked is not None:
+        sysid, compid, freq_hz = picked
+    else:
+        # Nothing published DISTANCE_SENSOR at all; fall back to
+        # whichever component the autopilot is on so the sampler still
+        # gets whatever rangefinder echo the autopilot might publish
+        # later. Not tied to the autopilot cache -- we don't refresh
+        # this fallback the way the autopilot cache does -- but the
+        # sysid rarely changes, and a bad guess just means one more
+        # discovery attempt on the next TTL expiry.
+        sysid, compid = _boat_vehicle_ids()
+
+    with _sonar_ids_lock:
+        _sonar_ids["ip"] = ip
+        _sonar_ids["checked_at"] = time.monotonic()
+        if (not _sonar_ids["discovered"]
+                or (sysid, compid) != (_sonar_ids["sys"], _sonar_ids["comp"])
+                or abs(freq_hz - _sonar_ids["freq_hz"]) > 0.25):
+            logger.info(
+                "Boat sonar source: MAVLink %s/%s (%.2f Hz DISTANCE_SENSOR)",
+                sysid, compid, freq_hz,
+            )
+        _sonar_ids["sys"] = sysid
+        _sonar_ids["comp"] = compid
+        _sonar_ids["freq_hz"] = freq_hz
+        _sonar_ids["discovered"] = True
+        return sysid, compid
+
+
+def _sonar_mavlink_url():
+    """URL of the fastest DISTANCE_SENSOR publisher on the boat.
+
+    The Ping1D driver on this rig publishes DISTANCE_SENSOR at 2.8 Hz
+    on ``1/194`` while the ArduRover autopilot echoes the same range at
+    ~1 Hz on ``2/1``. Both carry identical ``current_distance`` numbers
+    but different ``max_distance`` envelopes -- the raw driver reports
+    the sensor's actual 12 m ceiling and the autopilot echo clips to
+    ``RNGFND1_MAX`` (10 m in this vehicle, and 7 m in the field before
+    that parameter was raised). Reading from the fast publisher stops
+    the ring buffer from wasting slots on duplicate soundings and stops
+    ``RNGFND1_MAX`` acting as a de facto filter -- the sample gate on
+    ``signal_quality`` below is what replaces that filter.
+    """
+    sysid, comp = _boat_sonar_ids()
+    return (f'http://{tow_vehicle_ip}/mavlink2rest/mavlink/vehicles/'
+            f'{sysid}/components/{comp}/messages/DISTANCE_SENSOR')
+
 # ── ArduRover constants ──────────────────────────────────────────────────
 # Custom mode numbers for ArduRover (Plane / Sub / Copter use different
 # tables). AUTO is the only mode we care about for transect triggering.
@@ -724,7 +978,7 @@ def _mav_get_message(url):
     or non-200 response as "not currently available" rather than an error.
     """
     try:
-        resp = requests.get(url, timeout=_MISSION_HTTP_TIMEOUT_S)
+        resp = _HTTP.get(url, timeout=_MISSION_HTTP_TIMEOUT_S)
         if resp.status_code != 200 or not resp.content:
             return None
         try:
@@ -745,6 +999,21 @@ def _mav_get_message(url):
         logger.debug("mavlink2rest GET %s failed: %s", url, e)
         return None
 
+# Minimum signal quality a DISTANCE_SENSOR reading must carry to enter
+# the ring buffer. DISTANCE_SENSOR.signal_quality is 0..100 with 0
+# meaning "unknown" (either the driver did not populate it, or the
+# firmware is too old to publish it). Ping1D reports low integers when
+# it has lost bottom lock -- an 88 m return sitting at quality 1 will
+# otherwise pass ``in_range`` alone once we are off the autopilot echo
+# and its ``RNGFND1_MAX`` filter.
+_SONAR_MIN_QUALITY = 50
+# Physical cap replacing the autopilot echo's ``RNGFND1_MAX`` filter.
+# Wider than any real survey range this vehicle will fly, but tight
+# enough that a bad-lock 90 m return still gets rejected. Matches the
+# Ping1D driver's 30 m spec ceiling.
+_SONAR_MAX_RANGE_M = 30.0
+
+
 def get_ping_sonar_snapshot():
     """Read the BlueBoat's Ping sonar (published as DISTANCE_SENSOR) from
     the tow vehicle's mavlink2rest.
@@ -758,8 +1027,13 @@ def get_ping_sonar_snapshot():
     ``current_distance``/min/max are centimetres per the MAVLink spec.
     Ping1D reports downward (orientation PITCH_270), so this is the depth
     of water under the boat -- independent of the towfish's own baro depth.
+
+    The snapshot carries ``last_update`` (mavlink2rest's server-side
+    stamp for the underlying MAVLink packet) so the sonar history loop
+    can dedupe repeated GETs of the same underlying reading -- a
+    concern once we poll faster than the publisher.
     """
-    msg = _mav_get_message(_tow_mavlink_url('DISTANCE_SENSOR'))
+    msg = _mav_get_message(_sonar_mavlink_url())
     if not msg:
         return None
     cur = msg.get('current_distance')
@@ -791,6 +1065,11 @@ def get_ping_sonar_snapshot():
         "signal_quality": (quality if isinstance(quality, (int, float)) and quality > 0
                            else None),
         "orientation": orientation,
+        # Server-side timestamp of the last mavlink2rest update for this
+        # message. Same string across repeated GETs of an idle publisher,
+        # so :class:`SonarHistory` can compare it to skip duplicate
+        # samples once the loop rate exceeds the sensor rate.
+        "last_update": msg.get('__last_update'),
     }
 
 
@@ -815,6 +1094,18 @@ class SonarHistory:
         self._stop = threading.Event()
         self._speed_ms = None
         self._last_error = None
+        # Server-side stamp of the most recent DISTANCE_SENSOR update
+        # accepted into the ring buffer. Used to skip duplicate GETs of
+        # the same underlying reading now that the loop polls faster
+        # than the sensor publishes, and exposed via
+        # :meth:`last_update_id` so the surf-track tick can gate its
+        # terrain half on "a new sounding has arrived".
+        self._last_update_id = None
+        # Number of samples rejected since the last accepted one, and
+        # the last reason -- surfaced in :meth:`snapshot` so a widget
+        # can distinguish a Ping bottom-lock dropout from a dead link.
+        self._rejects_since_ok = 0
+        self._last_reject_reason = None
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -836,17 +1127,27 @@ class SonarHistory:
                 snap = get_ping_sonar_snapshot()
                 speed = get_blueboat_speed()
                 now = time.monotonic()
+                accepted, reject = self._classify_sample(snap)
                 with self._lock:
                     # NaN compares false against itself, which is how a
                     # bad speed would otherwise slip past the guard and
                     # poison every subsequent delay.
                     if isinstance(speed, (int, float)) and speed == speed:
                         self._speed_ms = float(speed)
-                    # Only in-range soundings are stored. Ping1D emits
-                    # wild values when it loses bottom lock, and a bad
-                    # sample here would silently corrupt an altitude.
-                    if snap and snap.get("in_range") and snap.get("distance_m"):
-                        self._samples.append((now, float(snap["distance_m"])))
+                    if accepted is not None:
+                        distance_m, update_id = accepted
+                        self._samples.append((now, distance_m))
+                        self._last_update_id = update_id
+                        self._rejects_since_ok = 0
+                        self._last_reject_reason = None
+                    elif reject is not None:
+                        # ``reject == "duplicate"`` just means the
+                        # publisher has not produced a new packet yet;
+                        # it is *not* a bottom-lock failure and should
+                        # not be counted against link health.
+                        if reject != "duplicate":
+                            self._rejects_since_ok += 1
+                            self._last_reject_reason = reject
                     cutoff = now - _SONAR_HISTORY_S
                     while self._samples and self._samples[0][0] < cutoff:
                         self._samples.popleft()
@@ -855,6 +1156,69 @@ class SonarHistory:
                 self._last_error = str(e)
                 logger.debug("Sonar history sample failed: %s", e)
             self._stop.wait(max(0.0, _SONAR_SAMPLE_PERIOD_S - (time.monotonic() - t0)))
+
+    def _classify_sample(self, snap):
+        """Decide whether ``snap`` should join the ring buffer.
+
+        Returns ``(accepted, reject_reason)`` -- exactly one is not
+        None. ``accepted`` is ``(distance_m, update_id)`` on success.
+        ``reject_reason`` is a short string: ``"no_link"`` when the GET
+        failed / returned nothing, ``"duplicate"`` when the publisher
+        has not produced a fresh packet since we last stored one,
+        ``"out_of_range"`` when the reading is outside the sensor's
+        own [min, max] window (the Ping ships wild ranges on lost lock,
+        so this is the primary bottom-lock filter), ``"over_cap"`` when
+        the reading exceeds :data:`_SONAR_MAX_RANGE_M` (a physical
+        backstop for the moment ``in_range`` is loosened by the driver
+        moving to a wider envelope), and ``"low_quality"`` when the
+        driver reports a real ``signal_quality`` under
+        :data:`_SONAR_MIN_QUALITY`.
+
+        ``signal_quality == None`` (older Ping firmware that does not
+        publish quality at all) is treated as acceptable so this vehicle
+        keeps working after a driver downgrade.
+        """
+        if not snap:
+            return None, "no_link"
+        distance_m = snap.get("distance_m")
+        if not isinstance(distance_m, (int, float)) or distance_m <= 0:
+            return None, "no_link"
+        update_id = snap.get("last_update")
+        if update_id is not None and update_id == self._last_update_id:
+            return None, "duplicate"
+        if not snap.get("in_range"):
+            return None, "out_of_range"
+        if distance_m > _SONAR_MAX_RANGE_M:
+            return None, "over_cap"
+        quality = snap.get("signal_quality")
+        if (isinstance(quality, (int, float))
+                and quality < _SONAR_MIN_QUALITY):
+            return None, "low_quality"
+        return (float(distance_m), update_id), None
+
+    def last_update_id(self):
+        """Server-side stamp of the most recent accepted sounding, or None.
+
+        Used by the surf-track tick to detect a new sounding without
+        having to reach back into ``get_ping_sonar_snapshot`` itself --
+        the tick already reads through :meth:`latest` and simply asks
+        this value whether it has advanced.
+        """
+        with self._lock:
+            return self._last_update_id
+
+    def latest_sample_id(self):
+        """``(monotonic_ts, depth_m, update_id)`` of the newest sample,
+        or ``None`` if the ring buffer is empty.
+
+        Kept separate from :meth:`latest` because callers of ``latest``
+        just want a fresh number; the surf-track tick needs the
+        additional freshness stamp for its terrain-tick gate."""
+        with self._lock:
+            if not self._samples:
+                return None
+            ts, depth = self._samples[-1]
+            return (ts, depth, self._last_update_id)
 
     def tow_delay_s(self):
         """Seconds between the boat sounding a point and the fish reaching it.
@@ -1048,6 +1412,7 @@ surf_target_altitude_m = _cfg["surf_target_altitude_m"]
 surf_deadband_m = _cfg["surf_deadband_m"]
 surf_full_scale_error_m = _cfg["surf_full_scale_error_m"]
 surf_max_depth_m = _cfg["surf_max_depth_m"]
+tether_length_m = _cfg["tether_length_m"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -1069,6 +1434,7 @@ def _persist_config():
         "surf_deadband_m": surf_deadband_m,
         "surf_full_scale_error_m": surf_full_scale_error_m,
         "surf_max_depth_m": surf_max_depth_m,
+        "tether_length_m": tether_length_m,
     })
 
 # Recording-storage state
@@ -1150,7 +1516,7 @@ def get_depth_data():
 def get_vfr_hud_data():
     """Get climb rate from VFR_HUD message. Returns 0.0 on failure."""
     try:
-        response = requests.get(vfr_hud_url, timeout=1)
+        response = _HTTP.get(vfr_hud_url, timeout=1)
         if response.status_code == 200:
             climb = response.json()['message'].get('climb', 0.0)
             return climb
@@ -1161,7 +1527,7 @@ def get_vfr_hud_data():
 def get_baro_data():
     """Get temperature from SCALED_PRESSURE2 message. Returns 0.0 on failure."""
     try:
-        response = requests.get(baro_url, timeout=1)
+        response = _HTTP.get(baro_url, timeout=1)
         if response.status_code == 200:
             temperature = response.json()['message'].get('temperature', 0.0) / 100.0  # Convert to degrees C
             return temperature
@@ -1172,7 +1538,7 @@ def get_baro_data():
 def get_light_output():
     """Get light output percentage from RC channels. Returns 0 on failure."""
     try:
-        response = requests.get(rc_channels_url, timeout=1)
+        response = _HTTP.get(rc_channels_url, timeout=1)
         data = response.json()
         
         if 'message' in data and 'chan9_raw' in data['message']:
@@ -1195,7 +1561,7 @@ def get_light_output():
 def get_blueboat_gps_position():
     """Get GPS position from tow vehicle. Returns (lat, lon, alt) or (None, None, None) on failure."""
     try:
-        response = requests.get(_blueboat_gps_url(), timeout=1)
+        response = _HTTP.get(_blueboat_gps_url(), timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             lat = message.get('lat', None)
@@ -1217,7 +1583,7 @@ def get_blueboat_gps_position():
 def get_towfish_heading():
     """Get heading from towfish ATTITUDE message. Returns heading in degrees or None on failure."""
     try:
-        response = requests.get(towfish_attitude_url, timeout=1)
+        response = _HTTP.get(towfish_attitude_url, timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             yaw = message.get('yaw', None)  # Yaw in radians
@@ -1243,7 +1609,7 @@ def get_towfish_attitude():
     nose-up per the ArduPilot/MAVLink body frame).
     """
     try:
-        response = requests.get(towfish_attitude_url, timeout=1)
+        response = _HTTP.get(towfish_attitude_url, timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             result = {}
@@ -1267,7 +1633,7 @@ def get_towfish_attitude():
 def get_blueboat_attitude():
     """Get yaw and pitch from tow vehicle ATTITUDE message. Returns dict with degrees."""
     try:
-        response = requests.get(_blueboat_attitude_url(), timeout=1)
+        response = _HTTP.get(_blueboat_attitude_url(), timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             result = {}
@@ -1288,7 +1654,7 @@ def get_blueboat_attitude():
 def get_blueboat_speed():
     """Get groundspeed from tow vehicle VFR_HUD message. Returns speed in m/s or None."""
     try:
-        response = requests.get(_blueboat_vfr_hud_url(), timeout=1)
+        response = _HTTP.get(_blueboat_vfr_hud_url(), timeout=1)
         if response.status_code == 200:
             return response.json()['message'].get('groundspeed')
     except Exception as e:
@@ -1410,7 +1776,7 @@ def get_isp_info():
     """Get camera ISP info from the camera endpoint.
     Returns dict with ISO, AGain, DGain, ISPDGain, ExpTime, Exposure, device_mac or None on failure."""
     try:
-        response = requests.get(camera_isp_url, timeout=2)
+        response = _HTTP.get(camera_isp_url, timeout=2)
         if response.status_code == 200:
             data = response.json()
             device_mac = data.get('device_mac', '')
@@ -1513,6 +1879,14 @@ _VIDEO_CSV_HEADER = [
     'depth_m', 'temperature_c', 'camera_tilt_deg', 'telem_ms',
     'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
     'camera_zoom_pct',
+    # Surf-track loop side of the frame. ``surf_state`` is the current
+    # controller mode (disabled/tracking/holding/recovering);
+    # ``surf_target_altitude_m`` is the operator's setpoint at that
+    # instant; ``surf_commanded_depth_m`` is what the loop was asking
+    # ALT_HOLD to hold; ``surf_error_m`` is the current miss. Appended
+    # (not slotted in beside altitude) so positional readers stay valid.
+    'surf_state', 'surf_target_altitude_m',
+    'surf_commanded_depth_m', 'surf_error_m',
 ]
 
 _WP_LABEL_RE = re.compile(r'_(wp\d+)(?:_|$)')
@@ -1772,7 +2146,7 @@ def zoom_pwm_to_frac(pwm):
 def _servo_output_message():
     """One SERVO_OUTPUT_RAW fetch. Empty dict on any failure."""
     try:
-        response = requests.get(servo_output_url, timeout=1)
+        response = _HTTP.get(servo_output_url, timeout=1)
         if response.status_code == 200:
             return response.json().get('message', {}) or {}
     except Exception as e:
@@ -2057,6 +2431,11 @@ def fetch_telemetry_block():
         zoom_frac = None
         alt_detail = {"sonar_depth_m": None, "tow_delay_s": None,
                       "sonar_age_err_s": None, "altitude_m": None}
+    # Attach a snapshot of the surf-track controller to the same
+    # telemetry sample so the CSV rows for the same instant carry both
+    # sides (measurement and command) without a second HTTP round-trip
+    # or a second lock acquisition.
+    surf = _surftrack.snapshot()
     return {
         'bb_lat': bb_lat, 'bb_lon': bb_lon, 'bb_alt': bb_alt,
         'gps_lat': gps_lat, 'gps_lon': gps_lon,
@@ -2068,6 +2447,10 @@ def fetch_telemetry_block():
         'sonar_depth': alt_detail['sonar_depth_m'],
         'tow_delay_s': alt_detail['tow_delay_s'],
         'fetch_ms': round((time.monotonic() - t0) * 1000, 1),
+        'surf_state': surf.get('state'),
+        'surf_target_altitude_m': surf.get('target_altitude_m'),
+        'surf_commanded_depth_m': surf.get('commanded_depth_m'),
+        'surf_error_m': surf.get('error_m'),
     }
 
 
@@ -2190,6 +2573,10 @@ def _video_csv_row(ts_local, elapsed, csv_path, wp_label, telem):
         num(telem.get('tow_delay_s'), '.1f'),
         num(None if telem.get('zoom_frac') is None
             else telem['zoom_frac'] * 100.0, '.1f'),
+        telem.get('surf_state') or "",
+        num(telem.get('surf_target_altitude_m'), '.2f'),
+        num(telem.get('surf_commanded_depth_m'), '.2f'),
+        num(telem.get('surf_error_m'), '.2f'),
     ]
 
 async def data_lake_handler(websocket):
@@ -2417,7 +2804,8 @@ def _handle_usb_failover(reason="lost"):
                 )
                 new_session = TimelapseSession(snap_url=snapshot_url,
                                                out_dir=out_dir,
-                                               source_tag=source_tag)
+                                               source_tag=source_tag,
+                                               new_csv_part=True)
                 new_session.on_usb = False
                 new_session.start()
                 _timelapse = new_session
@@ -3180,6 +3568,10 @@ _TIMELAPSE_CSV_HEADER = [
     'snap_ms', 'telem_ms', 'sync_skew_ms', 'towfish_altitude_m',
     'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
     'camera_zoom_pct',
+    # Surf-track loop side of the frame. See ``_VIDEO_CSV_HEADER`` for
+    # what each column means; the two sidecars share the same schema.
+    'surf_state', 'surf_target_altitude_m',
+    'surf_commanded_depth_m', 'surf_error_m',
 ]
 
 
@@ -3202,6 +3594,90 @@ def _make_source_tag(prefix):
     return f"{prefix}{datetime.now():%H%M%S}"
 
 
+# ``telemetry.csv`` is the first part; a USB failover (or any restart that
+# lands in an empty folder on the other disk) increments to telemetry_2.csv
+# so copying USB + SD into one survey folder cannot clobber either file.
+_TELEMETRY_CSV_RE = re.compile(r'^telemetry(?:_(\d+))?\.csv$', re.IGNORECASE)
+
+
+def _telemetry_csv_index(name):
+    """Part number for a survey telemetry filename, or None if not one.
+
+    ``telemetry.csv`` is part 1; ``telemetry_2.csv`` is part 2.
+    """
+    m = _TELEMETRY_CSV_RE.match(name)
+    if not m:
+        return None
+    return int(m.group(1)) if m.group(1) else 1
+
+
+def _telemetry_csv_name(index):
+    if index <= 1:
+        return "telemetry.csv"
+    return f"telemetry_{index}.csv"
+
+
+def _max_telemetry_csv_index(folder):
+    mx = 0
+    try:
+        for name in os.listdir(folder):
+            idx = _telemetry_csv_index(name)
+            if idx is not None:
+                mx = max(mx, idx)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception("telemetry CSV scan failed: %s", folder)
+    return mx
+
+
+def _survey_sibling_dirs(out_dir):
+    """Yield the same survey_* folder on every storage tier.
+
+    USB failover writes into an empty SD copy of ``survey_YYYYMMDD``.
+    Callers that need the day's existing files (CSV parts, JPEG seq)
+    have to look at the USB folder too, not just the new target.
+    """
+    survey = os.path.basename(out_dir.rstrip(os.sep))
+    seen = set()
+    candidates = [out_dir]
+    try:
+        for _label, root in _recording_roots():
+            candidates.append(os.path.join(root, survey))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        if real in seen:
+            continue
+        seen.add(real)
+        yield path
+
+
+def _resolve_survey_csv_path(out_dir, new_csv_part=False):
+    """Pick ``telemetry.csv`` or the next ``telemetry_N.csv`` for ``out_dir``.
+
+    Same-storage restarts append to the highest part already in this
+    folder. A failover lands in an empty folder, so we also look at the
+    matching survey_* folder on the other storage tier. ``new_csv_part``
+    is set by the failover path so a yanked USB stick (unmounted, so
+    invisible) still increments rather than writing a second
+    ``telemetry.csv``.
+    """
+    local_max = _max_telemetry_csv_index(out_dir)
+    if local_max > 0:
+        return os.path.join(out_dir, _telemetry_csv_name(local_max))
+
+    other_max = 0
+    for path in _survey_sibling_dirs(out_dir):
+        other_max = max(other_max, _max_telemetry_csv_index(path))
+    nxt = max(other_max, 1 if new_csv_part else 0) + 1
+    return os.path.join(out_dir, _telemetry_csv_name(nxt))
+
+
 class TimelapseSession:
     """Background thread that GETs JPEGs from the camera's snap CGI.
 
@@ -3215,37 +3691,44 @@ class TimelapseSession:
         ``{seq:06d}_{source_tag}_{frame:05d}.jpg``
 
     ``seq`` is a global counter across the whole survey day (continued
-    from any images already in the folder, so multiple sessions and
-    extension restarts keep climbing). ``frame`` is per-waypoint (or
-    per-session) and resets on each :meth:`set_leg`. One shared
-    ``telemetry.csv`` in the day folder gets a row per frame, keyed by
-    the final filename. For ``per_leg`` the loop captures nothing until
-    the monitor calls :meth:`set_leg`.
+    from any images already in the folder *or* the same survey_* folder
+    on the other storage tier, so a USB failover onto an empty SD card
+    keeps climbing). ``frame`` is per-waypoint (or per-session) and
+    resets on each :meth:`set_leg`. One ``telemetry.csv`` in the day
+    folder gets a row per frame, keyed by the final filename; a failover
+    onto the other disk increments to ``telemetry_2.csv`` so the two
+    files can be copied together without colliding. For ``per_leg`` the
+    loop captures nothing until the monitor calls :meth:`set_leg`.
     """
 
     @staticmethod
     def _scan_max_seq(folder):
-        """Highest existing ``NNNNNN_`` filename prefix in ``folder`` (0 if none).
+        """Highest existing ``NNNNNN_`` filename prefix for this survey day.
 
-        Lets a new session continue the day's global sequence rather than
-        clobbering earlier captures, and survives extension restarts.
+        Looks at ``folder`` and the same survey_* name on the other
+        storage tier, so a USB failover onto an empty SD card continues
+        the day's sequence instead of restarting at 000001.
         """
         mx = 0
-        try:
-            for name in os.listdir(folder):
-                if (name.endswith('.jpg') and len(name) >= 6
-                        and name[:6].isdigit()):
-                    mx = max(mx, int(name[:6]))
-        except FileNotFoundError:
-            pass
-        except Exception:
-            logger.exception("TIMELAPSE seq scan failed: %s", folder)
+        for path in _survey_sibling_dirs(folder):
+            try:
+                for name in os.listdir(path):
+                    if (name.endswith('.jpg') and len(name) >= 6
+                            and name[:6].isdigit()):
+                        mx = max(mx, int(name[:6]))
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.exception("TIMELAPSE seq scan failed: %s", path)
         return mx
 
-    def __init__(self, snap_url, out_dir, per_leg=False, source_tag=None):
+    def __init__(self, snap_url, out_dir, per_leg=False, source_tag=None,
+                 new_csv_part=False):
         self._snap_url = snap_url
         self._survey_dir = out_dir
-        self._csv_path = os.path.join(out_dir, "telemetry.csv")
+        self._csv_path = _resolve_survey_csv_path(
+            out_dir, new_csv_part=new_csv_part,
+        )
         self._per_leg = per_leg
         # Fallback tag if a caller forgets one, so filenames stay valid.
         self.source_tag = source_tag or _make_source_tag("tl")
@@ -3293,10 +3776,12 @@ class TimelapseSession:
         # Continue the day's global sequence from whatever's already on
         # disk in the survey folder.
         self._global_seq = self._scan_max_seq(self._survey_dir)
-        # One shared telemetry.csv for the whole day: write the header
-        # only when creating the file, then append across sessions.
+        # Append to the part already in this folder; write a header only
+        # when creating a new telemetry_N.csv (typical USB failover).
         if not os.path.exists(self._csv_path):
             self._write_csv_header(self._csv_path)
+        logger.info("TIMELAPSE telemetry CSV: %s (seq start %d)",
+                    self._csv_path, self._global_seq)
         self.start_time = datetime.now()
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -3439,6 +3924,10 @@ class TimelapseSession:
                 sonar_depth = None
                 tow_delay_s = None
                 zoom_frac = None
+                surf_state = None
+                surf_target = None
+                surf_command = None
+                surf_error = None
             else:
                 bb_lat = telemetry['bb_lat']
                 bb_lon = telemetry['bb_lon']
@@ -3456,6 +3945,10 @@ class TimelapseSession:
                 sonar_depth = telemetry.get('sonar_depth')
                 tow_delay_s = telemetry.get('tow_delay_s')
                 zoom_frac = telemetry.get('zoom_frac')
+                surf_state = telemetry.get('surf_state')
+                surf_target = telemetry.get('surf_target_altitude_m')
+                surf_command = telemetry.get('surf_commanded_depth_m')
+                surf_error = telemetry.get('surf_error_m')
             xy_acc, z_acc = photogrammetry_meta.reference_accuracy_m(
                 tow_offset_m, tow_alt)
 
@@ -3557,6 +4050,10 @@ class TimelapseSession:
                         f"{sonar_depth:.2f}" if sonar_depth is not None else "",
                         f"{tow_delay_s:.1f}" if tow_delay_s is not None else "",
                         f"{zoom_frac * 100.0:.1f}" if zoom_frac is not None else "",
+                        surf_state or "",
+                        f"{surf_target:.2f}" if surf_target is not None else "",
+                        f"{surf_command:.2f}" if surf_command is not None else "",
+                        f"{surf_error:.2f}" if surf_error is not None else "",
                     ])
             except Exception:
                 logger.exception("TIMELAPSE CSV write failed")
@@ -3592,7 +4089,7 @@ def config():
     global tow_offset_m, tow_heading_source, altitude_offset_m
     global jog_up_pwm, jog_down_pwm
     global surf_target_altitude_m, surf_deadband_m, surf_full_scale_error_m
-    global surf_max_depth_m
+    global surf_max_depth_m, tether_length_m
 
     if request.method == 'POST':
         # The AWB-loop toggle is safe to change while a mode is active
@@ -3612,6 +4109,7 @@ def config():
             "surf_deadband_m",
             "surf_full_scale_error_m",
             "surf_max_depth_m",
+            "tether_length_m",
         }
         touches_only_live_editable = (
             bool(data) and set(data.keys()) <= _live_editable_keys
@@ -3803,6 +4301,19 @@ def config():
             surf_max_depth_m = _sanitize_surf_max_depth_m(v)
             changed = True
 
+        new_tether = data.get('tether_length_m')
+        if new_tether is not None:
+            try:
+                v = float(new_tether)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "tether_length_m must be a number"}), 400
+            if not (TETHER_LENGTH_MIN_M <= v <= TETHER_LENGTH_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"tether_length_m must be between {TETHER_LENGTH_MIN_M} and {TETHER_LENGTH_MAX_M} m"}), 400
+            tether_length_m = _sanitize_tether_length_m(v)
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
@@ -3814,13 +4325,15 @@ def config():
             "tow_heading_source=%s, altitude_offset_m=%s, "
             "jog_up_pwm=%s, jog_down_pwm=%s, "
             "surf_target_altitude_m=%s, surf_deadband_m=%s, "
-            "surf_full_scale_error_m=%s, surf_max_depth_m=%s",
+            "surf_full_scale_error_m=%s, surf_max_depth_m=%s, "
+            "tether_length_m=%s, depth_ceiling_m=%.2f",
             tow_vehicle_ip, container_format, stream_protocol, snapshot_url,
             transect_capture_type, storage_preference, awb_loop_enabled,
             tow_offset_m, tow_heading_source, altitude_offset_m,
             jog_up_pwm, jog_down_pwm,
             surf_target_altitude_m, surf_deadband_m,
             surf_full_scale_error_m, surf_max_depth_m,
+            tether_length_m, _effective_depth_ceiling_m(),
         )
         return jsonify({"success": True,
                         "tow_vehicle_ip": tow_vehicle_ip,
@@ -3838,7 +4351,9 @@ def config():
                         "surf_target_altitude_m": surf_target_altitude_m,
                         "surf_deadband_m": surf_deadband_m,
                         "surf_full_scale_error_m": surf_full_scale_error_m,
-                        "surf_max_depth_m": surf_max_depth_m})
+                        "surf_max_depth_m": surf_max_depth_m,
+                        "tether_length_m": tether_length_m,
+                        "depth_ceiling_m": round(_effective_depth_ceiling_m(), 2)})
 
     resp = jsonify({
         "rtsp_endpoint": RTSP_ENDPOINT,
@@ -3875,6 +4390,11 @@ def config():
         "surf_max_depth_m": surf_max_depth_m,
         "surf_max_depth_min_m": SURF_MAX_DEPTH_MIN_M,
         "surf_max_depth_max_m": SURF_MAX_DEPTH_MAX_M,
+        "tether_length_m": tether_length_m,
+        "tether_length_min_m": TETHER_LENGTH_MIN_M,
+        "tether_length_max_m": TETHER_LENGTH_MAX_M,
+        "tether_safe_scope_frac": TETHER_SAFE_SCOPE_FRAC,
+        "depth_ceiling_m": round(_effective_depth_ceiling_m(), 2),
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -4131,7 +4651,8 @@ def _start_transect_timelapse(initial_label, force_local=False):
     )
 
     session = TimelapseSession(snap_url=snapshot_url, out_dir=out_dir,
-                               per_leg=True, source_tag=source_tag)
+                               per_leg=True, source_tag=source_tag,
+                               new_csv_part=force_local)
     session.on_usb = on_usb
     try:
         session.start()
@@ -4782,7 +5303,7 @@ def _current_servo_pwm(channel: int) -> int | None:
     motor outputs -- for the optics/mount channels this stays populated).
     """
     try:
-        response = requests.get(servo_output_url, timeout=1)
+        response = _HTTP.get(servo_output_url, timeout=1)
         if response.status_code == 200:
             message = response.json().get('message', {})
             pwm = message.get(f'servo{int(channel)}_raw', None)
@@ -4838,7 +5359,7 @@ def _get_towfish_depth_m():
     show ``--`` rather than a misleading 0.0 m.
     """
     try:
-        r = requests.get(vfr_hud_url, timeout=1)
+        r = _HTTP.get(vfr_hud_url, timeout=1)
         if r.status_code == 200:
             alt = r.json().get('message', {}).get('alt', None)
             if alt is not None:
@@ -4848,11 +5369,42 @@ def _get_towfish_depth_m():
     return None
 
 
-def get_vehicle_status_snapshot() -> dict:
-    """Return current ArduSub custom_mode + armed bit + depth for the widget."""
-    depth_m = _get_towfish_depth_m()
+# HEARTBEAT is published at ~1 Hz. Cache it here so the surf-track tick
+# (up to 10 Hz) does not re-read the mode and armed bit ten times a
+# second for a value that only changes once per second. Only the tick
+# uses the cache; the widget path bypasses it via ``depth_m`` so it
+# still sees a fresh HEARTBEAT on every poll.
+_HEARTBEAT_CACHE_TTL_S = 0.9  # slightly under 1 Hz so a fresh HEARTBEAT
+                              # is never skipped by more than one tick
+_heartbeat_cache_lock = threading.Lock()
+_heartbeat_cache = {"custom_mode": None, "armed": None,
+                    "mode_label": None, "ts": 0.0}
+
+
+def _cached_heartbeat_snapshot() -> dict:
+    """Return the last HEARTBEAT within ``_HEARTBEAT_CACHE_TTL_S``, or refetch.
+
+    Concurrent callers may race on the refetch itself, which is fine --
+    both will produce equivalent snapshots and update the cache with the
+    same value. The lock only guards the cache dict swap so a partial
+    write cannot leak.
+    """
+    now = time.monotonic()
+    with _heartbeat_cache_lock:
+        if (now - _heartbeat_cache["ts"]) < _HEARTBEAT_CACHE_TTL_S:
+            return {k: _heartbeat_cache[k]
+                    for k in ("custom_mode", "armed", "mode_label")}
+    fresh = _fetch_heartbeat_snapshot()
+    with _heartbeat_cache_lock:
+        _heartbeat_cache.update(fresh)
+        _heartbeat_cache["ts"] = time.monotonic()
+    return {k: fresh[k] for k in ("custom_mode", "armed", "mode_label")}
+
+
+def _fetch_heartbeat_snapshot() -> dict:
+    """One HEARTBEAT read, returning the same keys the cache holds."""
     try:
-        r = requests.get(
+        r = _HTTP.get(
             'http://host.docker.internal/mavlink2rest/mavlink/vehicles/1/components/1/messages/HEARTBEAT',
             timeout=1,
         )
@@ -4868,16 +5420,45 @@ def get_vehicle_status_snapshot() -> dict:
                 mode_label = "ALT_HOLD"
             elif custom_mode == MODE_MANUAL:
                 mode_label = "MANUAL"
-            return {
-                "armed": armed,
-                "custom_mode": custom_mode,
-                "mode_label": mode_label,
-                "depth_m": depth_m,
-            }
+            return {"custom_mode": custom_mode, "armed": armed,
+                    "mode_label": mode_label}
     except Exception as e:
         logger.debug("HEARTBEAT read failed: %s", e)
-    return {"armed": None, "custom_mode": None, "mode_label": None,
-            "depth_m": depth_m}
+    return {"custom_mode": None, "armed": None, "mode_label": None}
+
+
+# Sentinel default for :func:`get_vehicle_status_snapshot` so a caller
+# can distinguish "did not pass depth_m" from an intentional None (e.g. a
+# caller that already observed a failed depth read and does not want the
+# snapshot helper to try VFR_HUD again this tick).
+_DEPTH_UNSET = object()
+
+
+def get_vehicle_status_snapshot(depth_m=_DEPTH_UNSET, *,
+                                use_heartbeat_cache: bool = False) -> dict:
+    """Return current ArduSub custom_mode + armed bit + depth for the widget.
+
+    ``depth_m`` is optional so a caller that already read
+    :func:`_get_towfish_depth_m` this tick can pass it in and skip a
+    redundant ``VFR_HUD`` fetch. Widget callers omit the argument and
+    still get a fresh depth. The sentinel default distinguishes "no
+    argument passed" from an intentional ``depth_m=None``.
+
+    ``use_heartbeat_cache`` lets the surf-track tick reuse a HEARTBEAT
+    within :data:`_HEARTBEAT_CACHE_TTL_S` -- HEARTBEAT is a 1 Hz message
+    so a 10 Hz tick refetching it every time is pure waste. The widget
+    path leaves it False so every poll is honest.
+    """
+    if depth_m is _DEPTH_UNSET:
+        depth_m = _get_towfish_depth_m()
+    hb = (_cached_heartbeat_snapshot() if use_heartbeat_cache
+          else _fetch_heartbeat_snapshot())
+    return {
+        "armed": hb["armed"],
+        "custom_mode": hb["custom_mode"],
+        "mode_label": hb["mode_label"],
+        "depth_m": depth_m,
+    }
 
 
 # --- one-push AWB (RadCam) -------------------------------------------
@@ -5018,7 +5599,13 @@ _thrust_lock = threading.Lock()
 # gap without pinning the vehicle in descend the way the 651 s hold in the
 # towfish 00000061 log did.
 _THRUST_KEEPALIVE_S = 3.0
-_THRUST_REFRESH_HZ = 5.0
+# The RC3 override needs at least ~5 Hz to stay fresh from the
+# autopilot's point of view, but writing at 10 Hz matches the
+# controller's tick rate so a 10 Hz update from :meth:`_tick` is not
+# silently coalesced away by a slower sender. Manual jog holds are
+# happy at the higher rate too -- ArduSub replaces the pending override
+# on each write, so the extra frames are near-idempotent.
+_THRUST_REFRESH_HZ = 10.0
 # How many neutral frames to send before releasing the override. See
 # _thrust_worker for why a bare release is not enough on this vehicle. More
 # than one purely so a dropped packet can't leave the jog latched.
@@ -5193,6 +5780,162 @@ def get_thrust_status_snapshot() -> dict:
 # how it stays cooperative with the operator's UP/DOWN buttons. An operator
 # hit briefly suspends the loop rather than disengaging it, so a brushed
 # touchscreen button cannot silently kill the mode mid-survey.
+
+
+# Fixed on-disk cadence for the surf-track CSV. Two rows per second is
+# enough to reconstruct the controller's behaviour after the fact
+# without producing a 30 MB file per hour once the tick rate went to
+# 10 Hz.
+_SURF_LOG_HZ = 2.0
+_SURF_LOG_DECIMATION = 5  # ticks per row at SURF_TICK_S = 0.1
+
+
+# Columns for surftrack_YYYYMMDD.csv. Documented once so both the
+# writer and the header line refer to the same list.
+_SURF_LOG_HEADER = [
+    'utc_iso', 'mono_s', 'tick_count', 'event', 'state', 'hold_reason',
+    'target_altitude_m', 'altitude_m', 'fish_depth_m',
+    'bottom_ahead_m', 'bottom_delayed_m', 'tow_delay_s',
+    'commanded_depth_m', 'depth_ceiling_m', 'ceiling_limited', 'error_m',
+    'rc3_pwm', 'rc3_frac', 'rc3_source',
+    'boat_speed_ms', 'roll_deg', 'pitch_deg',
+    'mode_label', 'armed',
+]
+
+
+class SurfTrackLogger:
+    """Time-stamped surf-track trace, one file per survey day.
+
+    Decoupled from the tick rate: at 10 Hz control the tick fires 20
+    ``log_tick`` calls a second but only every fifth one becomes a
+    row, matching :data:`_SURF_LOG_HZ`. ``log_event`` writes
+    unconditionally so an operator target nudge (or a state change)
+    is always in the trace, even if it lands between two decimated
+    rows.
+
+    Not thread-safe against concurrent tick + event writers *inside a
+    single logger*; the controller only calls one at a time (event on
+    ``set_target_altitude_m``, tick under ``_lock`` in ``_tick``).
+    """
+
+    def __init__(self) -> None:
+        self._file = None
+        self._writer = None
+        self._path: str | None = None
+        self._on_usb = False
+        self._tick_count = 0
+
+    def _resolve_path(self) -> tuple[str | None, bool]:
+        """Return ``(csv_path, on_usb)`` for today's log, or (None, False)."""
+        try:
+            out_dir, on_usb = _resolve_recording_dir(
+                subfolder=_survey_day_subfolder())
+        except Exception as e:
+            logger.warning("Surf-track log dir resolve failed: %s", e)
+            return None, False
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning("Surf-track log dir create failed: %s", e)
+            return None, on_usb
+        path = os.path.join(out_dir,
+                            f"surftrack_{datetime.now():%Y%m%d}.csv")
+        return path, on_usb
+
+    def start(self) -> None:
+        if self._file is not None:
+            return
+        path, on_usb = self._resolve_path()
+        if not path:
+            return
+        try:
+            already = os.path.exists(path) and os.path.getsize(path) > 0
+            self._file = open(path, 'a', newline='')
+            self._writer = csv.writer(self._file)
+            if not already:
+                self._writer.writerow(_SURF_LOG_HEADER)
+            self._path = path
+            self._on_usb = on_usb
+            self._tick_count = 0
+            logger.info("Surf-track log opened at %s", path)
+        except Exception as e:
+            logger.warning("Surf-track log open failed: %s", e)
+            self._file = None
+            self._writer = None
+            self._path = None
+
+    def stop(self) -> None:
+        f = self._file
+        self._file = None
+        self._writer = None
+        self._path = None
+        self._tick_count = 0
+        if f is not None:
+            try:
+                f.flush()
+                f.close()
+            except Exception as e:
+                logger.debug("Surf-track log close failed: %s", e)
+
+    def _write(self, row: list) -> None:
+        w = self._writer
+        f = self._file
+        if w is None or f is None:
+            return
+        try:
+            w.writerow(row)
+            f.flush()
+        except Exception as e:
+            logger.debug("Surf-track log write failed: %s", e)
+
+    def _row(self, *, event: str, snap: dict, extras: dict) -> list:
+        """Build one row from a controller snapshot + per-tick extras."""
+        def num(value, fmt):
+            return format(value, fmt) if isinstance(value, (int, float)) else ""
+        now_utc = datetime.now(timezone.utc).isoformat()
+        return [
+            now_utc,
+            f"{time.monotonic():.3f}",
+            self._tick_count,
+            event,
+            snap.get('state') or "",
+            snap.get('hold_reason') or "",
+            num(snap.get('target_altitude_m'), '.2f'),
+            num(snap.get('altitude_m'), '.2f'),
+            num(snap.get('fish_depth_m'), '.2f'),
+            num(snap.get('bottom_ahead_m'), '.2f'),
+            num(snap.get('bottom_delayed_m'), '.2f'),
+            num(extras.get('tow_delay_s'), '.2f'),
+            num(snap.get('commanded_depth_m'), '.2f'),
+            num(snap.get('depth_ceiling_m'), '.2f'),
+            "1" if snap.get('ceiling_limited') else "0",
+            num(snap.get('error_m'), '.3f'),
+            num(extras.get('rc3_pwm'), 'd') if isinstance(extras.get('rc3_pwm'), int)
+                else "",
+            num(extras.get('rc3_frac'), '.3f'),
+            extras.get('rc3_source') or "",
+            num(extras.get('boat_speed_ms'), '.2f'),
+            num(extras.get('roll_deg'), '.1f'),
+            num(extras.get('pitch_deg'), '.1f'),
+            extras.get('mode_label') or "",
+            "1" if extras.get('armed') else "0",
+        ]
+
+    def log_tick(self, snap: dict, extras: dict) -> None:
+        """Called once per controller tick. Writes on the decimated cadence."""
+        if self._writer is None:
+            return
+        self._tick_count += 1
+        if self._tick_count % _SURF_LOG_DECIMATION == 0:
+            self._write(self._row(event="", snap=snap, extras=extras))
+
+    def log_event(self, event: str, snap: dict, extras: dict | None = None) -> None:
+        """Write an off-cadence row: target change, state transition, ..."""
+        if self._writer is None:
+            return
+        self._write(self._row(event=event, snap=snap, extras=extras or {}))
+
+
 class SurfTrackController:
     """Altitude-over-bottom hold. States: disabled / tracking / holding.
 
@@ -5209,8 +5952,15 @@ class SurfTrackController:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Trace writer. Only writes while the controller is enabled;
+        # a shared logger object across enable/disable cycles keeps the
+        # file open for the whole survey day.
+        self._logger = SurfTrackLogger()
         # Public snapshot fields (all read under _lock).
-        self.state = "disabled"     # 'disabled' | 'tracking' | 'holding'
+        # ``recovering`` is entered on a roll/pitch excursion or a
+        # detected down-stall. See the class docstring for the exit
+        # rules; unlike ``holding`` we still write RC3 in this state.
+        self.state = "disabled"     # 'disabled' | 'tracking' | 'holding' | 'recovering'
         self.hold_reason: str | None = None
         self.last_event: str | None = None
         self.last_event_at: datetime | None = None
@@ -5222,12 +5972,53 @@ class SurfTrackController:
         self._last_altitude_m: float | None = None
         self._last_error_m: float | None = None
         self._last_command: dict | None = None
+        # Effective ceiling depth and whether the last raw target had
+        # to be clamped by it. Exposed via the snapshot so the widget
+        # can tell the operator "commanding shallower than the terrain
+        # asked for" instead of quietly capping.
+        self._last_depth_ceiling_m: float | None = None
+        self._last_ceiling_limited: bool = False
         # Internal state.
+        #
+        # Two depths, split so the terrain and output halves of the
+        # loop decouple: :data:`_raw_target_depth_m` is recomputed only
+        # when a new sounding arrives (see :data:`_last_sounding_id`),
+        # while :data:`_target_depth_m` slews toward it *every tick* at
+        # :data:`SURF_TARGET_SLEW_MPS`. Before the split both depths
+        # were the same field and every tick reran the geometry with
+        # the same sounding, which either wasted work at 10 Hz or
+        # produced a step change at 2 Hz.
+        self._raw_target_depth_m: float | None = None
         self._target_depth_m: float | None = None
+        # Freshness stamp of the sounding that fed ``_raw_target_depth_m``.
+        # Compared against :meth:`SonarHistory.last_update_id` to decide
+        # whether the terrain half of the tick has anything new to do.
+        self._last_sounding_id = None
         self._last_tick_ts: float | None = None
         # Monotonic timestamp at which all hold conditions first cleared,
         # or None while any condition still fails. See _tick.
         self._hold_ok_since: float | None = None
+        # Rolling attitude readouts + monotonic timestamps used to
+        # drive the recovery state machine.
+        self._last_roll_deg: float | None = None
+        self._last_pitch_deg: float | None = None
+        # ``_recovery_ok_since`` is set the first tick attitude is
+        # inside the clear window; cleared whenever it goes back
+        # outside. Recovery exit compares this to now.
+        self._recovery_ok_since: float | None = None
+        # Buffer of ``(monotonic_ts, fish_depth_m)`` samples for the
+        # down-stall detector -- only populated while the loop is
+        # actively commanding down.
+        self._stall_track: collections.deque = collections.deque()
+        # Monotonic time at which the loop last commanded ``down``;
+        # cleared on any release or up. Reset on entering recovery.
+        self._down_since: float | None = None
+        # After exiting recovery the down-slew is clamped for a soft
+        # cooldown so re-descending is gentle. None outside cooldown.
+        self._recovery_cooldown_until: float | None = None
+        # Cached reason a down-command was refused this tick (widget
+        # surfaces this through ``hold_reason`` when we still track).
+        self._last_down_gate_reason: str | None = None
 
     # -- lifecycle -----------------------------------------------------
     def enable(self) -> None:
@@ -5242,10 +6033,24 @@ class SurfTrackController:
             self.state = "tracking"
             self.hold_reason = None
             self._hold_ok_since = None
+            self._raw_target_depth_m = None
             self._target_depth_m = None
+            self._last_sounding_id = None
             self._last_tick_ts = None
             self._last_command = None
+            self._recovery_ok_since = None
+            self._recovery_cooldown_until = None
+            self._down_since = None
+            self._stall_track.clear()
+            self._last_down_gate_reason = None
             self._note("enabled")
+        # Open (or re-open) the trace file *before* starting the
+        # thread so the very first tick has somewhere to log.
+        self._logger.start()
+        try:
+            self._logger.log_event("enabled", self._snapshot_locked(), {})
+        except Exception:
+            logger.debug("Surf-track log event 'enabled' failed", exc_info=True)
         self._thread = threading.Thread(
             target=self._run, name="surftrack", daemon=True,
         )
@@ -5268,9 +6073,22 @@ class SurfTrackController:
             self._thread = None
             self.state = "disabled"
             self.hold_reason = None
+            self._raw_target_depth_m = None
             self._target_depth_m = None
+            self._last_sounding_id = None
             self._last_command = None
+            self._recovery_ok_since = None
+            self._recovery_cooldown_until = None
+            self._down_since = None
+            self._stall_track.clear()
+            self._last_down_gate_reason = None
             self._note("disabled")
+            snap_for_log = self._snapshot_locked()
+        try:
+            self._logger.log_event("disabled", snap_for_log, {})
+        except Exception:
+            logger.debug("Surf-track log event 'disabled' failed", exc_info=True)
+        self._logger.stop()
 
     def set_target_altitude_m(self, target: float) -> float:
         """Persist a new goal altitude, clamped to the configured band."""
@@ -5280,6 +6098,17 @@ class SurfTrackController:
         _persist_config()
         with self._lock:
             self._note(f"target={clamped:.2f} m")
+            snap = self._snapshot_locked()
+        # Off-cadence trace row so the operator's nudge shows up
+        # separately from the 2 Hz decimated stream. Only writes when
+        # the logger is open (i.e. controller currently enabled) --
+        # persisting the target while disabled still writes config.
+        try:
+            self._logger.log_event(
+                f"target_set={clamped:.2f}", snap, {})
+        except Exception:
+            logger.debug("Surf-track log event 'target_set' failed",
+                         exc_info=True)
         return clamped
 
     # -- background loop ----------------------------------------------
@@ -5297,14 +6126,30 @@ class SurfTrackController:
         now = time.monotonic()
 
         fish_depth = _get_towfish_depth_m()
+        # Attitude is read once per tick so the recovery detector
+        # (roll/pitch limits) and the CSV trace share one fetch. The
+        # pooled session makes an extra 10 Hz GET cheap, but only
+        # doing it once keeps the pattern honest as more consumers
+        # (recovery, ceiling) grow off the same tick.
+        attitude = get_towfish_attitude() or {}
         latest = _sonar_history.latest(SURF_SONAR_MAX_AGE_S)
+        # Freshness stamp of the newest accepted sounding. Compared
+        # against ``_last_sounding_id`` below so the terrain half of
+        # the tick only recomputes when a new packet has actually
+        # arrived; the attitude/output half still runs every tick.
+        sounding_id = _sonar_history.last_update_id()
         # The delayed sounding is only read here for the *reported*
         # altitude; the control loop itself uses ``latest`` above so it
         # gets a one-layback lookahead instead of the fish's present
         # altitude.
         delayed = _sonar_history.depth_at_tow_delay()
         speed = _sonar_history.latest_speed_ms()
-        veh = get_vehicle_status_snapshot()
+        # Reuse ``fish_depth`` and let the snapshot reuse a cached
+        # HEARTBEAT: the tick runs up to 10 Hz but HEARTBEAT is 1 Hz and
+        # VFR_HUD was already fetched two lines up. Without these two
+        # arguments every tick did two extra HTTP GETs.
+        veh = get_vehicle_status_snapshot(depth_m=fish_depth,
+                                          use_heartbeat_cache=True)
         armed = veh.get("armed")
         custom_mode = veh.get("custom_mode")
 
@@ -5338,27 +6183,63 @@ class SurfTrackController:
         elif bottom_ahead is not None and bottom_ahead < fish_depth:
             reason = "geometry_insane"
 
+        roll_deg = attitude.get('roll') if attitude else None
+        pitch_deg = attitude.get('pitch') if attitude else None
+
         with self._lock:
             self._last_fish_depth_m = fish_depth
             self._last_bottom_ahead_m = bottom_ahead
             self._last_bottom_delayed_m = delayed_bottom
             self._last_altitude_m = reported_altitude
+            self._last_roll_deg = roll_deg
+            self._last_pitch_deg = pitch_deg
+
+            # Recovery has the highest priority under an armed fish:
+            # a roll/pitch excursion beats every other hold reason
+            # because commanding up is safer than letting ALT_HOLD
+            # continue to hunt a depth that just tumbled the vehicle.
+            # The stall detector piggy-backs on this branch through
+            # ``_check_stall_locked`` -- both take the same recovery
+            # path once tripped.
+            recovery_entry = None
+            if armed and fish_depth is not None:
+                recovery_entry = self._check_attitude_abort_locked(
+                    now, roll_deg, pitch_deg)
+                if recovery_entry is None:
+                    recovery_entry = self._check_stall_locked(
+                        now, fish_depth)
 
             if reason is not None:
-                # Conditions failing: enter/stay in holding. Reset the
-                # slew target so a resume starts from where the fish is
-                # rather than from a stale commanded depth.
+                # Conditions failing: enter/stay in holding. Reset both
+                # target depths and forget the last sounding id so a
+                # resume starts from where the fish is with a fresh
+                # geometry pass rather than a stale commanded depth.
                 self._hold_ok_since = None
                 if self.state != "holding":
                     self._note(f"hold: {reason}")
                 self.state = "holding"
                 self.hold_reason = reason
+                self._raw_target_depth_m = None
                 self._target_depth_m = None
+                self._last_sounding_id = None
                 self._last_command = None
                 self._last_tick_ts = now
+                self._down_since = None
+                self._stall_track.clear()
                 # Fall through to release RC3 outside the lock.
                 do_release = True
                 do_command = None
+            elif self.state == "recovering" or recovery_entry is not None:
+                if self.state != "recovering":
+                    # Fresh entry into recovery.
+                    self.state = "recovering"
+                    self.hold_reason = recovery_entry
+                    self._recovery_ok_since = None
+                    self._down_since = None
+                    self._stall_track.clear()
+                    self._note(f"recovering: {recovery_entry}")
+                do_release, do_command = self._plan_recovery(
+                    now, fish_depth, roll_deg, pitch_deg)
             else:
                 # Conditions ok. If we were holding, wait out the
                 # debounce so a flickering bottom lock does not chatter.
@@ -5375,15 +6256,21 @@ class SurfTrackController:
                         self.state = "tracking"
                         self.hold_reason = None
                         self._hold_ok_since = None
+                        # Seed the slew target from the fish's current
+                        # depth so we ramp from where it is rather than
+                        # from a stale commanded depth, and drop the
+                        # sounding id so the terrain half refreshes on
+                        # this same tick.
                         self._target_depth_m = fish_depth
+                        self._last_sounding_id = None
                         do_release, do_command = self._plan_command(
-                            now, fish_depth, bottom_ahead)
+                            now, fish_depth, bottom_ahead, sounding_id, speed)
                 else:
                     # Steady state tracking.
                     self._hold_ok_since = None
-                    self.hold_reason = None
+                    self.hold_reason = self._last_down_gate_reason
                     do_release, do_command = self._plan_command(
-                        now, fish_depth, bottom_ahead)
+                        now, fish_depth, bottom_ahead, sounding_id, speed)
 
         # Do the RC3 writes outside the state lock so a slow HTTP call
         # cannot block the widget's status poll.
@@ -5401,39 +6288,121 @@ class SurfTrackController:
                     self._last_command = None
                     self._note("suspended: operator")
 
-    def _plan_command(self, now, fish_depth, bottom_ahead):
+        # Trace row. Snapshotted after the RC3 write so the row
+        # reflects whether that write actually landed (an operator
+        # veto has already flipped ``_last_command`` back to None).
+        try:
+            with self._lock:
+                snap = self._snapshot_locked()
+                last_cmd = self._last_command or {}
+            extras = {
+                "tow_delay_s": (delayed[1]
+                                if delayed is not None else None),
+                "rc3_pwm": last_cmd.get('pwm'),
+                "rc3_frac": last_cmd.get('frac'),
+                "rc3_source": ("surftrack" if last_cmd else
+                               ("release" if do_release else None)),
+                "boat_speed_ms": speed,
+                "roll_deg": attitude.get('roll'),
+                "pitch_deg": attitude.get('pitch'),
+                "mode_label": veh.get('mode_label'),
+                "armed": armed,
+            }
+            self._logger.log_tick(snap, extras)
+        except Exception:
+            logger.debug("Surf-track log_tick failed", exc_info=True)
+
+    def _plan_command(self, now, fish_depth, bottom_ahead, sounding_id, speed):
         """Compute the RC3 command for this tick under normal tracking.
 
         Runs while holding ``self._lock``. Returns ``(do_release, command)``
         where ``command`` is ``None`` inside the deadband (RC3 released
         so ALT_HOLD does the fine hold) or ``{"direction","pwm","frac"}``
         outside it.
+
+        The tick has two halves that run at different effective rates:
+
+        * *Terrain half* -- recomputes :data:`_raw_target_depth_m` from
+          the sounding, altitude offset and target altitude. Gated on
+          ``sounding_id`` differing from the last one we consumed, so
+          at 10 Hz on a 2.8 Hz sounding stream this only fires on
+          roughly one in four ticks.
+        * *Output half* -- slews :data:`_target_depth_m` toward the
+          latest raw target at split up/down rates, computes the
+          error against :data:`fish_depth`, and drives RC3. Runs
+          every tick because attitude and depth do change at 10 Hz
+          even when the sounding does not. Down commands are gated
+          on ``speed >= SURF_MIN_DOWN_SPEED_MS`` -- diving is what
+          kills boat speed, so the loop refuses to keep digging when
+          the boat has stalled but still allows up commands.
         """
         dt = SURF_TICK_S
         if self._last_tick_ts is not None:
             dt = max(0.0, min(1.0, now - self._last_tick_ts))
         self._last_tick_ts = now
+        self._last_down_gate_reason = None
 
-        raw_target = (bottom_ahead - altitude_offset_m
-                      - surf_target_altitude_m)
-        # Hard clamp. Even a wildly stale/insane sounding cannot push
-        # the commanded depth past this envelope.
-        raw_target = max(SURF_SURFACE_DEPTH_M,
-                         min(surf_max_depth_m, raw_target))
+        # Terrain half: recompute the raw target only when we have a
+        # new sounding. ``sounding_id`` is None when the ring buffer
+        # was empty at last accept -- in that case we keep whatever
+        # raw target we had, which is fine because ``latest`` returned
+        # a valid ``bottom_ahead`` above.
+        ceiling = _effective_depth_ceiling_m()
+        self._last_depth_ceiling_m = ceiling
+        if (sounding_id is not None
+                and sounding_id != self._last_sounding_id):
+            raw_target = (bottom_ahead - altitude_offset_m
+                          - surf_target_altitude_m)
+            # Hard clamp. Even a wildly stale/insane sounding cannot
+            # push the commanded depth past this envelope, and the
+            # tether length now squeezes the operator's own cap.
+            clamped = max(SURF_SURFACE_DEPTH_M, min(ceiling, raw_target))
+            self._last_ceiling_limited = clamped < raw_target
+            self._raw_target_depth_m = clamped
+            self._last_sounding_id = sounding_id
+        elif self._raw_target_depth_m is None:
+            # First tick after enable, before a sounding has been
+            # consumed. Seed from the current sounding without stamping
+            # the id -- so the next fresh publication still triggers a
+            # recompute.
+            raw_target = (bottom_ahead - altitude_offset_m
+                          - surf_target_altitude_m)
+            clamped = max(SURF_SURFACE_DEPTH_M, min(ceiling, raw_target))
+            self._last_ceiling_limited = clamped < raw_target
+            self._raw_target_depth_m = clamped
 
         if self._target_depth_m is None:
             self._target_depth_m = fish_depth
-        # Slew-limit the commanded depth. Rate-limits a bottom-lock
-        # step change into a ramp the fish can actually follow instead
-        # of trying to slam a full-scale descent.
-        max_step = SURF_TARGET_SLEW_MPS * dt
-        delta = raw_target - self._target_depth_m
+        # Output half: slew-limit the commanded depth toward the raw
+        # target every tick, at different rates for up vs down. Down
+        # is the direction that fights drag and stalls the vehicle,
+        # so it moves slower; up is essentially free. In the soft
+        # cooldown that follows a recovery the down-slew is squeezed
+        # further so a re-descent is deliberately gentle.
+        delta = self._raw_target_depth_m - self._target_depth_m
+        if delta >= 0:
+            down_slew = SURF_TARGET_SLEW_DOWN_MPS
+            if (self._recovery_cooldown_until is not None
+                    and now < self._recovery_cooldown_until):
+                down_slew *= SURF_RECOVERY_COOLDOWN_SLEW_FRAC
+            max_step = down_slew * dt
+        else:
+            max_step = SURF_TARGET_SLEW_UP_MPS * dt
         if abs(delta) > max_step:
             delta = math.copysign(max_step, delta)
         self._target_depth_m += delta
 
         error = self._target_depth_m - fish_depth  # +ve => go deeper
         self._last_error_m = error
+
+        # Down-command speed gate: refuse to command deeper when the
+        # boat is not making enough way. This does not force a hold
+        # (the loop keeps tracking so it can command up if terrain
+        # rises); it just clamps the down direction to zero authority.
+        if error > 0 and (speed is None or speed < SURF_MIN_DOWN_SPEED_MS):
+            self._last_command = None
+            self._last_down_gate_reason = "too_slow_to_dive"
+            return True, None
 
         if abs(error) <= surf_deadband_m:
             self._last_command = None
@@ -5452,6 +6421,120 @@ class SurfTrackController:
         cmd = {"direction": direction, "pwm": pwm,
                "frac": round(frac, 3)}
         self._last_command = cmd
+        # Feed the stall detector: only track sustained down commands,
+        # and always with the depth at command time so a resample is
+        # unnecessary.
+        if direction == "down":
+            if self._down_since is None:
+                self._down_since = now
+                self._stall_track.clear()
+            self._stall_track.append((now, fish_depth))
+            # Age out anything older than the stall window.
+            cutoff = now - SURF_STALL_WINDOW_S
+            while self._stall_track and self._stall_track[0][0] < cutoff:
+                self._stall_track.popleft()
+        else:
+            self._down_since = None
+            self._stall_track.clear()
+        return False, cmd
+
+    def _check_attitude_abort_locked(self, now, roll_deg, pitch_deg):
+        """Return a recovery reason if attitude is out of limits.
+
+        Called while holding ``self._lock``. Two cases:
+
+        * Already recovering: keep the reason we entered on; the exit
+          criterion is handled by :meth:`_plan_recovery`.
+        * Not yet recovering: check current roll/pitch against the
+          entry thresholds. Missing/None readings do not trip -- the
+          alternative would be to abort every time attitude polling
+          hiccups, which is a worse failure mode than trusting the
+          last-good reading.
+        """
+        if self.state == "recovering":
+            return None  # already inside; caller keeps state
+        if isinstance(roll_deg, (int, float)) and abs(roll_deg) > SURF_ROLL_ABORT_DEG:
+            return "roll_excursion"
+        if isinstance(pitch_deg, (int, float)) and abs(pitch_deg) > SURF_PITCH_ABORT_DEG:
+            return "pitch_excursion"
+        return None
+
+    def _check_stall_locked(self, now, fish_depth):
+        """Return a recovery reason if a down-stall is detected.
+
+        Compares the oldest and newest depths in ``_stall_track``: if
+        the window covers at least :data:`SURF_STALL_WINDOW_S` and the
+        gain across the window is under :data:`SURF_STALL_MIN_GAIN_M`,
+        the vertical thruster is fighting drag it cannot win.
+        """
+        if self._down_since is None:
+            return None
+        if now - self._down_since < SURF_STALL_WINDOW_S:
+            return None
+        if not self._stall_track:
+            return None
+        oldest_t, oldest_d = self._stall_track[0]
+        if now - oldest_t < SURF_STALL_WINDOW_S:
+            return None
+        gain = fish_depth - oldest_d
+        if gain < SURF_STALL_MIN_GAIN_M:
+            return "down_stall"
+        return None
+
+    def _plan_recovery(self, now, fish_depth, roll_deg, pitch_deg):
+        """Command up until attitude clears; then exit with a cooldown.
+
+        Runs while holding ``self._lock``. Returns
+        ``(do_release, command)`` in the same shape as
+        :meth:`_plan_command` -- a release is never used here because
+        releasing RC3 in a stalled dive leaves ALT_HOLD trying to hold
+        the depth that stalled us, which is what turned mission 241's
+        13:48 dive into a 176 deg tumble. So we actively command up.
+        """
+        # Attitude-clear tracking. Absent readings do not count as
+        # clear (they might come back showing a still-bad angle).
+        roll_ok = (isinstance(roll_deg, (int, float))
+                   and abs(roll_deg) < SURF_ROLL_CLEAR_DEG)
+        pitch_ok = (isinstance(pitch_deg, (int, float))
+                    and abs(pitch_deg) < SURF_PITCH_CLEAR_DEG)
+        if roll_ok and pitch_ok:
+            if self._recovery_ok_since is None:
+                self._recovery_ok_since = now
+            if now - self._recovery_ok_since >= SURF_RECOVERY_CLEAR_S:
+                # Exit recovery: rebaseline the commanded depth to
+                # where the fish actually is, arm the cooldown, and
+                # let the next tick's normal tracking resume with a
+                # squeezed down-slew.
+                self._recovery_cooldown_until = (
+                    now + SURF_RECOVERY_COOLDOWN_S)
+                self._target_depth_m = fish_depth
+                self._raw_target_depth_m = None
+                self._last_sounding_id = None
+                self._recovery_ok_since = None
+                self._down_since = None
+                self._stall_track.clear()
+                self._last_tick_ts = now
+                self.state = "tracking"
+                self.hold_reason = None
+                self._note("recovered")
+                # Neither release nor command this tick; the next
+                # tick's _plan_command will pick it up. Return a
+                # release so RC3 isn't left biased up while we
+                # transition (ALT_HOLD is what should be holding).
+                self._last_command = None
+                return True, None
+        else:
+            self._recovery_ok_since = None
+
+        # Still recovering: command up at recovery authority.
+        self._last_tick_ts = now
+        pwm = int(round(Z_PWM_NEUTRAL
+                        + (jog_up_pwm - Z_PWM_NEUTRAL)
+                        * SURF_RECOVERY_UP_FRAC))
+        pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
+        cmd = {"direction": "up", "pwm": pwm,
+               "frac": round(SURF_RECOVERY_UP_FRAC, 3)}
+        self._last_command = cmd
         return False, cmd
 
     # -- diagnostics ---------------------------------------------------
@@ -5460,35 +6543,234 @@ class SurfTrackController:
         self.last_event = event
         self.last_event_at = datetime.now()
 
+    def _snapshot_locked(self) -> dict:
+        """Same as :meth:`snapshot` but must be called under ``self._lock``.
+
+        Kept separate so an event / tick log call inside the lock does
+        not deadlock re-acquiring it. External callers should use
+        :meth:`snapshot`.
+        """
+        def _round(v, n=2):
+            return round(v, n) if isinstance(v, (int, float)) else None
+        now = time.monotonic()
+        cooldown_remaining = None
+        if (self._recovery_cooldown_until is not None
+                and now < self._recovery_cooldown_until):
+            cooldown_remaining = round(self._recovery_cooldown_until - now, 2)
+        return {
+            "enabled": self.state != "disabled",
+            "state": self.state,
+            "hold_reason": self.hold_reason,
+            "target_altitude_m": round(surf_target_altitude_m, 2),
+            "target_altitude_min_m": SURF_TARGET_ALTITUDE_MIN_M,
+            "target_altitude_max_m": SURF_TARGET_ALTITUDE_MAX_M,
+            "deadband_m": round(surf_deadband_m, 3),
+            "full_scale_error_m": round(surf_full_scale_error_m, 2),
+            "max_depth_m": round(surf_max_depth_m, 1),
+            "tether_length_m": round(tether_length_m, 1),
+            "depth_ceiling_m": _round(self._last_depth_ceiling_m),
+            "ceiling_limited": bool(self._last_ceiling_limited),
+            "fish_depth_m": _round(self._last_fish_depth_m),
+            "bottom_ahead_m": _round(self._last_bottom_ahead_m),
+            "bottom_delayed_m": _round(self._last_bottom_delayed_m),
+            "altitude_m": _round(self._last_altitude_m),
+            "commanded_depth_m": _round(self._target_depth_m),
+            "error_m": _round(self._last_error_m, 3),
+            "command": self._last_command,
+            "roll_deg": _round(self._last_roll_deg, 1),
+            "pitch_deg": _round(self._last_pitch_deg, 1),
+            "recovery_cooldown_s": cooldown_remaining,
+            "last_event": self.last_event,
+            "last_event_at": (self.last_event_at.isoformat()
+                              if self.last_event_at else None),
+        }
+
     def snapshot(self) -> dict:
         """JSON-serialisable status for /status."""
         with self._lock:
-            def _round(v, n=2):
-                return round(v, n) if isinstance(v, (int, float)) else None
-            return {
-                "enabled": self.state != "disabled",
-                "state": self.state,
-                "hold_reason": self.hold_reason,
-                "target_altitude_m": round(surf_target_altitude_m, 2),
-                "target_altitude_min_m": SURF_TARGET_ALTITUDE_MIN_M,
-                "target_altitude_max_m": SURF_TARGET_ALTITUDE_MAX_M,
-                "deadband_m": round(surf_deadband_m, 3),
-                "full_scale_error_m": round(surf_full_scale_error_m, 2),
-                "max_depth_m": round(surf_max_depth_m, 1),
-                "fish_depth_m": _round(self._last_fish_depth_m),
-                "bottom_ahead_m": _round(self._last_bottom_ahead_m),
-                "bottom_delayed_m": _round(self._last_bottom_delayed_m),
-                "altitude_m": _round(self._last_altitude_m),
-                "commanded_depth_m": _round(self._target_depth_m),
-                "error_m": _round(self._last_error_m, 3),
-                "command": self._last_command,
-                "last_event": self.last_event,
-                "last_event_at": (self.last_event_at.isoformat()
-                                  if self.last_event_at else None),
-            }
+            return self._snapshot_locked()
 
 
 _surftrack = SurfTrackController()
+
+
+# --- UTC clock bridge: boat GPS -> fish autopilot --------------------
+#
+# The towfish has no GPS, so its ArduSub publishes SYSTEM_TIME with
+# ``time_unix_usec = 0`` and its dataflash logs open with an ``RTC``
+# epoch of 0. The tow boat has a GPS fix and a valid clock. This
+# monitor reads the boat's SYSTEM_TIME once startup, posts it into the
+# fish's autopilot via mavlink2rest (ArduPilot's
+# handle_system_time_message feeds it straight into AP_RTC), and
+# re-asserts on a slow cadence so a mid-mission autopilot reboot re-
+# syncs.
+#
+# Fallback: when the boat is unreachable the fish's own Raspberry Pi
+# is still on the same NTP the topside is, so we push the container's
+# wall-clock instead. That is enough to make the extension's own logs
+# (surf-track CSV, EXIF, video sidecars) UTC-aligned even without the
+# autopilot's cooperation.
+_TIME_SYNC_RETRY_S = 5.0       # while un-synced or verification failing
+_TIME_SYNC_REFRESH_S = 60.0    # once verified, re-assert every minute
+
+
+class TimeSyncMonitor:
+    """Post ``SYSTEM_TIME`` to the local autopilot until it accepts it.
+
+    Writes go to the fish's own ArduSub via the same mavlink2rest the
+    RC3 writer uses (``host.docker.internal``). Reads back the fish's
+    own ``SYSTEM_TIME`` to confirm ``time_unix_usec`` is non-zero
+    before switching from retry cadence to refresh cadence; a value
+    that stays zero means the autopilot silently dropped the write.
+    """
+
+    _FISH_SYSTEM_TIME_URL = (
+        'http://host.docker.internal/mavlink2rest/mavlink/vehicles/'
+        '1/components/1/messages/SYSTEM_TIME'
+    )
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._start_monotonic = time.monotonic()
+        # Snapshot fields (read under _lock).
+        self.state = "starting"      # 'starting' | 'synced' | 'no_source' | 'stopped'
+        self.source: str | None = None  # 'boat_gps' | 'container_clock' | None
+        self.last_write_at: datetime | None = None
+        self.last_success_at: datetime | None = None
+        self.last_error: str | None = None
+        self.fish_unix_usec: int | None = None
+        self.boat_unix_usec: int | None = None
+        self.write_count = 0
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="time-sync", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        with self._lock:
+            self.state = "stopped"
+
+    def _boot_ms(self) -> int:
+        """Increasing millisecond stamp since this monitor started.
+
+        ArduPilot's RTC handler only reads ``time_unix_usec``, but
+        ``time_boot_ms`` still has to be a plausibly-increasing 32-bit
+        value or the packet is rejected by some GCS-side validators.
+        Using our own monotonic delta keeps it monotonic without
+        needing to know the autopilot's boot time.
+        """
+        return int((time.monotonic() - self._start_monotonic) * 1000) & 0xFFFFFFFF
+
+    def _read_boat_time_usec(self):
+        """Return the boat's UTC epoch in microseconds, or None."""
+        msg = _mav_get_message(_tow_mavlink_url('SYSTEM_TIME'))
+        if not msg:
+            return None
+        val = msg.get('time_unix_usec')
+        if not isinstance(val, (int, float)) or val <= 0:
+            return None
+        return int(val)
+
+    def _read_fish_time_usec(self):
+        """Return the fish autopilot's own UTC epoch, or None on failure."""
+        try:
+            r = _HTTP.get(self._FISH_SYSTEM_TIME_URL, timeout=1)
+            if r.status_code != 200:
+                return None
+            val = ((r.json() or {}).get('message') or {}).get('time_unix_usec')
+            if not isinstance(val, (int, float)):
+                return None
+            return int(val)
+        except Exception as e:
+            logger.debug("fish SYSTEM_TIME read failed: %s", e)
+            return None
+
+    def _post_time(self, unix_usec: int) -> bool:
+        writer = get_default_writer()
+        try:
+            return writer.system_time(unix_usec, self._boot_ms())
+        except Exception as e:
+            logger.debug("SYSTEM_TIME post failed: %s", e)
+            return False
+
+    def _pick_source(self):
+        """Return ``(unix_usec, source_label)``. Never raises."""
+        boat_usec = self._read_boat_time_usec()
+        if boat_usec is not None:
+            return boat_usec, "boat_gps"
+        # Fall back to the container's own clock. On the BlueOS Pi
+        # this is NTP-disciplined and enough to keep the extension's
+        # sidecars UTC-aligned even when the boat is offline.
+        return int(time.time() * 1_000_000), "container_clock"
+
+    def _run(self) -> None:
+        logger.info("Time-sync monitor started")
+        while not self._stop.is_set():
+            unix_usec, source = self._pick_source()
+            posted = self._post_time(unix_usec)
+            fish_usec = self._read_fish_time_usec() if posted else None
+            now_utc = datetime.now(timezone.utc)
+
+            with self._lock:
+                self.boat_unix_usec = unix_usec if source == "boat_gps" else None
+                self.fish_unix_usec = fish_usec
+                self.source = source if posted else None
+                if posted:
+                    self.last_write_at = now_utc
+                    self.write_count += 1
+                    self.last_error = None
+                    if fish_usec is not None and fish_usec > 0:
+                        self.state = "synced"
+                        self.last_success_at = now_utc
+                    elif source == "boat_gps":
+                        # Boat had a fix but the fish silently dropped
+                        # the write. Keep retrying rather than declare
+                        # sync.
+                        self.state = "starting"
+                    else:
+                        # Boat unreachable and the fish still shows
+                        # unix_usec = 0. The autopilot may or may not
+                        # accept the container clock; sidecars work
+                        # either way.
+                        self.state = "no_source"
+                else:
+                    self.state = "starting"
+                    self.last_error = "mavlink2rest post failed"
+                # Decide the next wait outside the state lock.
+                synced_now = self.state == "synced"
+
+            wait_s = _TIME_SYNC_REFRESH_S if synced_now else _TIME_SYNC_RETRY_S
+            if self._stop.wait(wait_s):
+                break
+        logger.info("Time-sync monitor exited")
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            def _iso(dt):
+                return dt.isoformat() if dt else None
+            return {
+                "state": self.state,
+                "source": self.source,
+                "write_count": self.write_count,
+                "last_write_at": _iso(self.last_write_at),
+                "last_success_at": _iso(self.last_success_at),
+                "last_error": self.last_error,
+                "boat_unix_usec": self.boat_unix_usec,
+                "fish_unix_usec": self.fish_unix_usec,
+            }
+
+
+_time_sync = TimeSyncMonitor()
 
 
 # --- Startup optics preset -------------------------------------------
@@ -5957,6 +7239,11 @@ def get_status():
             # (populated by the module singleton) so the widget can
             # render the state machine without null checks.
             "surftrack": _surftrack.snapshot(),
+            # UTC clock bridge: whether the fish's autopilot has been
+            # given a real epoch yet, and what source is behind it.
+            # Widget uses this to warn when logs will open with an
+            # RTC = 0 (dataflash) so the operator knows before arming.
+            "time_sync": _time_sync.snapshot(),
             # BlueBoat Ping sonar (DISTANCE_SENSOR) -- water depth under
             # the surface craft. Null when the boat is unreachable.
             "ping_sonar": get_ping_sonar_snapshot(),
@@ -6667,6 +7954,15 @@ if __name__ == '__main__':
         _kick_off_startup_optics()
     except Exception as e:
         logger.warning(f"Startup optics init failed to start: {e}")
+
+    # Bridge the boat's GPS-derived UTC to the fish's autopilot so
+    # dataflash logs open with a real RTC epoch instead of 0. Falls
+    # back to the Pi's own clock when the boat is offline, so the
+    # extension's own sidecars stay UTC-aligned regardless.
+    try:
+        _time_sync.start()
+    except Exception as e:
+        logger.warning(f"Time-sync monitor failed to start: {e}")
 
     # Soundings have to be buffered continuously, not just while
     # recording: the altitude for the very first frame of a leg needs a

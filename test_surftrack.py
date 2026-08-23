@@ -41,7 +41,8 @@ def stub(name, **attrs):
 stub("flask", Flask=mock.MagicMock(), jsonify=mock.MagicMock(),
      request=mock.MagicMock(), send_file=mock.MagicMock())
 stub("requests", get=mock.MagicMock(), post=mock.MagicMock(),
-     exceptions=mock.MagicMock())
+     exceptions=mock.MagicMock(),
+     Session=mock.MagicMock(), adapters=mock.MagicMock())
 
 gi = stub("gi", require_version=lambda *a, **k: None)
 stub("gi.repository", Gst=mock.MagicMock())
@@ -64,12 +65,17 @@ class FakeSonar:
     ``latest_speed_ms()`` and ``latest(max_age_s)`` are what the loop
     reads; ``depth_at_tow_delay`` is only used for the reported present
     altitude, so a static value there is fine for control tests.
+    ``last_update_id`` returns a monotonic counter so the surf-track
+    tick sees each call as a fresh sounding -- keeps the terrain half
+    firing on every _tick just like the pre-split loop did, so existing
+    assertions on _target_depth_m still apply.
     """
 
     def __init__(self, latest=(10.0, 0.5), speed=1.2, delayed=(10.5, 5.8, 0.2)):
         self._latest = latest
         self._speed = speed
         self._delayed = delayed
+        self._id = 0
 
     def latest(self, max_age_s):
         if self._latest is None:
@@ -84,6 +90,16 @@ class FakeSonar:
 
     def depth_at_tow_delay(self):
         return self._delayed
+
+    def last_update_id(self):
+        # Advance on every read so the loop treats each tick as a
+        # fresh sounding. ``None`` when the previous ``latest`` was
+        # None (nothing accepted into the ring buffer), mirroring
+        # ``SonarHistory.last_update_id``.
+        if self._latest is None:
+            return None
+        self._id += 1
+        return self._id
 
 
 def install_thrust_capture():
@@ -122,12 +138,15 @@ def fresh_controller(sonar=None):
     main.surf_deadband_m = 0.1
     main.surf_full_scale_error_m = 1.0
     main.surf_max_depth_m = 50.0
+    main.tether_length_m = 0.0
     main.jog_up_pwm = 1600
     main.jog_down_pwm = 1400
     ctrl = main.SurfTrackController()
     ctrl.state = "tracking"
     ctrl.hold_reason = None
     ctrl._target_depth_m = None
+    ctrl._raw_target_depth_m = None
+    ctrl._last_sounding_id = None
     ctrl._last_tick_ts = None
     return ctrl
 
@@ -138,20 +157,36 @@ def default_vehicle(armed=True, mode=main.MODE_ALT_HOLD):
 
 
 def drive(ctrl, *, fish_depth=5.5, sonar=None, vehicle=None,
-          now=None, dt=0.5):
-    """Run one _tick with the given inputs. Returns captured RC3 writes."""
+          now=None, dt=0.5, attitude=None):
+    """Run one _tick with the given inputs. Returns captured RC3 writes.
+
+    ``attitude`` is ``None`` to leave ``get_towfish_attitude`` alone
+    (defaults to an empty dict via the requests stub), or a dict like
+    ``{"roll": 25.0, "pitch": 0.0}`` to inject a specific attitude
+    into the recovery detector.
+    """
     if sonar is not None:
         main._sonar_history = sonar
     if vehicle is None:
         vehicle = default_vehicle()
     calls = install_thrust_capture()
     tstart = now if now is not None else 100.0
-    with mock.patch.object(main.time, "monotonic", return_value=tstart), \
-         mock.patch.object(main, "_get_towfish_depth_m",
-                           return_value=fish_depth), \
-         mock.patch.object(main, "get_vehicle_status_snapshot",
-                           return_value=vehicle):
-        ctrl._tick()
+    patches = [
+        mock.patch.object(main.time, "monotonic", return_value=tstart),
+        mock.patch.object(main, "_get_towfish_depth_m",
+                          return_value=fish_depth),
+        mock.patch.object(main, "get_vehicle_status_snapshot",
+                          return_value=vehicle),
+    ]
+    if attitude is not None:
+        patches.append(mock.patch.object(main, "get_towfish_attitude",
+                                         return_value=attitude))
+    with patches[0], patches[1], patches[2]:
+        if len(patches) > 3:
+            with patches[3]:
+                ctrl._tick()
+        else:
+            ctrl._tick()
     return calls
 
 
@@ -180,9 +215,14 @@ check("full-scale error commands down at jog_down_pwm=1400",
 
 # Error just larger than deadband but well below full-scale should be
 # clamped up to the SURF_MIN_FRAC floor rather than nearly-neutral.
+# With the recovery-item tuning the floor is 0.08 and full-scale is
+# wider, so the test uses a smaller deadband and a correspondingly
+# small error to keep the "raw frac < floor" condition realisable.
 ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
 ctrl._target_depth_m = 6.0
-calls = drive(ctrl, fish_depth=5.85)  # error 0.15 m, frac would be 0.15
+main.surf_deadband_m = 0.02
+main.surf_full_scale_error_m = 1.0
+calls = drive(ctrl, fish_depth=5.97)  # error 0.03 m, frac would be 0.03
 check("small-error frac is floored at SURF_MIN_FRAC",
       len(calls) == 1 and calls[0][0] == "down"
       and calls[0][1] == round(main.Z_PWM_NEUTRAL
@@ -380,6 +420,12 @@ check("NaN falls back to the default (up)",
 # ---------------------------------------------------------------------------
 print("\noperator veto")
 ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+# Preseed the target past the slew ramp so this tick actually issues a
+# command (raw_target = 6, fish = 5, deadband = 0.1). Without the
+# preseed the first-tick slew at SURF_TICK_S puts us inside deadband
+# and the write we want to see vetoed never happens.
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
 calls = install_thrust_operator_veto()
 with mock.patch.object(main.time, "monotonic", return_value=100.0), \
      mock.patch.object(main, "_get_towfish_depth_m", return_value=5.0), \
@@ -408,6 +454,144 @@ for i in range(200):
 check("commanded depth clamped by surf_max_depth_m",
       ctrl._target_depth_m is not None and ctrl._target_depth_m <= 8.0 + 1e-6,
       f"got {ctrl._target_depth_m}")
+
+# ---------------------------------------------------------------------------
+# Tether ceiling: 0.7 * tether_length caps the commanded raw target
+# ---------------------------------------------------------------------------
+print("\ntether-length ceiling")
+# tether = 5 m gives an effective ceiling of 0.7 * 5 = 3.5 m even
+# though surf_max_depth_m is 50 m. Sonar reads 20 m ahead, target alt
+# 4 m -> raw target 16 m -> must clamp to 3.5.
+ctrl = fresh_controller(FakeSonar(latest=(20.0, 0.5)))
+main.surf_max_depth_m = 50.0
+main.tether_length_m = 5.0
+# Ramp for many ticks so the slew catches up to the raw target.
+now = 700.0
+for i in range(200):
+    drive(ctrl, fish_depth=3.0, sonar=FakeSonar(latest=(20.0, 0.5)),
+          now=now + i * 0.5)
+snap = ctrl.snapshot()
+check("tether ceiling clamps _target_depth_m at 0.7 * tether",
+      ctrl._target_depth_m is not None and ctrl._target_depth_m <= 3.5 + 1e-6,
+      f"got _target_depth_m={ctrl._target_depth_m}")
+check("snapshot exposes effective depth_ceiling_m",
+      snap.get("depth_ceiling_m") == 3.5,
+      f"got depth_ceiling_m={snap.get('depth_ceiling_m')}")
+check("snapshot flags ceiling_limited",
+      snap.get("ceiling_limited") is True)
+# Undo global for the tests below so they use the plain surf_max_depth_m cap.
+main.tether_length_m = 0.0
+
+# ---------------------------------------------------------------------------
+# Recovery entry on roll excursion, up-command at recovery frac
+# ---------------------------------------------------------------------------
+print("\nrecovery: roll excursion drives full up")
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+# Preseed a modest tracking state so the tick actually enters the
+# _tick body at ``elif`` -> recovery rather than being swallowed by
+# the ``hold_reason`` branch.
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
+calls = drive(ctrl, fish_depth=6.0, now=800.0,
+              attitude={"roll": 25.0, "pitch": 0.0})
+check("state transitions to 'recovering'", ctrl.state == "recovering",
+      f"got state={ctrl.state}")
+check("hold_reason records 'roll_excursion'",
+      ctrl.hold_reason == "roll_excursion",
+      f"got hold_reason={ctrl.hold_reason}")
+check("recovery commands up",
+      any(c[0] == "up" and c[2] == "surftrack" for c in calls),
+      f"got {calls}")
+# SURF_RECOVERY_UP_FRAC is 1.0 today -- pwm should hit the full up jog.
+check("recovery up command is at recovery authority",
+      any(c[0] == "up" and c[1] == main.jog_up_pwm for c in calls),
+      f"got {calls}")
+
+# ---------------------------------------------------------------------------
+# Recovery: attitude clears after SURF_RECOVERY_CLEAR_S -> tracking + cooldown
+# ---------------------------------------------------------------------------
+print("\nrecovery: clearance exits with cooldown")
+# Continue from the previous controller. Advance time past
+# SURF_RECOVERY_CLEAR_S with attitude back inside limits.
+t = 800.0
+# Two ticks: one to seed _recovery_ok_since, another after the
+# clearance window elapses.
+drive(ctrl, fish_depth=6.0, now=t + 0.1,
+      attitude={"roll": 0.0, "pitch": 0.0})
+check("still recovering while clear-window unfinished",
+      ctrl.state == "recovering",
+      f"got state={ctrl.state}")
+drive(ctrl, fish_depth=6.0, now=t + 0.1 + main.SURF_RECOVERY_CLEAR_S + 0.5,
+      attitude={"roll": 0.0, "pitch": 0.0})
+check("state returns to 'tracking' after clearance",
+      ctrl.state == "tracking",
+      f"got state={ctrl.state}")
+check("recovery cooldown armed",
+      ctrl._recovery_cooldown_until is not None
+      and ctrl._recovery_cooldown_until > t,
+      f"got cooldown={ctrl._recovery_cooldown_until}")
+# Snapshot the cooldown from the same simulated clock the tick ran
+# under so ``time.monotonic()`` still lies inside the cooldown
+# window; otherwise real wall-clock time trivially clears it.
+with mock.patch.object(main.time, "monotonic",
+                       return_value=t + 0.1 + main.SURF_RECOVERY_CLEAR_S + 0.6):
+    snap = ctrl.snapshot()
+check("snapshot reports recovery_cooldown_s",
+      isinstance(snap.get("recovery_cooldown_s"), (int, float))
+      and snap["recovery_cooldown_s"] > 0,
+      f"got {snap.get('recovery_cooldown_s')}")
+
+# ---------------------------------------------------------------------------
+# Recovery: pitch excursion also enters recovering
+# ---------------------------------------------------------------------------
+print("\nrecovery: pitch excursion also enters recovery")
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
+calls = drive(ctrl, fish_depth=6.0, now=900.0,
+              attitude={"roll": 0.0, "pitch": 30.0})
+check("pitch excursion -> recovering", ctrl.state == "recovering",
+      f"got state={ctrl.state}")
+check("pitch excursion sets hold_reason 'pitch_excursion'",
+      ctrl.hold_reason == "pitch_excursion",
+      f"got hold_reason={ctrl.hold_reason}")
+
+# ---------------------------------------------------------------------------
+# Speed gate: down refused when boat is stalled
+# ---------------------------------------------------------------------------
+print("\nspeed gate: down blocked when boat < 0.7 m/s")
+sonar = FakeSonar(latest=(10.0, 0.5), speed=0.3)
+ctrl = fresh_controller(sonar)
+# Preseed so the tick would want to command down but the speed gate
+# should refuse.
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
+calls = drive(ctrl, fish_depth=5.0, sonar=sonar, now=1000.0)
+check("no down command written while too slow",
+      not any(c[0] == "down" and c[2] == "surftrack" for c in calls),
+      f"got {calls}")
+# RC3 must still be released (deadband/no-command shape), and the
+# snapshot must expose the reason for the operator.
+check("RC3 released on speed gate",
+      any(c == (None, main.Z_PWM_NEUTRAL, "surftrack") for c in calls),
+      f"got {calls}")
+check("_last_down_gate_reason == 'too_slow_to_dive'",
+      ctrl._last_down_gate_reason == "too_slow_to_dive",
+      f"got {ctrl._last_down_gate_reason}")
+
+# ---------------------------------------------------------------------------
+# Speed gate: up commands still allowed while stalled
+# ---------------------------------------------------------------------------
+print("\nspeed gate: up still allowed while stalled")
+sonar = FakeSonar(latest=(10.0, 0.5), speed=0.3)
+ctrl = fresh_controller(sonar)
+# Preseed target depth shallower than fish so error < 0 -> up.
+ctrl._target_depth_m = 3.0
+ctrl._raw_target_depth_m = 3.0
+calls = drive(ctrl, fish_depth=5.0, sonar=sonar, now=1100.0)
+check("up command still issued despite low speed",
+      any(c[0] == "up" and c[2] == "surftrack" for c in calls),
+      f"got {calls}")
 
 print()
 if FAILURES:

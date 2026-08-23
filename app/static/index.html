@@ -906,7 +906,7 @@
                 <div class="field">
                     <label for="surfMaxDepth">SURF TRACK MAX DEPTH</label>
                     <div class="field-row">
-                        <input type="number" id="surfMaxDepth" step="1" min="2" max="300" placeholder="50" autocomplete="off">
+                        <input type="number" id="surfMaxDepth" step="1" min="2" max="300" placeholder="5" autocomplete="off">
                         <span class="unit">m</span>
                         <button class="btn" id="surfMaxDepthSave">SAVE</button>
                         <span class="saved" id="surfMaxDepthSaved">OK</span>
@@ -915,6 +915,24 @@
                         Hard cap on the commanded depth. Even a wildly stale or insane
                         sounding cannot fly the fish past this. Slightly deeper than the
                         deepest survey water you expect to run in.
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="tetherLength">TETHER LENGTH</label>
+                    <div class="field-row">
+                        <input type="number" id="tetherLength" step="1" min="0" max="500" placeholder="0" autocomplete="off">
+                        <span class="unit">m</span>
+                        <button class="btn" id="tetherLengthSave">SAVE</button>
+                        <span class="saved" id="tetherLengthSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Physical tether length deployed. When set, surf-track's
+                        effective ceiling is squeezed to 70&nbsp;% of this value so the
+                        loop cannot ask for more scope than the cable can give --
+                        the winch itself becomes a stall risk otherwise. Leave at
+                        0&nbsp;to disable the tether limit and rely only on
+                        <code>SURF TRACK MAX DEPTH</code>.
                     </div>
                 </div>
             </div>
@@ -1168,6 +1186,7 @@ async function loadConfig() {
         if (d.altitude_offset_m != null) $('altitudeOffset').value = Number(d.altitude_offset_m).toFixed(2);
         if (d.surf_full_scale_error_m != null) $('surfFullScaleError').value = Number(d.surf_full_scale_error_m).toFixed(1);
         if (d.surf_max_depth_m != null) $('surfMaxDepth').value = Number(d.surf_max_depth_m).toFixed(0);
+        if (d.tether_length_m != null) $('tetherLength').value = Number(d.tether_length_m).toFixed(0);
     } catch (e) {
         showError(`Could not load configuration: ${e.message}`);
     }
@@ -1306,6 +1325,18 @@ $('surfMaxDepthSave').addEventListener('click', () => {
 });
 $('surfMaxDepth').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') $('surfMaxDepthSave').click();
+});
+
+$('tetherLengthSave').addEventListener('click', () => {
+    const value = parseFloat($('tetherLength').value);
+    if (!Number.isFinite(value) || value < 0 || value > 500) {
+        showError('Tether length must be a number of metres between 0 and 500 (0 disables the tether limit).');
+        return;
+    }
+    saveConfigField({ tether_length_m: value }, 'tetherLengthSaved');
+});
+$('tetherLength').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('tetherLengthSave').click();
 });
 
 // Right triangle: tether is the hypotenuse, depth the vertical leg, and
