@@ -8,6 +8,7 @@ import json
 import os
 import glob
 import subprocess
+import copy
 from datetime import datetime
 import logging
 import time
@@ -525,6 +526,197 @@ PARAM_SPECS = [
         "min": 0.0,
         "max": 100.0,
         "desc": "Roll axis rate controller derivative frequency in Hz.",
+    },
+    # ── Control-surface corrections to ArduSub's thruster assumptions ────
+    # Everything below exists because ArduSub has no notion of a towed
+    # body with servo-driven wings. Its defaults describe a BlueROV2:
+    # six thrusters that produce torque and thrust at zero forward speed,
+    # roughly quadratic in PWM, capable of 1 m/s vertical. The towfish has
+    # two wing servos whose lift is linear in deflection until it stalls,
+    # scales with tow speed, and tops out near 0.2 m/s vertical. The
+    # values here are read off mission 241 rather than guessed -- see
+    # tools/rate_envelope.py and tools/expo_check.py.
+    {
+        "name": "PILOT_SPEED_UP",
+        "vehicle": "towfish",
+        "default": 25.0,
+        "unit": "cm/s",
+        "decimals": 0,
+        "min": 5.0,
+        "max": 200.0,
+        "presets": [15.0, 20.0, 25.0, 40.0],
+        "desc": "Fastest ascent the depth controller may ask for. Stock "
+                "ArduSub ships 100 cm/s, which is a BlueROV2 figure: it "
+                "makes the controller size every command for a vehicle "
+                "five times livelier than this one. Mission 241 sustained "
+                "about 20 cm/s up, and buoyancy helps in that direction.",
+    },
+    {
+        "name": "PILOT_SPEED_DN",
+        "vehicle": "towfish",
+        "default": 20.0,
+        "unit": "cm/s",
+        "decimals": 0,
+        "min": 5.0,
+        "max": 200.0,
+        "presets": [10.0, 15.0, 20.0, 30.0],
+        "desc": "Fastest descent the depth controller may ask for. Leaving "
+                "this at 0 does not mean 'unset' -- ArduSub silently falls "
+                "back to PILOT_SPEED_UP, which is how mission 241 ended up "
+                "demanding 1 m/s down from a wing that can manage 0.2 and "
+                "stalls if pushed harder.",
+    },
+    {
+        "name": "MOT_THST_EXPO",
+        "vehicle": "towfish",
+        "default": 0.0,
+        "unit": "",
+        "decimals": 2,
+        "min": 0.0,
+        "max": 1.0,
+        "presets": [0.0, 0.35, 0.65],
+        "desc": "Thrust curve compensation. A propeller's thrust rises "
+                "roughly with the square of its speed, so ArduSub bends "
+                "the PWM to linearise it. A servo does not need that: "
+                "angle is linear in PWM and lift is linear in angle until "
+                "stall. At the stock 0.65 the loop gain is 2.9x near trim "
+                "and 0.6x at full deflection -- hottest exactly where the "
+                "wing is most linear, softest where it is about to stall, "
+                "and the stall knee arrives at 23% of demand instead of "
+                "38%. 0 makes demand and deflection proportional.",
+    },
+    {
+        "name": "MOT_PWM_MIN",
+        "vehicle": "towfish",
+        "default": 1100.0,
+        "unit": "us",
+        "decimals": 0,
+        "min": 1000.0,
+        "max": 1500.0,
+        "desc": "Low end of the range the mixer drives the wing servos "
+                "to. This overrides SERVO5/6_MIN, so the stock 1000 sends "
+                "the wings 100 us past the 1100 travel limit the servo "
+                "config declares -- mission 241 spent 5.5% of its samples "
+                "outside that limit, grinding the servos against their "
+                "stops for no extra lift.",
+    },
+    {
+        "name": "MOT_PWM_MAX",
+        "vehicle": "towfish",
+        "default": 1900.0,
+        "unit": "us",
+        "decimals": 0,
+        "min": 1500.0,
+        "max": 2100.0,
+        "desc": "High end of the mixer's wing servo range, and the other "
+                "half of the MOT_PWM_MIN problem: stock 2001 against a "
+                "declared SERVO5/6_MAX of 1900.",
+    },
+    {
+        "name": "MOT_HOVER_LEARN",
+        "vehicle": "towfish",
+        "default": 0.0,
+        "unit": "",
+        "decimals": 0,
+        "min": 0.0,
+        "max": 2.0,
+        "presets": [0.0, 1.0, 2.0],
+        "desc": "Whether the autopilot learns and saves the throttle that "
+                "holds depth. On an ROV that converges on a real constant. "
+                "On a towfish the equivalent trim moves with tow speed, "
+                "tether angle and depth, so the stock 2 (learn and save) "
+                "quietly writes a drifting feedforward to EEPROM that the "
+                "next mission inherits. 0 pins it; the mechanical trim "
+                "already lives in SERVO5_TRIM.",
+    },
+    {
+        "name": "MOT_THST_HOVER",
+        "vehicle": "towfish",
+        "default": 0.5,
+        "unit": "",
+        "decimals": 3,
+        "min": 0.1,
+        "max": 0.9,
+        "desc": "The throttle the controller assumes holds depth, and the "
+                "value MOT_HOVER_LEARN would otherwise keep rewriting. 0.5 "
+                "is mixer neutral, which on this fish is the passive glide "
+                "attitude that already holds about 5 m on its own. The "
+                "mechanical offset between the wings lives in SERVO5_TRIM "
+                "and does not belong here.",
+    },
+    {
+        "name": "PSC_D_POS_P",
+        "vehicle": "towfish",
+        "default": 1.0,
+        "unit": "",
+        "decimals": 2,
+        "min": 0.1,
+        "max": 6.0,
+        "presets": [0.5, 1.0, 2.0, 3.0],
+        "desc": "Converts depth error into a target vertical speed. The "
+                "stock 3.0 was chosen against a 1 m/s vehicle; paired with "
+                "a 20 cm/s limit it saturates on 7 cm of error, which is "
+                "bang-bang control on a sensor that sees more wave noise "
+                "than that. 1.0 gives a 20 cm proportional band.",
+    },
+    {
+        "name": "PSC_JERK_D",
+        "vehicle": "towfish",
+        "default": 5.0,
+        "unit": "m/s/s/s",
+        "decimals": 1,
+        "min": 1.0,
+        "max": 50.0,
+        "presets": [2.0, 5.0, 10.0],
+        "desc": "How abruptly the vertical demand may change. 50 lets the "
+                "controller go from hold to full deflection inside one "
+                "loop, which is the step input that stalls the wing. A "
+                "wing needs to be eased into its working range.",
+    },
+    {
+        "name": "ATC_RAT_RLL_IMAX",
+        "vehicle": "towfish",
+        "default": 0.15,
+        "unit": "",
+        "decimals": 3,
+        "min": 0.0,
+        "max": 1.0,
+        "presets": [0.1, 0.15, 0.25, 0.444],
+        "desc": "Ceiling on the roll rate integrator. Thruster torque is "
+                "there whenever the motors spin, but wing torque scales "
+                "with tow speed and vanishes at rest, so every slow moment "
+                "looks to the controller like an unresponsive vehicle and "
+                "winds the integrator up. At the stock 0.444 that stored "
+                "error dumps 44% of full deflection into the wings the "
+                "moment speed returns.",
+    },
+    {
+        "name": "ATC_RATE_R_MAX",
+        "vehicle": "towfish",
+        "default": 30.0,
+        "unit": "deg/s",
+        "decimals": 0,
+        "min": 0.0,
+        "max": 360.0,
+        "presets": [15.0, 30.0, 60.0, 0.0],
+        "desc": "Cap on the roll rate the attitude controller will ask "
+                "for. 0 means uncapped, which is only reasonable when the "
+                "actuators can deliver any rate demanded. Asking a wing "
+                "for a rate it cannot reach just saturates the servo and "
+                "winds up the integrator.",
+    },
+    {
+        "name": "ATC_RATE_P_MAX",
+        "vehicle": "towfish",
+        "default": 30.0,
+        "unit": "deg/s",
+        "decimals": 0,
+        "min": 0.0,
+        "max": 360.0,
+        "presets": [15.0, 30.0, 60.0, 0.0],
+        "desc": "Same cap for pitch. Pitch on a towed body is set mostly "
+                "by where the tether pulls, so a large rate demand is a "
+                "request the wings cannot fill.",
     },
 ]
 
@@ -7384,6 +7576,10 @@ def get_status():
             # Widget uses this to warn when logs will open with an
             # RTC = 0 (dataflash) so the operator knows before arming.
             "time_sync": _time_sync.snapshot(),
+            # Result of the startup towfish parameter enforcement pass.
+            # An operator seeing corrections here after every boot is
+            # being told something else keeps resetting the autopilot.
+            "param_enforce": _param_enforce_snapshot(),
             # BlueBoat Ping sonar (DISTANCE_SENSOR) -- water depth under
             # the surface craft. Null when the boat is unreachable.
             "ping_sonar": get_ping_sonar_snapshot(),
@@ -7753,8 +7949,31 @@ _param_job = {
     "started_at": None,
     "finished_at": None,
     "message": None,
+    # Populated by an "enforce" pass: which parameters were found off
+    # target and rewritten, and whether the pass had to stand down
+    # because the fish was armed.
+    "corrections": [],
+    "deferred": False,
+    "failures": 0,
 }
 _param_thread = None
+
+# Outcome of the most recent enforce pass, kept separate from _param_job
+# so a later operator-triggered check doesn't overwrite the record of
+# what boot-time enforcement actually found.
+_param_enforce_last = {
+    "state": "pending",
+    "checked": 0,
+    "corrections": [],
+    "failures": 0,
+    "message": None,
+    "finished_at": None,
+}
+
+
+def _param_enforce_snapshot():
+    with _param_lock:
+        return copy.deepcopy(_param_enforce_last)
 
 
 def _param_client(vehicle):
@@ -7856,6 +8075,8 @@ def _param_worker(kind, names):
 
         done = 0
         failures = 0
+        corrections = []
+        deferred = False
         for vehicle, vehicle_names in by_vehicle.items():
             client = _param_client(vehicle)
             reachable = client.is_reachable()
@@ -7873,11 +8094,41 @@ def _param_worker(kind, names):
                 _param_job_update(done=done)
                 continue
 
+            # An enforce pass can rewrite mixer-shaping parameters --
+            # MOT_PWM_MIN/MAX and MOT_THST_EXPO change what a given
+            # thrust demand means at the servo. Doing that under an armed
+            # autopilot would move the wings mid-tow, so enforcement
+            # waits for the deck and retries.
+            if (kind == "enforce" and vehicle == "towfish"
+                    and _cached_heartbeat_snapshot().get("armed")):
+                for name in vehicle_names:
+                    _param_record(name, error="deferred: towfish armed")
+                    done += 1
+                    failures += 1
+                deferred = True
+                _param_job_update(done=done)
+                continue
+
             for name in vehicle_names:
                 _param_job_update(current=name, done=done)
                 try:
                     if kind == "apply":
                         result = client.write(name, param_targets[name])
+                    elif kind == "enforce":
+                        # Read first so an already-correct parameter is
+                        # never rewritten: every write costs an EEPROM
+                        # cycle and a mailbox round trip.
+                        result = client.read(name)
+                        target = param_targets[name]
+                        was = result.get("value")
+                        if _param_matches(PARAM_SPECS_BY_NAME[name],
+                                          was, target) is False:
+                            result = client.write(name, target)
+                            corrections.append({
+                                "name": name,
+                                "was": was,
+                                "now": result.get("value"),
+                            })
                     else:
                         result = client.read(name)
                     _param_record(name, value=result.get("value"),
@@ -7893,11 +8144,39 @@ def _param_worker(kind, names):
                 done += 1
                 _param_job_update(done=done)
 
-        verb = "Applied" if kind == "apply" else "Checked"
-        message = f"{verb} {done - failures}/{done} parameters"
-        if failures:
-            message += f" -- {failures} failed"
-        _param_job_update(message=message)
+        if kind == "enforce":
+            if deferred:
+                message = "Deferred -- towfish armed"
+            elif corrections:
+                message = (f"Corrected {len(corrections)}/{done}: "
+                           + ", ".join(c["name"] for c in corrections))
+            else:
+                message = f"All {done} parameters already on target"
+            if failures and not deferred:
+                message += f" -- {failures} failed"
+            _param_job_update(message=message, corrections=corrections,
+                              deferred=deferred, failures=failures)
+            with _param_lock:
+                _param_enforce_last.update({
+                    "state": ("deferred" if deferred
+                              else "failed" if failures else "ok"),
+                    "checked": done,
+                    "corrections": list(corrections),
+                    "failures": failures,
+                    "message": message,
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                })
+            for c in corrections:
+                logger.warning(
+                    "Parameter drift corrected: %s was %s, now %s",
+                    c["name"], c["was"], c["now"],
+                )
+        else:
+            verb = "Applied" if kind == "apply" else "Checked"
+            message = f"{verb} {done - failures}/{done} parameters"
+            if failures:
+                message += f" -- {failures} failed"
+            _param_job_update(message=message, failures=failures)
     except Exception as e:
         logger.error("Parameter %s batch crashed: %s", kind, e)
         _param_job_update(message=f"Batch failed: {e}")
@@ -7924,6 +8203,9 @@ def _param_start_job(kind, names):
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
             "message": None,
+            "corrections": [],
+            "deferred": False,
+            "failures": 0,
         })
     _param_thread = threading.Thread(
         target=_param_worker, args=(kind, names),
@@ -7931,6 +8213,61 @@ def _param_start_job(kind, names):
     )
     _param_thread.start()
     return True, None
+
+
+# ── Towfish parameter enforcement ────────────────────────────────────────
+# Targets have to be enforced, not merely offered. Mission 241 went to sea
+# with all four of the roll-tuning targets this extension already shipped
+# sitting at their stock values -- ATC_RAT_RLL_D was 0.0004 against a
+# target of 0.0072, an 18x deficit in the one gain that damps the roll
+# departures we were chasing. The console has an Apply button; nobody
+# pressed it, and a check-only workflow gives an operator no way to
+# notice that once the boat has left the dock. Parameters also revert
+# behind you: a firmware update or a "reset to defaults" in another GCS
+# silently undoes an apply that did happen.
+#
+# So the extension re-asserts the towfish set every time it starts. Only
+# the towfish: the boat's parameters belong to whoever is driving it, and
+# the boat may not even be the same hull between missions.
+PARAM_ENFORCE_SETTLE_S = 25.0
+PARAM_ENFORCE_RETRY_S = 60.0
+PARAM_ENFORCE_MAX_ATTEMPTS = 15
+
+
+def _param_enforce_worker():
+    """Re-assert the towfish targets once the autopilot is up and safe."""
+    names = [s["name"] for s in PARAM_SPECS if s["vehicle"] == "towfish"]
+    if not names:
+        return
+    time.sleep(PARAM_ENFORCE_SETTLE_S)
+    for attempt in range(1, PARAM_ENFORCE_MAX_ATTEMPTS + 1):
+        started, why = _param_start_job("enforce", names)
+        if not started:
+            # An operator-triggered batch owns the PARAM_VALUE mailbox.
+            # Theirs is the more specific intent, so stand down.
+            logger.info("Parameter enforcement waiting: %s", why)
+            time.sleep(PARAM_ENFORCE_RETRY_S)
+            continue
+        while True:
+            time.sleep(1.0)
+            with _param_lock:
+                if not _param_job["running"]:
+                    job = dict(_param_job)
+                    break
+        if not job.get("deferred") and not job.get("failures"):
+            logger.info("Parameter enforcement: %s", job.get("message"))
+            return
+        logger.info("Parameter enforcement attempt %d/%d: %s",
+                    attempt, PARAM_ENFORCE_MAX_ATTEMPTS, job.get("message"))
+        time.sleep(PARAM_ENFORCE_RETRY_S)
+    logger.warning("Parameter enforcement gave up after %d attempts; "
+                   "towfish parameters may be off target",
+                   PARAM_ENFORCE_MAX_ATTEMPTS)
+
+
+def _start_param_enforcement():
+    threading.Thread(target=_param_enforce_worker,
+                     name="param-enforce", daemon=True).start()
 
 
 def _param_names_from_request(data):
@@ -8111,6 +8448,14 @@ if __name__ == '__main__':
         _sonar_history.start()
     except Exception as e:
         logger.warning(f"Sonar history sampler failed to start: {e}")
+
+    # Re-assert the towfish parameter targets. ArduSub's stock values
+    # describe a thruster ROV, and mission 241 proved that leaving the
+    # correction to an operator button means it silently does not happen.
+    try:
+        _start_param_enforcement()
+    except Exception as e:
+        logger.warning(f"Parameter enforcement failed to start: {e}")
 
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)

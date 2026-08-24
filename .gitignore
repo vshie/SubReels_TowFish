@@ -3,3 +3,13 @@
 *.egg-info
 **/build
 **/__pycache__
+.DS_Store
+
+# Log-analysis intermediates under tools/. The scripts that produce them
+# are tracked; the extracts are tens of MB and regenerable from the .BIN
+# dataflash logs with mission_241_extract.py.
+tools/*.npz
+tools/*.png
+tools/*.html
+tools/*.pdf
+tools/*.json
