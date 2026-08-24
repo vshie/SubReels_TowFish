@@ -34,7 +34,7 @@ autocalibration from ``FocalLength`` plus sensor pixel size
 ``FocalLengthIn35mmFilm``). It does not read a field-of-view tag. With
 none of those present it assumes a 50 mm 35 mm-equivalent lens, which
 is a ~40 deg horizontal FOV -- a factor of three off this camera's
-94 deg wide end, and enough for alignment to fail. The RadCam's Sony
+94 deg wide end, and enough for alignment to fail. The BR 4k Cam's Sony
 IMX678 (2.0 um pitch, 3.6-11 mm F1.5 zoom, 94x62 deg at fully out) is
 therefore written into every JPEG so the solver starts from the real
 optics rather than that default.
@@ -69,12 +69,12 @@ GPS_XY_ACCURACY_LAYBACK_FRAC = 0.25  # layback contributes 25% of its length
 GPS_Z_ACCURACY_DEPTH_M = 0.3         # pressure depth alone
 GPS_Z_ACCURACY_ALTITUDE_M = 0.5      # altitude = two sensors differenced
 
-# RadCam / Sony IMX678. Pixel pitch is physical and constant; focal
+# BR 4k Cam / Sony IMX678. Pixel pitch is physical and constant; focal
 # length is the 3.6-11 mm zoom, with 94 x 62 deg FOV at the wide end
 # (fully out -- the survey preset). 4K readout of 3840x2160 at 2.0 um
 # is a 7.68 x 4.32 mm active area, which at 3.6 mm is 93.7 x 61.9 deg
 # and matches the published FOV within the lens's +/-5% spec.
-CAMERA_MAKE = b"RadCam"
+CAMERA_MAKE = b"BR 4k Cam"
 CAMERA_MODEL = b"IMX678"
 LENS_MODEL = b"3.6-11mm F1.5"
 PIXEL_SIZE_MM = 0.002
@@ -200,7 +200,7 @@ def _ppi_rational(ppi):
 
 
 def apply_lens_exif(exif_ifd, image_ifd, jpeg_bytes=None, zoom_frac=None):
-    """Stamp IMX678 Make/Model/focal-length/pixel-size into the IFDs.
+    """Stamp BR 4k Cam / IMX678 Make/Model/focal-length/pixel-size into the IFDs.
 
     Returns the millimetre focal length that was written, so the
     UserComment can echo it.

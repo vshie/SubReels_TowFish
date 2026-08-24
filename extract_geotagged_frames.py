@@ -35,7 +35,7 @@ Each output JPEG gets whatever the sidecar supports:
     * XMP Camera:GPSXYAccuracy / GPSZAccuracy reference priors -- CSV only
     * XMP Towfish:MountPitchBody / DepthBelowSurface / SonarBottomDepth
     * EXIF FocalLength / FocalPlane* / FocalLengthIn35mmFilm for the
-      RadCam IMX678 (3.6-11 mm, 2.0 um pitch) so Metashape does not
+      BR 4k Cam / IMX678 (3.6-11 mm, 2.0 um pitch) so Metashape does not
       assume a 50 mm 35 mm-equivalent lens
     * UserComment / ImageDescription with roll, pitch, tilt, depth, temp
     * GPSTimeStamp / GPSDateStamp in UTC

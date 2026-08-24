@@ -147,7 +147,7 @@ def check_embedding():
 
     exif_ifd = exif["Exif"]
     image_ifd = exif["0th"]
-    check("Make is RadCam", image_ifd[piexif.ImageIFD.Make] == b"RadCam")
+    check("Make is BR 4k Cam", image_ifd[piexif.ImageIFD.Make] == b"BR 4k Cam")
     check("Model is IMX678", image_ifd[piexif.ImageIFD.Model] == b"IMX678")
     check("FocalLength is 3.6 mm at default zoom",
           exif_ifd[piexif.ExifIFD.FocalLength] == (36, 10))
