@@ -13,6 +13,15 @@ on:
 jobs:
   deploy-docker-image:
     runs-on: ubuntu-latest
+    # svenstaro/upload-release-action (invoked by the BlueOS deploy action
+    # on tag pushes) attaches the built per-arch .tar files to the GitHub
+    # Release for the tag. That requires contents: write on the workflow
+    # token; the repo default is read-only, so tag builds fail at the
+    # upload step with "Resource not accessible by integration". Regular
+    # branch pushes never hit that step, which is why every non-tag run
+    # up to v0.99 was green.
+    permissions:
+      contents: write
     steps:
       - name: Clear Docker cache
         run: |
