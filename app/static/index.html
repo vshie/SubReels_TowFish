@@ -627,6 +627,20 @@
         .pcard-current.mismatch { color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
         .pcard-current.error { color: var(--red); text-shadow: none; font-size: 13px; }
         .pcard-current .unit { font-size: 12.5px; color: var(--ink-dim); text-shadow: none; margin-left: 4px; }
+        /* "BlueROV2 0.65 -> towfish 0.00" line, shown only for the
+           parameters this extension converts away from their stock
+           thruster-ROV values. */
+        .pcard-conv {
+            font: 600 11.5px var(--mono);
+            letter-spacing: 0.04em;
+            color: var(--ink-dim);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .pcard-conv .from { text-decoration: line-through; opacity: 0.7; }
+        .pcard-conv .to { color: var(--amber); }
         .pcard-target { display: flex; gap: 5px; align-items: center; }
         .pcard-target .unit {
             font-size: 12.5px;
@@ -1422,6 +1436,25 @@ function buildParamCard(p) {
     desc.className = 'pcard-desc';
     desc.textContent = p.desc;
 
+    // Conversion line: what the frame was commissioned with as a
+    // BlueROV2 versus what the towfish wants. Only the parameters the
+    // extension actually converts carry a stock value, so the boat's
+    // survey preferences render without this.
+    let conv = null;
+    if (p.stock !== null && p.stock !== undefined) {
+        conv = document.createElement('div');
+        conv.className = 'pcard-conv';
+        const from = document.createElement('span');
+        from.className = 'from';
+        from.textContent = `BLUEROV2 ${fmt(p.stock, p.decimals)}${p.unit || ''}`;
+        const arrow = document.createElement('span');
+        arrow.textContent = '\u2192';
+        const to = document.createElement('span');
+        to.className = 'to';
+        to.textContent = `TOWFISH ${fmt(p.default, p.decimals)}${p.unit || ''}`;
+        conv.append(from, arrow, to);
+    }
+
     const values = document.createElement('div');
     values.className = 'pcard-values';
 
@@ -1480,7 +1513,7 @@ function buildParamCard(p) {
     applyBtn.addEventListener('click', () => applyParams([p.name]));
     actions.append(presets, spacer, applyBtn);
 
-    card.append(head, desc, values, actions);
+    card.append(head, desc, ...(conv ? [conv] : []), values, actions);
 
     input.addEventListener('input', () => {
         dirtyTargets[p.name] = input.value;

@@ -164,28 +164,27 @@ print("\ncontrol-surface corrections are present and point away from stock")
 # The stock ArduSub value each of these is correcting, straight off the
 # mission 241 parameter dump. The test is that the target actually
 # differs -- a spec whose target equals the stock value corrects nothing.
-STOCK = {
-    "PILOT_SPEED_UP": 100.0,
-    "PILOT_SPEED_DN": 0.0,
-    "MOT_THST_EXPO": 0.65,
-    "MOT_PWM_MIN": 1000.0,
-    "MOT_PWM_MAX": 2001.0,
-    "MOT_HOVER_LEARN": 2.0,
-    "PSC_D_POS_P": 3.0,
-    "PSC_JERK_D": 50.0,
-    "ATC_RAT_RLL_IMAX": 0.444,
-    "ATC_RATE_R_MAX": 0.0,
-    "ATC_RATE_P_MAX": 0.0,
-}
-for name, stock in STOCK.items():
+for name, stock in main.TOWFISH_STOCK.items():
     spec = main.PARAM_SPECS_BY_NAME.get(name)
     check(f"{name}: spec exists", spec is not None)
     if spec is None:
         continue
     check(f"{name}: spec is on the towfish", spec["vehicle"] == "towfish")
-    check(f"{name}: target differs from ArduSub stock {stock:g}",
+    check(f"{name}: target differs from BlueROV2 stock {stock:g}",
           main._param_matches(spec, stock, spec["default"]) is False,
           f"target {spec['default']:g} == stock")
+    check(f"{name}: stock is carried on the spec",
+          spec.get("stock") == stock)
+
+check("every towfish spec declares what it converts from",
+      all(s.get("stock") is not None
+          for s in main.PARAM_SPECS if s["vehicle"] == "towfish"),
+      "missing: " + ", ".join(s["name"] for s in main.PARAM_SPECS
+                              if s["vehicle"] == "towfish"
+                              and s.get("stock") is None))
+check("boat specs carry no stock value -- they are preferences, not a conversion",
+      all(s.get("stock") is None
+          for s in main.PARAM_SPECS if s["vehicle"] == "boat"))
 
 # The two that caused the mission-241 dive behaviour specifically.
 check("PILOT_SPEED_DN is set explicitly, not left at 0",
@@ -194,9 +193,15 @@ check("PILOT_SPEED_DN target is no faster than the wing can manage",
       main.PARAM_SPECS_BY_NAME["PILOT_SPEED_DN"]["default"] <= 30.0)
 check("MOT_THST_EXPO target linearises the servo",
       main.PARAM_SPECS_BY_NAME["MOT_THST_EXPO"]["default"] == 0.0)
-check("MOT_PWM range stays inside the declared servo travel",
-      main.PARAM_SPECS_BY_NAME["MOT_PWM_MIN"]["default"] >= 1100
-      and main.PARAM_SPECS_BY_NAME["MOT_PWM_MAX"]["default"] <= 1900)
+
+# Retired on evidence: the servos take out-of-range PWM without
+# complaint and have no end stops, so capping MOT_PWM would only be a
+# blunt gain cut; and throttle_hover measured nearer 0.31 than the 0.5
+# mixer neutral would imply, so pinning it is worse than letting the
+# autopilot learn it.
+for name in ("MOT_PWM_MIN", "MOT_PWM_MAX", "MOT_HOVER_LEARN",
+             "MOT_THST_HOVER"):
+    check(f"{name} is not enforced", name not in main.PARAM_SPECS_BY_NAME)
 
 # ---------------------------------------------------------------------------
 print("\ntarget sanitisation")
@@ -350,6 +355,9 @@ with mock.patch.object(main, "_boat_vehicle_ids", return_value=(1, 1)):
 check("/params still lists every spec",
       len(full["params"]) == len(main.PARAM_SPECS))
 check("/params is JSON-serialisable", isinstance(json.dumps(full), str))
+check("/params carries stock so the console can show the conversion",
+      all(row["stock"] == main.TOWFISH_STOCK[row["name"]]
+          for row in full["params"] if row["name"] in main.TOWFISH_STOCK))
 
 # ---------------------------------------------------------------------------
 print()

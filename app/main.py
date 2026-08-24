@@ -585,65 +585,23 @@ PARAM_SPECS = [
                 "and the stall knee arrives at 23% of demand instead of "
                 "38%. 0 makes demand and deflection proportional.",
     },
-    {
-        "name": "MOT_PWM_MIN",
-        "vehicle": "towfish",
-        "default": 1100.0,
-        "unit": "us",
-        "decimals": 0,
-        "min": 1000.0,
-        "max": 1500.0,
-        "desc": "Low end of the range the mixer drives the wing servos "
-                "to. This overrides SERVO5/6_MIN, so the stock 1000 sends "
-                "the wings 100 us past the 1100 travel limit the servo "
-                "config declares -- mission 241 spent 5.5% of its samples "
-                "outside that limit, grinding the servos against their "
-                "stops for no extra lift.",
-    },
-    {
-        "name": "MOT_PWM_MAX",
-        "vehicle": "towfish",
-        "default": 1900.0,
-        "unit": "us",
-        "decimals": 0,
-        "min": 1500.0,
-        "max": 2100.0,
-        "desc": "High end of the mixer's wing servo range, and the other "
-                "half of the MOT_PWM_MIN problem: stock 2001 against a "
-                "declared SERVO5/6_MAX of 1900.",
-    },
-    {
-        "name": "MOT_HOVER_LEARN",
-        "vehicle": "towfish",
-        "default": 0.0,
-        "unit": "",
-        "decimals": 0,
-        "min": 0.0,
-        "max": 2.0,
-        "presets": [0.0, 1.0, 2.0],
-        "desc": "Whether the autopilot learns and saves the throttle that "
-                "holds depth. On an ROV that converges on a real constant. "
-                "On a towfish the equivalent trim moves with tow speed, "
-                "tether angle and depth, so the stock 2 (learn and save) "
-                "quietly writes a drifting feedforward to EEPROM that the "
-                "next mission inherits. 0 pins it; the mechanical trim "
-                "already lives in SERVO5_TRIM.",
-    },
-    {
-        "name": "MOT_THST_HOVER",
-        "vehicle": "towfish",
-        "default": 0.5,
-        "unit": "",
-        "decimals": 3,
-        "min": 0.1,
-        "max": 0.9,
-        "desc": "The throttle the controller assumes holds depth, and the "
-                "value MOT_HOVER_LEARN would otherwise keep rewriting. 0.5 "
-                "is mixer neutral, which on this fish is the passive glide "
-                "attitude that already holds about 5 m on its own. The "
-                "mechanical offset between the wings lives in SERVO5_TRIM "
-                "and does not belong here.",
-    },
+    # Deliberately not managed here, and worth recording why.
+    #
+    # MOT_PWM_MIN/MAX: narrowing these would cap wing deflection, but the
+    # servos take out-of-range PWM without complaint and there are no end
+    # stops to hit, so there is nothing to protect. It is only a blunt
+    # gain reduction, and it would cut roll authority (which needs up to
+    # 210 us at p99) along with the collective it was meant to limit.
+    # PILOT_SPEED_DN and PSC_D_POS_P limit the demand at the source
+    # instead.
+    #
+    # MOT_THST_HOVER / MOT_HOVER_LEARN: AC_PosControl really does add
+    # throttle_hover as a feedforward, so this matters, but mission 241
+    # held about -95 us of standing collective while level -- roughly
+    # 0.31, not the 0.5 that mixer neutral would imply. Pinning a value
+    # derived from one mission's tow speed would be worse than letting
+    # the autopilot keep learning it, so learning stays on until there is
+    # a measurement across several tow speeds to pin it to.
     {
         "name": "PSC_D_POS_P",
         "vehicle": "towfish",
@@ -719,6 +677,32 @@ PARAM_SPECS = [
                 "request the wings cannot fill.",
     },
 ]
+
+# What each towfish parameter was set to before conversion, read straight
+# off the vehicle's own mission 241 parameter dump (tools/param_audit.py).
+# These are the BlueROV2 values the frame was commissioned with, and the
+# setup console shows them beside each target so an operator can see what
+# the extension changed rather than having to trust that it changed the
+# right things. Not populated for the boat -- an ArduRover tow boat is not
+# being converted from anything, its targets are just survey preferences.
+TOWFISH_STOCK = {
+    "PILOT_SPEED_UP": 100.0,
+    "PILOT_SPEED_DN": 0.0,
+    "MOT_THST_EXPO": 0.65,
+    "PSC_D_POS_P": 3.0,
+    "PSC_JERK_D": 50.0,
+    "ATC_RAT_RLL_IMAX": 0.444,
+    "ATC_RATE_R_MAX": 0.0,
+    "ATC_RATE_P_MAX": 0.0,
+    "ATC_ANG_RLL_P": 3.0,
+    "ATC_RAT_RLL_D": 0.0004,
+    "ATC_RAT_RLL_FLTE": 5.0,
+    "ATC_RAT_RLL_FLTD": 2.0,
+}
+
+for _spec in PARAM_SPECS:
+    if _spec["name"] in TOWFISH_STOCK:
+        _spec["stock"] = TOWFISH_STOCK[_spec["name"]]
 
 PARAM_SPECS_BY_NAME = {spec["name"]: spec for spec in PARAM_SPECS}
 
@@ -8025,6 +8009,8 @@ def _param_snapshot():
                                     "min", "max", "desc")},
             "presets": spec.get("presets"),
             "default": spec["default"],
+            # The BlueROV2 value this target replaces, when there is one.
+            "stock": spec.get("stock"),
             "target": target,
             "current": current,
             "matches": _param_matches(spec, current, target),
