@@ -641,6 +641,27 @@
         }
         .pcard-conv .from { text-decoration: line-through; opacity: 0.7; }
         .pcard-conv .to { color: var(--amber); }
+        /* Shown when the saved target is not what this build recommends.
+           A stale config looks exactly like a deliberate edit, so say so
+           instead of applying it silently. */
+        .pcard-override {
+            font: 600 11px var(--mono);
+            letter-spacing: 0.04em;
+            color: var(--amber);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .pcard-override button {
+            font: 600 10px var(--mono);
+            letter-spacing: 0.08em;
+            background: transparent;
+            border: 1px solid var(--amber);
+            color: var(--amber);
+            border-radius: 3px;
+            padding: 1px 5px;
+            cursor: pointer;
+        }
         .pcard-target { display: flex; gap: 5px; align-items: center; }
         .pcard-target .unit {
             font-size: 12.5px;
@@ -1513,7 +1534,19 @@ function buildParamCard(p) {
     applyBtn.addEventListener('click', () => applyParams([p.name]));
     actions.append(presets, spacer, applyBtn);
 
-    card.append(head, desc, ...(conv ? [conv] : []), values, actions);
+    const override = document.createElement('div');
+    override.className = 'pcard-override';
+    override.style.display = 'none';
+    const overrideText = document.createElement('span');
+    const overrideBtn = document.createElement('button');
+    overrideBtn.textContent = 'USE RECOMMENDED';
+    overrideBtn.addEventListener('click', () => {
+        input.value = fmt(p.default, p.decimals);
+        commitTarget(p.name);
+    });
+    override.append(overrideText, overrideBtn);
+
+    card.append(head, desc, ...(conv ? [conv] : []), override, values, actions);
 
     input.addEventListener('input', () => {
         dirtyTargets[p.name] = input.value;
@@ -1524,7 +1557,8 @@ function buildParamCard(p) {
         if (e.key === 'Enter') { e.preventDefault(); commitTarget(p.name); }
     });
 
-    paramEls[p.name] = { card, badge, current, input, applyBtn, presetButtons };
+    paramEls[p.name] = { card, badge, current, input, applyBtn, presetButtons,
+                         override, overrideText };
     return card;
 }
 
@@ -1546,6 +1580,14 @@ function updateParamCard(p) {
     els.badge.className = 'badge' + (badgeClass ? ' ' + badgeClass : '');
     els.badge.textContent = badgeText;
     els.card.className = 'pcard' + (cardClass ? ' ' + cardClass : '');
+
+    if (els.override) {
+        els.override.style.display = p.overridden ? 'flex' : 'none';
+        if (p.overridden) {
+            els.overrideText.textContent =
+                `SAVED TARGET OVERRIDES RECOMMENDED ${fmt(p.default, p.decimals)}`;
+        }
+    }
 
     if (hasError) {
         els.current.className = 'pcard-current error';

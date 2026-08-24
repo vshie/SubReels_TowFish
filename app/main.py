@@ -734,6 +734,74 @@ def _sanitize_param_targets(raw):
     return targets
 
 
+# What a saved config's targets were reconciled against, so an upgrade
+# can tell an operator's deliberate value apart from a stale copy of an
+# older shipped recommendation. Populated at load; surfaced in /params.
+_param_supersessions = []
+
+
+def _reconcile_saved_targets(saved, saved_defaults):
+    """Merge a saved target map with the shipped recommendations.
+
+    Saving the full target map means a saved value shadows the shipped
+    default forever, so improving a recommendation has no effect on any
+    existing install. That is not theoretical: it is how a saved
+    ATC_RAT_RLL_D of 0 outlived a shipped 0.0072 and got written to the
+    vehicle as 0, leaving the fish with no roll rate damping at all.
+
+    The fix is to record, alongside the targets, the defaults they were
+    saved against. A saved value equal to the default of its day was
+    never touched by anyone, so the current default supersedes it; a
+    saved value that differs is a deliberate edit and survives.
+
+    Configs written before that bookkeeping existed carry no defaults to
+    compare against, so intent is unknowable. Those adopt the shipped
+    set -- the whole point of this parameter list is converting a stock
+    BlueROV2 to a towfish, and a half-applied conversion is worse than
+    either end of it -- and every value that lost is recorded in
+    :data:`_param_supersessions` so the operator can put back anything
+    that really was deliberate.
+    """
+    global _param_supersessions
+    targets = dict(DEFAULT_PARAM_TARGETS)
+    superseded = []
+    if not isinstance(saved, dict):
+        _param_supersessions = superseded
+        return targets
+
+    legacy = not isinstance(saved_defaults, dict)
+    clean = _sanitize_param_targets(saved)
+    for name, shipped in DEFAULT_PARAM_TARGETS.items():
+        if name not in saved:
+            continue
+        was = clean[name]
+        if abs(was - shipped) <= max(1e-4, abs(shipped) * 1e-3):
+            continue
+        prior = None if legacy else saved_defaults.get(name)
+        if prior is not None:
+            try:
+                prior = float(prior)
+            except (TypeError, ValueError):
+                prior = None
+        if prior is not None and abs(was - prior) > max(1e-4,
+                                                        abs(prior) * 1e-3):
+            # Differs from the default it was saved against: a real edit.
+            targets[name] = was
+            continue
+        superseded.append({"name": name, "saved": was, "shipped": shipped,
+                           "reason": "no saved baseline" if legacy
+                           else "was the shipped default at save time"})
+    _param_supersessions = superseded
+    if superseded:
+        logger.warning(
+            "Adopted shipped targets over %d saved value(s): %s",
+            len(superseded),
+            ", ".join(f"{s['name']} {s['saved']:g}->{s['shipped']:g}"
+                      for s in superseded),
+        )
+    return targets
+
+
 def _sanitize_tow_offset_m(raw, fallback=DEFAULT_TOW_OFFSET_M):
     """Coerce a saved/posted layback distance to a clamped float."""
     try:
@@ -939,6 +1007,7 @@ def load_config():
         "storage_preference": DEFAULT_STORAGE_PREFERENCE,
         "awb_loop_enabled": DEFAULT_AWB_LOOP_ENABLED,
         "param_targets": dict(DEFAULT_PARAM_TARGETS),
+        "param_target_defaults": dict(DEFAULT_PARAM_TARGETS),
         "tow_offset_m": DEFAULT_TOW_OFFSET_M,
         "tow_heading_source": DEFAULT_TOW_HEADING_SOURCE,
         "altitude_offset_m": DEFAULT_ALTITUDE_OFFSET_M,
@@ -971,8 +1040,11 @@ def load_config():
         defaults["storage_preference"] = DEFAULT_STORAGE_PREFERENCE
     defaults["awb_loop_enabled"] = bool(defaults.get("awb_loop_enabled",
                                                      DEFAULT_AWB_LOOP_ENABLED))
-    defaults["param_targets"] = _sanitize_param_targets(
-        defaults.get("param_targets"))
+    defaults["param_targets"] = _reconcile_saved_targets(
+        defaults.get("param_targets"), defaults.get("param_target_defaults"))
+    # Stamp the recommendations these targets were reconciled against so
+    # the next upgrade can tell a deliberate edit from a stale copy.
+    defaults["param_target_defaults"] = dict(DEFAULT_PARAM_TARGETS)
     defaults["tow_offset_m"] = _sanitize_tow_offset_m(
         defaults.get("tow_offset_m"))
     defaults["tow_heading_source"] = _sanitize_tow_heading_source(
@@ -1690,6 +1762,7 @@ def _persist_config():
         "storage_preference": storage_preference,
         "awb_loop_enabled": awb_loop_enabled,
         "param_targets": param_targets,
+        "param_target_defaults": dict(DEFAULT_PARAM_TARGETS),
         "tow_offset_m": tow_offset_m,
         "tow_heading_source": tow_heading_source,
         "altitude_offset_m": altitude_offset_m,
@@ -8011,6 +8084,13 @@ def _param_snapshot():
             "default": spec["default"],
             # The BlueROV2 value this target replaces, when there is one.
             "stock": spec.get("stock"),
+            # True when the saved target is not the shipped recommendation.
+            # Legitimate after a deliberate edit, but it is also what a
+            # stale config looks like, so the console says so out loud
+            # rather than quietly applying something we did not ship.
+            "overridden": (target is not None
+                           and _param_matches(spec, target,
+                                              spec["default"]) is False),
             "target": target,
             "current": current,
             "matches": _param_matches(spec, current, target),
@@ -8024,6 +8104,10 @@ def _param_snapshot():
         "params": params,
         "job": job,
         "links": links,
+        # Saved values the last config load dropped in favour of a newer
+        # shipped recommendation, so a deliberate setting that was lost
+        # on upgrade is recoverable rather than merely gone.
+        "superseded": list(_param_supersessions),
         "boat_url": f'http://{tow_vehicle_ip}/mavlink2rest',
         "boat_system_id": boat_sys,
         "boat_component_id": boat_comp,

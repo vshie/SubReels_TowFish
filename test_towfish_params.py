@@ -228,6 +228,78 @@ check("garbage input yields the full default map",
       main._sanitize_param_targets(None) == main.DEFAULT_PARAM_TARGETS)
 
 # ---------------------------------------------------------------------------
+print("\nsaved targets reconcile against the shipped recommendations")
+# ---------------------------------------------------------------------------
+
+# The bug this guards: the config persists the whole target map, so a
+# saved value used to shadow the shipped default forever. A saved
+# ATC_RAT_RLL_D of 0 outlived a shipped 0.0072 and was written to the
+# vehicle as 0, leaving no roll rate damping at all.
+SHIPPED = main.DEFAULT_PARAM_TARGETS
+
+# 1. Legacy config: no baseline, so intent is unknowable and the shipped
+#    set wins. This is the exact map that was on the vehicle.
+legacy = dict(SHIPPED)
+legacy.update({"ATC_ANG_RLL_P": 3.0, "ATC_RAT_RLL_D": 0.0,
+               "ATC_RAT_RLL_FLTE": 0.0, "ATC_RAT_RLL_FLTD": 2.0,
+               "TURN_RADIUS": 3.5})
+got = main._reconcile_saved_targets(legacy, None)
+check("legacy: stale roll targets do not survive",
+      got["ATC_RAT_RLL_D"] == SHIPPED["ATC_RAT_RLL_D"],
+      f"got {got['ATC_RAT_RLL_D']}")
+check("legacy: every shipped recommendation is adopted",
+      all(got[n] == SHIPPED[n] for n in SHIPPED),
+      "differs: " + ", ".join(n for n in SHIPPED if got[n] != SHIPPED[n]))
+sup = {s["name"]: s for s in main._param_supersessions}
+check("legacy: superseded values are recorded, not silently dropped",
+      set(sup) == {"ATC_ANG_RLL_P", "ATC_RAT_RLL_D", "ATC_RAT_RLL_FLTE",
+                   "ATC_RAT_RLL_FLTD", "TURN_RADIUS"},
+      str(sorted(sup)))
+check("legacy: a superseded record keeps the value that was lost",
+      sup["TURN_RADIUS"]["saved"] == 3.5
+      and sup["TURN_RADIUS"]["shipped"] == SHIPPED["TURN_RADIUS"])
+
+# 2. Config saved against a known baseline: a value equal to the default
+#    of its day was never edited, so a newer default supersedes it.
+prior = dict(SHIPPED)
+prior["ATC_RAT_RLL_D"] = 0.0001          # what we used to recommend
+saved = dict(SHIPPED)
+saved["ATC_RAT_RLL_D"] = 0.0001          # operator never touched it
+got = main._reconcile_saved_targets(saved, prior)
+check("untouched value adopts the newer recommendation",
+      got["ATC_RAT_RLL_D"] == SHIPPED["ATC_RAT_RLL_D"],
+      f"got {got['ATC_RAT_RLL_D']}")
+
+# 3. Same baseline, but the operator did edit it: that survives.
+saved = dict(SHIPPED)
+saved["ATC_RAT_RLL_D"] = 0.0055          # deliberate, differs from prior
+got = main._reconcile_saved_targets(saved, prior)
+check("deliberate edit survives an upgrade",
+      got["ATC_RAT_RLL_D"] == 0.0055, f"got {got['ATC_RAT_RLL_D']}")
+check("a surviving edit is not reported as superseded",
+      "ATC_RAT_RLL_D" not in {s["name"] for s in main._param_supersessions})
+
+# 4. An edit made against the current shipped set survives untouched.
+saved = dict(SHIPPED)
+saved["PILOT_SPEED_DN"] = 12.0
+got = main._reconcile_saved_targets(saved, dict(SHIPPED))
+check("edit against the current baseline survives",
+      got["PILOT_SPEED_DN"] == 12.0, f"got {got['PILOT_SPEED_DN']}")
+
+# 5. Out-of-envelope saved values are still clamped on the way through.
+saved = dict(SHIPPED)
+saved["PILOT_SPEED_DN"] = 9999.0
+got = main._reconcile_saved_targets(saved, dict(SHIPPED))
+check("a surviving edit is still clamped to the envelope",
+      got["PILOT_SPEED_DN"] == main.PARAM_SPECS_BY_NAME["PILOT_SPEED_DN"]["max"],
+      f"got {got['PILOT_SPEED_DN']}")
+
+check("no saved map at all yields the shipped set",
+      main._reconcile_saved_targets(None, None) == SHIPPED)
+check("nothing is reported superseded when there was nothing saved",
+      main._param_supersessions == [])
+
+# ---------------------------------------------------------------------------
 print("\nenforcement corrects drift")
 # ---------------------------------------------------------------------------
 
@@ -358,6 +430,27 @@ check("/params is JSON-serialisable", isinstance(json.dumps(full), str))
 check("/params carries stock so the console can show the conversion",
       all(row["stock"] == main.TOWFISH_STOCK[row["name"]]
           for row in full["params"] if row["name"] in main.TOWFISH_STOCK))
+check("/params exposes superseded saved values",
+      isinstance(full.get("superseded"), list))
+check("/params flags nothing as overridden when targets are the shipped set",
+      all(row["overridden"] is False for row in full["params"]),
+      "flagged: " + ", ".join(r["name"] for r in full["params"]
+                              if r["overridden"]))
+
+saved_targets = main.param_targets
+try:
+    main.param_targets = dict(main.DEFAULT_PARAM_TARGETS)
+    main.param_targets["PILOT_SPEED_DN"] = 11.0
+    with mock.patch.object(main, "_boat_vehicle_ids", return_value=(1, 1)):
+        drifted_snap = main._param_snapshot()
+    row = next(r for r in drifted_snap["params"]
+               if r["name"] == "PILOT_SPEED_DN")
+    check("a diverging saved target is flagged overridden",
+          row["overridden"] is True)
+    check("only the diverging one is flagged",
+          sum(1 for r in drifted_snap["params"] if r["overridden"]) == 1)
+finally:
+    main.param_targets = saved_targets
 
 # ---------------------------------------------------------------------------
 print()
