@@ -1,6 +1,6 @@
 [project]
 name = "subreels_towfish"
-version = "1.0.0"
+version = "0.99"
 description = "SubReels: TowFish -- towed-body video survey extension for BlueOS"
 classifiers = [
     "Programming Language :: Python :: 3",

@@ -669,6 +669,89 @@ def _effective_depth_ceiling_m():
     return max(SURF_MAX_DEPTH_MIN_M, ceiling)
 
 
+# ── Optics defaults + user-named presets ─────────────────────────────────
+# The widget's OPTICS PRESETS section persists two things through /config:
+#
+#   optics_default  {zoom_pct, focus_pct}
+#       Applied on extension boot after the tilt-down/zoom-out kick, so a
+#       cold container comes up on the operator's chosen survey rig without
+#       an extra button press. Seeded from the last mission's survey mark
+#       (SERVO11=935, SERVO12=1637 -- the same 61.03 % commanded by the
+#       earlier SNAP TO TRIM path).
+#
+#   optics_presets  [{name, zoom_pct, focus_pct}, ...]
+#       Named zoom/focus combinations the operator saves from the widget.
+#       Each chip in the CAM panel maps to one entry; clicking the chip
+#       fires both channels back to those percentages.
+#
+# Percentages (0..100) rather than raw PWMs, matching the range the
+# /optics/focus and /optics/zoom endpoints already speak.
+DEFAULT_OPTICS_DEFAULT = {"zoom_pct": 0.0, "focus_pct": 61.03}
+DEFAULT_OPTICS_PRESETS = [
+    {"name": "SURVEY", "zoom_pct": 0.0, "focus_pct": 61.03},
+]
+_OPTICS_PRESET_NAME_MAX = 16
+# Widget renders each chip as a full-height pill with a delete affordance;
+# more than four crowds the CAM tab and starts to wrap. The sanitizer drops
+# excess entries silently, and the widget's SAVE CURRENT button greys out
+# once this ceiling is hit so it also serves as visible feedback.
+_OPTICS_PRESET_LIST_MAX = 4
+
+
+def _clamp_pct(value, fallback):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if v != v or v in (float("inf"), float("-inf")):
+        return float(fallback)
+    return float(max(0.0, min(100.0, v)))
+
+
+def _sanitize_optics_default(raw):
+    if not isinstance(raw, dict):
+        return dict(DEFAULT_OPTICS_DEFAULT)
+    return {
+        "zoom_pct":  _clamp_pct(raw.get("zoom_pct"),  DEFAULT_OPTICS_DEFAULT["zoom_pct"]),
+        "focus_pct": _clamp_pct(raw.get("focus_pct"), DEFAULT_OPTICS_DEFAULT["focus_pct"]),
+    }
+
+
+def _sanitize_optics_presets(raw):
+    """Whitelist the list into ``{name, zoom_pct, focus_pct}`` entries.
+
+    - name is trimmed, upper-cased and clipped so a rogue string cannot
+      wallpaper the button row;
+    - percentages are clamped to 0..100 through :func:`_clamp_pct`;
+    - duplicate names collapse to the last-writer entry, so a widget
+      "save current" over an existing chip just updates it in place;
+    - the list is capped at :data:`_OPTICS_PRESET_LIST_MAX` chips so a
+      runaway saver cannot overflow the panel.
+    """
+    if not isinstance(raw, list):
+        return [dict(p) for p in DEFAULT_OPTICS_PRESETS]
+    out = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip().upper()[:_OPTICS_PRESET_NAME_MAX]
+        if not name:
+            continue
+        preset = {
+            "name": name,
+            "zoom_pct":  _clamp_pct(entry.get("zoom_pct"),  DEFAULT_OPTICS_DEFAULT["zoom_pct"]),
+            "focus_pct": _clamp_pct(entry.get("focus_pct"), DEFAULT_OPTICS_DEFAULT["focus_pct"]),
+        }
+        if name in seen:
+            out = [p for p in out if p["name"] != name]
+        seen.add(name)
+        out.append(preset)
+        if len(out) >= _OPTICS_PRESET_LIST_MAX:
+            break
+    return out
+
+
 def load_config():
     """Load persisted configuration from disk, returning defaults on failure."""
     defaults = {
@@ -690,6 +773,8 @@ def load_config():
         "surf_full_scale_error_m": DEFAULT_SURF_FULL_SCALE_ERROR_M,
         "surf_max_depth_m": DEFAULT_SURF_MAX_DEPTH_M,
         "tether_length_m": DEFAULT_TETHER_LENGTH_M,
+        "optics_default": dict(DEFAULT_OPTICS_DEFAULT),
+        "optics_presets": [dict(p) for p in DEFAULT_OPTICS_PRESETS],
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -730,6 +815,8 @@ def load_config():
         defaults.get("surf_max_depth_m"))
     defaults["tether_length_m"] = _sanitize_tether_length_m(
         defaults.get("tether_length_m"))
+    defaults["optics_default"] = _sanitize_optics_default(defaults.get("optics_default"))
+    defaults["optics_presets"] = _sanitize_optics_presets(defaults.get("optics_presets"))
     return defaults
 
 def save_config(cfg):
@@ -1413,6 +1500,8 @@ surf_deadband_m = _cfg["surf_deadband_m"]
 surf_full_scale_error_m = _cfg["surf_full_scale_error_m"]
 surf_max_depth_m = _cfg["surf_max_depth_m"]
 tether_length_m = _cfg["tether_length_m"]
+optics_default = _cfg["optics_default"]
+optics_presets = _cfg["optics_presets"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -1435,6 +1524,8 @@ def _persist_config():
         "surf_full_scale_error_m": surf_full_scale_error_m,
         "surf_max_depth_m": surf_max_depth_m,
         "tether_length_m": tether_length_m,
+        "optics_default": optics_default,
+        "optics_presets": optics_presets,
     })
 
 # Recording-storage state
@@ -4076,7 +4167,7 @@ def register_service():
         "description": "Towed-body video survey: RTSP recording, geotagged 2 Hz stills, and mission-triggered transect capture",
         "icon": "mdi-fish",
         "company": "Blue Robotics",
-        "version": "1.0.0",
+        "version": "0.99",
         "webpage": "https://github.com/vshie/SubReels_TowFish",
         "api": "https://github.com/bluerobotics/BlueOS-docker"
     }
@@ -4090,6 +4181,7 @@ def config():
     global jog_up_pwm, jog_down_pwm
     global surf_target_altitude_m, surf_deadband_m, surf_full_scale_error_m
     global surf_max_depth_m, tether_length_m
+    global optics_default, optics_presets
 
     if request.method == 'POST':
         # The AWB-loop toggle is safe to change while a mode is active
@@ -4110,6 +4202,11 @@ def config():
             "surf_full_scale_error_m",
             "surf_max_depth_m",
             "tether_length_m",
+            # Optics presets are just persisted numbers -- saving a chip
+            # or overwriting the boot default has no effect on the running
+            # recorder, so they can be updated mid-survey.
+            "optics_default",
+            "optics_presets",
         }
         touches_only_live_editable = (
             bool(data) and set(data.keys()) <= _live_editable_keys
@@ -4314,6 +4411,19 @@ def config():
             tether_length_m = _sanitize_tether_length_m(v)
             changed = True
 
+        # Optics defaults + user presets. Both accept whole-object writes
+        # from the widget; ``_sanitize_*`` clamps pcts and drops junk, so
+        # a bad payload cannot poison the CAM tab's chip row.
+        new_optics_default = data.get('optics_default')
+        if new_optics_default is not None:
+            optics_default = _sanitize_optics_default(new_optics_default)
+            changed = True
+
+        new_optics_presets = data.get('optics_presets')
+        if new_optics_presets is not None:
+            optics_presets = _sanitize_optics_presets(new_optics_presets)
+            changed = True
+
         if not changed:
             return jsonify({"success": False, "message": "No valid fields provided"}), 400
 
@@ -4353,6 +4463,8 @@ def config():
                         "surf_full_scale_error_m": surf_full_scale_error_m,
                         "surf_max_depth_m": surf_max_depth_m,
                         "tether_length_m": tether_length_m,
+                        "optics_default": optics_default,
+                        "optics_presets": optics_presets,
                         "depth_ceiling_m": round(_effective_depth_ceiling_m(), 2)})
 
     resp = jsonify({
@@ -4395,6 +4507,8 @@ def config():
         "tether_length_max_m": TETHER_LENGTH_MAX_M,
         "tether_safe_scope_frac": TETHER_SAFE_SCOPE_FRAC,
         "depth_ceiling_m": round(_effective_depth_ceiling_m(), 2),
+        "optics_default": optics_default,
+        "optics_presets": optics_presets,
     })
     resp.headers['Cache-Control'] = 'no-store'
     return resp
@@ -6779,22 +6893,28 @@ _STARTUP_OPTICS_RETRY_S = 3.0
 
 
 def _startup_optics_worker() -> None:
-    """After Flask boots, drive tilt down + zoom Out once.
+    """After Flask boots, seat tilt + the saved default zoom / focus.
 
     mavlink2rest may not be ready the instant the container starts, so
     retry a bounded number of times with a short sleep between tries.
-    Focus is intentionally left at the vehicle-configured trim.
+    The default zoom + focus percentages come from the persisted
+    ``optics_default`` config (widget's SET DEFAULT button); this makes
+    a cold container come up on the operator's chosen survey rig, just
+    like MAX TILT DOWN reseats the mount.
     """
     writer = get_default_writer()
-    logger.info("Startup optics init: tilt=DOWN, zoom=OUT")
+    default = _sanitize_optics_default(optics_default)
+    logger.info("Startup optics init: tilt=DOWN, zoom_pct=%.2f, focus_pct=%.2f",
+                default["zoom_pct"], default["focus_pct"])
     for attempt in range(1, _STARTUP_OPTICS_MAX_ATTEMPTS + 1):
-        ok_tilt = writer.tilt_down()
-        ok_zoom = writer.set_camera_zoom_range(ZOOM_PRESETS_PCT["out"])
-        if ok_tilt and ok_zoom:
+        ok_tilt  = writer.tilt_down()
+        ok_zoom  = writer.set_camera_zoom_range(default["zoom_pct"])
+        ok_focus = writer.set_camera_focus_range(default["focus_pct"])
+        if ok_tilt and ok_zoom and ok_focus:
             logger.info("Startup optics init succeeded on attempt %d", attempt)
             return
-        logger.debug("Startup optics attempt %d: tilt=%s zoom=%s",
-                     attempt, ok_tilt, ok_zoom)
+        logger.debug("Startup optics attempt %d: tilt=%s zoom=%s focus=%s",
+                     attempt, ok_tilt, ok_zoom, ok_focus)
         time.sleep(_STARTUP_OPTICS_RETRY_S)
     logger.warning("Startup optics init gave up after %d attempts",
                    _STARTUP_OPTICS_MAX_ATTEMPTS)
@@ -6983,17 +7103,37 @@ def optics_focus():
 
 @app.route('/optics/zoom', methods=['POST'])
 def optics_zoom():
-    """One of the three verified zoom presets (out / half / full)."""
+    """Absolute zoom RANGE.
+
+    Body accepts either ``{"preset": "out" | "half" | "full"}`` (the three
+    verified radcam presets) or ``{"pct": <0..100>}`` for an arbitrary
+    RANGE -- used by the OPTICS PRESETS chips to jump zoom + focus back
+    to a saved rig without needing new HTTP verbs.
+    """
     data = request.get_json(silent=True) or {}
     preset = str(data.get('preset', '')).strip().lower()
-    if preset not in ZOOM_PRESETS_PCT:
-        return jsonify({
-            "success": False,
-            "message": f"preset must be one of {sorted(ZOOM_PRESETS_PCT)}",
-        }), 400
-    pct = ZOOM_PRESETS_PCT[preset]
+    if preset:
+        if preset not in ZOOM_PRESETS_PCT:
+            return jsonify({
+                "success": False,
+                "message": f"preset must be one of {sorted(ZOOM_PRESETS_PCT)}",
+            }), 400
+        pct = ZOOM_PRESETS_PCT[preset]
+    elif 'pct' in data:
+        try:
+            pct = float(data['pct'])
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "pct must be a number"}), 400
+        pct = max(0.0, min(100.0, pct))
+    else:
+        return jsonify({"success": False,
+                        "message": "preset or pct required"}), 400
     ok = get_default_writer().set_camera_zoom_range(pct)
-    return jsonify({"success": ok, "preset": preset, "pct": pct}), (200 if ok else 502)
+    return jsonify({
+        "success": ok,
+        "preset": preset or None,
+        "pct": round(pct, 2),
+    }), (200 if ok else 502)
 
 
 @app.route('/optics/awb', methods=['POST'])

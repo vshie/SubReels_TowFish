@@ -3,48 +3,64 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Towfish MFD</title>
+    <title>TowFish</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
     <style>
+        /*
+         * Compact TowFish MFD.
+         *
+         * Neon-on-black flight-control interface: pure black background,
+         * thin phosphor-green structural rules, one title size and one
+         * label size. Status colours are reserved for meaning: amber for
+         * tuned input / warnings, red for armed / recording, sky for the
+         * boat sonar / surf-track setpoint, phosphor otherwise. Every
+         * DOM id the poller writes to is preserved from the previous
+         * widget so app/static/widget.html JS keeps working.
+         */
         :root {
-            --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular,
-                    Menlo, Consolas, 'DejaVu Sans Mono', monospace;
-            --panel: #0d1310;
-            --panel-edge: #1f2a25;
-            --panel-inset: #060a08;
-            --bezel: #1a1e1c;
-            --bezel-highlight: #2a2e2c;
-            --phosphor: #7cf29c;
+            --mono:      'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular,
+                         Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+            --display:   'Share Tech Mono', var(--mono);
+            --bg:        #000;
+            --panel:     #050807;
+            --panel-2:   #080d0b;
+            --panel-3:   #0a1210;
+            --stroke:    rgba(124, 242, 156, 0.28);
+            --stroke-hi: rgba(124, 242, 156, 0.55);
+            --stroke-lo: rgba(124, 242, 156, 0.12);
+            --phosphor:  #7cf29c;
             --phosphor-dim: #3f8a53;
             --phosphor-glow: rgba(124, 242, 156, 0.35);
-            --amber: #f2b34c;
+            --amber:     #f2b34c;
             --amber-glow: rgba(242, 179, 76, 0.4);
-            --red: #ef5350;
-            --red-glow: rgba(239, 83, 80, 0.45);
-            --sky: #6ec6ff;
-            --sky-glow: rgba(110, 198, 255, 0.35);
-            --off: #6b7d76;
-            --ink: #e6f2ec;
-            /* Secondary text was #8fa89d, dim enough that labels and
-               hints read as noise against the dark panels. */
-            --ink-dim: #a9c2b6;
-            /* Section headings get their own hue so structure is visible
-               at a glance. Deliberately not phosphor/amber/red, which all
-               carry status meaning elsewhere in this widget. */
-            --title: #7fe9ff;
-            --title-glow: rgba(127, 233, 255, 0.45);
+            --red:       #ef5350;
+            --red-glow:  rgba(239, 83, 80, 0.45);
+            --sky:       #6ec6ff;
+            --sky-glow:  rgba(110, 198, 255, 0.35);
+            --off:       #4a5a54;
+            --ink:       #d7f0e0;
+            --ink-dim:   #7ea393;
+
+            --lbl:       10.5px;
+            --title:     12px;
+            --body:      12px;
+            --value-md:  18px;
+            --value-lg:  22px;
+            --pad:       6px;
+            --gap:       6px;
+            --radius:    3px;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { height: 100%; }
         body {
             font-family: var(--mono);
-            font-size: 13px;
+            font-size: var(--body);
             color: var(--ink);
-            background:
-                radial-gradient(1200px 800px at 30% -10%, #0a1a15 0%, #050807 60%, #030503 100%);
+            background: var(--bg);
             min-height: 100vh;
             padding: 10px;
             display: flex;
@@ -52,413 +68,372 @@
             align-items: flex-start;
             letter-spacing: 0.02em;
         }
-
         .mfd {
             width: 100%;
             max-width: 360px;
-            border-radius: 14px;
-            padding: 12px;
-            background:
-                linear-gradient(180deg, var(--bezel-highlight) 0%, var(--bezel) 4%, #111512 96%, #0b0d0c 100%);
-            box-shadow:
-                inset 0 1px 0 rgba(255,255,255,0.05),
-                inset 0 -1px 0 rgba(0,0,0,0.4),
-                0 12px 30px rgba(0,0,0,0.65),
-                0 0 0 1px #050807;
+            background: var(--bg);
+            border: 1px solid var(--stroke);
+            border-radius: 6px;
+            padding: 8px;
+            box-shadow: 0 0 24px rgba(124, 242, 156, 0.05);
         }
 
+        /* --- Header ----------------------------------------------------- */
         .brand {
             display: flex;
             align-items: baseline;
             justify-content: space-between;
-            padding: 2px 4px 8px 4px;
+            padding: 0 2px 4px;
+            border-bottom: 1px solid var(--stroke-lo);
         }
         .brand .name {
-            font-family: 'Orbitron', var(--mono);
-            font-weight: 800;
-            font-size: 17px;
-            letter-spacing: 0.26em;
-            color: var(--ink);
-            text-shadow: 0 0 6px rgba(215,229,223,0.15);
+            font-family: var(--display);
+            font-weight: 400;
+            font-size: 15px;
+            letter-spacing: 0.22em;
+            color: var(--phosphor);
+            text-shadow: 0 0 6px var(--phosphor-glow);
         }
-        .brand .sub {
-            font-size: 11.5px;
-            font-weight: 500;
-            letter-spacing: 0.18em;
+        .brand .ver {
+            font-size: var(--lbl);
+            letter-spacing: 0.14em;
             color: var(--ink-dim);
         }
 
-        .screen {
-            background:
-                radial-gradient(120% 90% at 50% 0%, #0d1a15 0%, #060a08 55%, #040705 100%);
-            border-radius: 8px;
-            border: 1px solid var(--panel-edge);
-            padding: 10px;
-            box-shadow:
-                inset 0 0 24px rgba(0,0,0,0.7),
-                inset 0 0 0 1px rgba(255,255,255,0.02);
-            position: relative;
-            overflow: hidden;
-        }
-        /* Faint scanlines to sell the CRT look */
-        .screen::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: repeating-linear-gradient(
-                0deg,
-                rgba(0,0,0,0.14) 0px,
-                rgba(0,0,0,0.14) 1px,
-                transparent 1px,
-                transparent 3px
-            );
-            pointer-events: none;
-        }
-        .screen > * { position: relative; z-index: 1; }
-
-        /* --- Tab strip -------------------------------------------------- */
-        .tabs {
+        /* Depth + time header section: three peer cells in one row.
+           Left cells stack their label vertically (WATER over DEPTH /
+           FISH over DEPTH) with the numeric readout to the right at
+           the full two-line height, so at a glance the row reads as
+           three big instruments rather than four tiny lines of text.
+           The clock + sync-source chip sit on the far right as before. */
+        .head-row {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 4px;
-            padding: 3px;
-            background: var(--panel-inset);
-            border-radius: 6px;
-            border: 1px solid #0a120e;
-            margin-bottom: 8px;
+            grid-template-columns: 1fr 1fr auto;
+            gap: 10px;
+            align-items: center;
+            padding: 6px 4px;
+            border-top: 1px solid var(--stroke-lo);
+            border-bottom: 1px solid var(--stroke-lo);
         }
-        .tab {
-            background: transparent;
-            color: var(--phosphor-dim);
-            border: 1px solid transparent;
-            padding: 7px 0;
-            font: 700 12.5px var(--mono);
+        .depth-cell {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            gap: 5px;
+            min-width: 0;
+        }
+        .depth-cell .lbl-stack {
+            display: flex;
+            flex-direction: column;
+            line-height: 1.05;
+            font-size: var(--lbl);
+            font-weight: 700;
             letter-spacing: 0.14em;
-            cursor: pointer;
-            border-radius: 4px;
-            transition: color 0.15s, background 0.15s, box-shadow 0.15s;
+            color: var(--ink-dim);
         }
-        .tab.active {
-            color: var(--phosphor);
-            background: linear-gradient(180deg, #10231a 0%, #0a1912 100%);
-            box-shadow:
-                inset 0 0 0 1px #1f4a34,
-                0 0 8px var(--phosphor-glow);
-            text-shadow: 0 0 5px var(--phosphor-glow);
+        .depth-cell .lbl-stack span { display: block; }
+        .depth-cell .val {
+            font-family: var(--display);
+            font-size: var(--value-lg);
+            line-height: 1;
+            letter-spacing: 0.02em;
+            text-align: right;
         }
-        .tab:hover:not(.active) { color: var(--phosphor); }
+        .depth-cell .unit {
+            font-size: 10.5px;
+            color: var(--ink-dim);
+            letter-spacing: 0.06em;
+            align-self: end;
+            padding-bottom: 2px;
+        }
+        .depth-cell.water .val { color: var(--phosphor); text-shadow: 0 0 6px var(--phosphor-glow); }
+        .depth-cell.fish  .val { color: var(--sky);      text-shadow: 0 0 6px var(--sky-glow); }
+        .depth-cell .val.dim  { color: var(--ink-dim);  text-shadow: none; }
+        .depth-cell .val.warn { color: var(--amber);    text-shadow: 0 0 6px var(--amber-glow); }
 
-        /* --- Persistent status strip ------------------------------------ */
-        .strip {
+        .clock {
+            display: grid;
+            grid-template-rows: auto auto;
+            row-gap: 2px;
+            align-content: center;
+            justify-items: end;
+        }
+        .clock .t {
+            font-family: var(--display);
+            font-size: 15px;
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
+            letter-spacing: 0.06em;
+        }
+        .clock .src {
+            font-size: var(--lbl);
+            color: var(--phosphor-dim);
+            border: 1px solid var(--stroke-lo);
+            padding: 1px 6px;
+            border-radius: 2px;
+            letter-spacing: 0.14em;
+        }
+        .clock .src.sync-boat { color: var(--phosphor); border-color: var(--stroke); }
+        .clock .src.sync-pi   { color: var(--sky);      border-color: rgba(110, 198, 255, 0.3); }
+        .clock .src.sync-off  { color: var(--amber);    border-color: rgba(242, 179, 76, 0.35); }
+
+        /* Lamps row: SAFE / ARMED  --  Mode: XX  --  IDLE / REC / TL / XT */
+        .lamps {
             display: grid;
             grid-template-columns: auto 1fr auto;
             gap: 8px;
             align-items: center;
-            padding: 6px 8px;
-            background: var(--panel-inset);
-            border: 1px solid #0a120e;
-            border-radius: 6px;
-            margin-bottom: 8px;
-            font-size: 12.5px;
+            padding: 5px 2px;
+            border-bottom: 1px solid var(--stroke-lo);
         }
-        .lamp {
+        .lamp, .rec-lamp {
             display: inline-flex;
             align-items: center;
-            gap: 6px;
-            padding: 3px 8px;
-            border-radius: 3px;
-            background: #050807;
-            border: 1px solid #0d1310;
+            gap: 5px;
+            padding: 2px 6px;
+            border: 1px solid var(--stroke-lo);
+            border-radius: 2px;
+            font-size: var(--lbl);
             font-weight: 700;
-            letter-spacing: 0.08em;
+            letter-spacing: 0.14em;
             color: var(--off);
+            background: var(--bg);
         }
-        .lamp .dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
+        .lamp .dot, .rec-lamp .dot {
+            width: 6px; height: 6px; border-radius: 50%;
             background: var(--off);
-            box-shadow: none;
         }
-        .lamp.armed { color: var(--red); }
-        .lamp.armed .dot {
-            background: var(--red);
-            box-shadow: 0 0 8px var(--red-glow);
-            animation: pulse 1.6s ease-in-out infinite;
-        }
-        .lamp.disarmed { color: var(--phosphor-dim); }
-        .lamp.disarmed .dot { background: var(--phosphor-dim); }
+        .lamp.disarmed    { color: var(--phosphor); border-color: var(--stroke); }
+        .lamp.disarmed .dot { background: var(--phosphor); box-shadow: 0 0 5px var(--phosphor-glow); }
+        .lamp.armed       { color: var(--red);      border-color: rgba(239, 83, 80, 0.4); }
+        .lamp.armed .dot  { background: var(--red);      box-shadow: 0 0 6px var(--red-glow); animation: pulse 1.4s ease-in-out infinite; }
+        .rec-lamp.video   { color: var(--red);      border-color: rgba(239, 83, 80, 0.4); }
+        .rec-lamp.video .dot { background: var(--red); box-shadow: 0 0 6px var(--red-glow); animation: pulse 1.1s ease-in-out infinite; }
+        .rec-lamp.timelapse { color: var(--amber);  border-color: rgba(242, 179, 76, 0.4); }
+        .rec-lamp.timelapse .dot { background: var(--amber); box-shadow: 0 0 6px var(--amber-glow); animation: pulse 1.1s ease-in-out infinite; }
+        .rec-lamp.transect  { color: var(--sky);    border-color: rgba(110, 198, 255, 0.35); }
+        .rec-lamp.transect .dot { background: var(--sky); box-shadow: 0 0 6px var(--sky-glow); animation: pulse 1.4s ease-in-out infinite; }
+        .rec-lamp.armed-transect { color: var(--amber); border-color: rgba(242, 179, 76, 0.4); }
+        .rec-lamp.armed-transect .dot { background: var(--amber); box-shadow: 0 0 6px var(--amber-glow); animation: pulse 1.8s ease-in-out infinite; }
 
-        .mode-readout {
-            text-align: center;
+        .mode-wrap {
+            display: inline-flex;
+            gap: 5px;
+            align-items: baseline;
+            justify-content: center;
+            font-size: var(--title);
             font-weight: 700;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.14em;
+        }
+        .mode-wrap .mode-key {
+            font-weight: 500;
+            letter-spacing: 0.12em;
+            color: var(--ink-dim);
+        }
+        .mode-readout {
             color: var(--phosphor);
             text-shadow: 0 0 4px var(--phosphor-glow);
-            font-size: 13.5px;
         }
         .mode-readout.unknown { color: var(--ink-dim); text-shadow: none; }
 
-        .rec-lamp {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 3px 8px;
-            border-radius: 3px;
-            background: #050807;
-            border: 1px solid #0d1310;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-            color: var(--off);
-        }
-        .rec-lamp .dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: var(--off);
-        }
-        .rec-lamp.video { color: var(--red); }
-        .rec-lamp.video .dot { background: var(--red); box-shadow: 0 0 8px var(--red-glow); animation: pulse 1.2s infinite; }
-        .rec-lamp.timelapse { color: var(--amber); }
-        .rec-lamp.timelapse .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber-glow); animation: pulse 1.2s infinite; }
-        .rec-lamp.transect { color: var(--sky); }
-        .rec-lamp.transect .dot { background: var(--sky); box-shadow: 0 0 8px var(--sky-glow); animation: pulse 1.2s infinite; }
-        .rec-lamp.armed-transect { color: var(--amber); }
-        .rec-lamp.armed-transect .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber-glow); animation: pulse 1.8s ease-in-out infinite; }
-
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-        /* Optics micro-readouts on the status strip */
-        .strip-mini {
-            grid-column: 1 / -1;
+        /* Mini payload strip -- tight to the lamps row above; bold labels
+           so the four columns read as a scan line, not a paragraph. */
+        .mini {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 6px;
-            padding-top: 6px;
-            border-top: 1px dashed #16221c;
-            margin-top: 6px;
-            font-size: 12px;
-            font-weight: 500;
+            gap: 4px;
+            padding: 3px 0 3px;
+            border-bottom: 1px solid var(--stroke-lo);
         }
-        .strip-mini .cell {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 2px;
-        }
-        .strip-mini .label {
+        .mini .cell { text-align: center; }
+        .mini .lbl {
+            font-size: var(--lbl);
+            letter-spacing: 0.16em;
+            font-weight: 700;
             color: var(--ink-dim);
-            letter-spacing: 0.12em;
-            font-size: 10.5px;
-            font-weight: 500;
         }
-        .strip-mini .value {
+        .mini .val {
+            font-family: var(--display);
+            font-size: 13px;
             color: var(--phosphor);
             text-shadow: 0 0 4px var(--phosphor-glow);
             letter-spacing: 0.03em;
         }
-        .strip-mini .value.dim {
+        .mini .val.dim, .mini .value.dim { color: var(--ink-dim); text-shadow: none; }
+        .mini .sub {
+            font-size: 10px;
             color: var(--ink-dim);
-            text-shadow: none;
-        }
-
-        /* Always-visible depth band: towfish baro depth + boat Ping sonar */
-        .strip-depth {
-            grid-column: 1 / -1;
-            display: flex;
-            align-items: stretch;
-            justify-content: space-around;
-            gap: 8px;
-            padding: 6px 4px 2px;
-            margin-top: 6px;
-            border-top: 1px dashed #16221c;
-        }
-        .depth-cell {
-            display: flex;
-            align-items: baseline;
-            gap: 6px;
-            flex: 1;
-            justify-content: center;
-        }
-        .depth-cell + .depth-cell {
-            border-left: 1px dashed #16221c;
-        }
-        .strip-depth .dlabel {
-            font-size: 11.5px;
-            font-weight: 500;
-            letter-spacing: 0.12em;
-            color: var(--ink-dim);
-        }
-        .strip-depth .dvalue {
-            font: 800 24px 'Orbitron', var(--mono);
-            line-height: 1;
-            color: var(--sky);
-            text-shadow: 0 0 8px var(--sky-glow);
             letter-spacing: 0.04em;
         }
-        /* Ping sonar reads in phosphor green to set it apart from the
-           sky-blue towfish depth. */
-        .depth-cell.ping .dvalue { color: var(--phosphor); text-shadow: 0 0 8px var(--phosphor-glow); }
-        .strip-depth .dvalue.dim { color: var(--ink-dim); text-shadow: none; }
-        .strip-depth .dvalue.warn { color: var(--amber); text-shadow: 0 0 8px var(--amber-glow); }
-        .strip-depth .dunit {
-            font-size: 12.5px;
-            font-weight: 700;
-            letter-spacing: 0.1em;
-            color: var(--ink-dim);
-        }
-        /* Depth-jog activity flag -- always visible so the operator sees
-           the simulated pilot input regardless of which tab is open.
+        /* Duration cell shares the mini's value slot but tints red while
+           recording -- classes toggled by the poller. */
+        .mini .duration            { color: var(--phosphor); text-shadow: 0 0 4px var(--phosphor-glow); }
+        .mini .duration.dim        { color: var(--ink-dim);  text-shadow: none; }
+        .mini .duration.active     { color: var(--red);      text-shadow: 0 0 4px var(--red-glow); }
+        .mini .duration.active.timelapse { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
+        .mini .duration.active.transect  { color: var(--sky);   text-shadow: 0 0 4px var(--sky-glow); }
 
-           The flag lives inside a depth cell, so its box is load-bearing:
-           anything that makes it taller grows the status strip and shoves
-           every panel below it down, out from under the finger holding a
-           jog button. It only has the cell's leftover width, so a longer
-           label wrapped to three lines and moved the buttons 14px. Hence
-           nowrap here and a constant-length label in the render loop. */
-        .jog-flag {
-            margin-left: 6px;
-            font-size: 12.5px;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-            padding: 2px 7px;
-            border-radius: 3px;
-            border: 1px solid transparent;
-            color: var(--off);
-            visibility: hidden;
-            white-space: nowrap;
-            text-align: center;
+        /* Tabs */
+        .tabs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+            margin-top: 2px;
+            border-bottom: 1px solid var(--stroke);
         }
-        .jog-flag.up, .jog-flag.down {
-            visibility: visible;
-            color: var(--amber);
-            border-color: #4a3a16;
-            background: #191207;
-            text-shadow: 0 0 6px var(--amber-glow);
-            animation: pulse 0.9s ease-in-out infinite;
+        .tab {
+            background: transparent;
+            color: var(--phosphor-dim);
+            border: none;
+            padding: 6px 0 5px;
+            font: 700 var(--title) var(--mono);
+            letter-spacing: 0.24em;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }
+        .tab.active {
+            color: var(--phosphor);
+            text-shadow: 0 0 5px var(--phosphor-glow);
+            border-bottom-color: var(--phosphor);
         }
 
-        /* --- Panels & rows ---------------------------------------------- */
+        /* Panels are stacked in the same grid cell so both contribute to
+           the widget's height. Whichever tab is taller sets the container
+           size; the hidden panel keeps its layout so switching tabs never
+           resizes the widget. */
+        .panels {
+            display: grid;
+            grid-template-areas: "stack";
+            padding-top: 6px;
+        }
         .panel {
-            display: none;
+            grid-area: stack;
+            display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 6px;
+            visibility: hidden;
+            pointer-events: none;
         }
-        .panel.active { display: flex; }
+        .panel.active {
+            visibility: visible;
+            pointer-events: auto;
+        }
+        /* Align stacked panels to the top of the grid cell -- otherwise
+           the shorter panel would centre inside the taller one's height. */
+        .panels > .panel { align-self: start; width: 100%; }
 
         .section {
-            background:
-                linear-gradient(180deg, #0a1611 0%, #06100c 100%);
-            border: 1px solid #16221c;
-            border-radius: 6px;
-            padding: 8px;
+            border: 1px solid var(--stroke-lo);
+            border-radius: var(--radius);
+            padding: 6px 7px 7px;
+            background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
         }
         .section-title {
-            position: relative;
-            font-size: 14px;
-            font-weight: 700;
-            letter-spacing: 0.16em;
-            color: var(--title);
-            text-shadow: 0 0 8px var(--title-glow);
-            margin-bottom: 7px;
-            padding-left: 10px;
-            padding-bottom: 5px;
-            border-bottom: 1px solid #1b2f33;
             display: flex;
             justify-content: space-between;
             align-items: baseline;
-        }
-        /* Accent bar so each panel's heading is findable at a glance on a
-           small MFD, not just a differently-coloured line of text. These
-           headings hold bare text rather than a wrapping span, so the bar
-           is positioned against the title box itself; as a flex item it
-           would be pushed away from the text by space-between. */
-        .section-title::before {
-            content: '';
-            position: absolute;
-            left: 0;
-            top: 0.15em;
-            width: 3px;
-            height: 0.95em;
-            border-radius: 2px;
-            background: var(--title);
-            box-shadow: 0 0 6px var(--title-glow);
+            padding-bottom: 4px;
+            margin-bottom: 6px;
+            border-bottom: 1px solid var(--stroke-lo);
+            font-size: var(--title);
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            color: var(--phosphor);
+            text-shadow: 0 0 4px var(--phosphor-glow);
         }
         .section-title .aux {
+            font-size: var(--lbl);
+            font-weight: 500;
+            letter-spacing: 0.08em;
             color: var(--ink-dim);
-            letter-spacing: 0.06em;
-            font-size: 11.5px;
-            font-weight: 400;
             text-shadow: none;
         }
+        .section-title .aux.on  { color: var(--phosphor); text-shadow: 0 0 4px var(--phosphor-glow); }
+        .section-title .aux.hot { color: var(--amber);    text-shadow: 0 0 4px var(--amber-glow); }
+        .section-title .aux.sky { color: var(--sky);      text-shadow: 0 0 4px var(--sky-glow); }
+        .section-title .aux.off { color: var(--off); }
 
-        .row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 6px;
+        /* Inline divider used inside the combined DEPTH JOG section to
+           label the SURF TRACK target-nudge controls without pulling a
+           whole new card. */
+        .jog-divider {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 8px;
+            margin: 8px 0 4px;
+            padding-bottom: 3px;
+            border-bottom: 1px solid var(--stroke-lo);
+            font-size: var(--lbl);
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            color: var(--phosphor-dim);
         }
-        .row.three  { grid-template-columns: repeat(3, 1fr); }
-        /* A labelled toggle needs the full panel width in a side-panel-sized
-           widget; sharing a half column wraps its label onto three lines. */
-        .row.stack  { grid-template-columns: 1fr; }
-        .row.four   { grid-template-columns: repeat(4, 1fr); }
-        .row + .row { margin-top: 6px; }
+        .jog-divider .aux { font-weight: 500; letter-spacing: 0.08em; color: var(--ink-dim); }
+        .jog-divider .aux.on  { color: var(--phosphor); text-shadow: 0 0 4px var(--phosphor-glow); }
+        .jog-divider .aux.hot { color: var(--amber);    text-shadow: 0 0 4px var(--amber-glow); }
+        .jog-divider .aux.sky { color: var(--sky);      text-shadow: 0 0 4px var(--sky-glow); }
+        .jog-divider .aux.off { color: var(--off); }
 
-        /* --- Hard buttons ----------------------------------------------- */
+        .row  { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); }
+        .row.three { grid-template-columns: repeat(3, 1fr); }
+        .row.four  { grid-template-columns: repeat(4, 1fr); }
+        .row.stack { grid-template-columns: 1fr; }
+        .row + .row { margin-top: var(--gap); }
+
+        .hint {
+            font-size: var(--lbl);
+            letter-spacing: 0.02em;
+            color: var(--ink-dim);
+            margin-top: 5px;
+        }
+
+        /* --- Buttons ---------------------------------------------------- */
         .btn {
-            border: 1px solid #1a2621;
-            background: linear-gradient(180deg, #10201a 0%, #081611 100%);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            border: 1px solid var(--stroke);
+            background: transparent;
             color: var(--phosphor);
-            font: 700 13px var(--mono);
+            font: 700 var(--title) var(--mono);
             letter-spacing: 0.1em;
-            padding: 10px 6px;
-            border-radius: 4px;
+            padding: 7px 4px;
+            border-radius: var(--radius);
             cursor: pointer;
-            text-shadow: 0 0 4px var(--phosphor-glow);
-            transition: background 0.1s, box-shadow 0.1s, transform 0.05s;
-            box-shadow:
-                inset 0 1px 0 rgba(255,255,255,0.03),
-                inset 0 -1px 0 rgba(0,0,0,0.4);
+            text-shadow: 0 0 3px var(--phosphor-glow);
+            text-transform: uppercase;
             user-select: none;
             -webkit-user-select: none;
             touch-action: manipulation;
         }
-        .btn:hover:not(:disabled) {
-            background: linear-gradient(180deg, #14291f 0%, #0b1c15 100%);
-            box-shadow:
-                inset 0 1px 0 rgba(255,255,255,0.04),
-                0 0 8px var(--phosphor-glow);
-        }
+        .btn:hover:not(:disabled) { background: rgba(124, 242, 156, 0.06); }
         .btn:active:not(:disabled),
         .btn.held:not(:disabled) {
-            background: linear-gradient(180deg, #051009 0%, #030906 100%);
-            box-shadow:
-                inset 0 2px 4px rgba(0,0,0,0.6),
-                0 0 10px var(--phosphor-glow);
+            background: rgba(124, 242, 156, 0.11);
             transform: translateY(1px);
         }
-        .btn:disabled {
-            opacity: 0.35;
-            cursor: not-allowed;
-            text-shadow: none;
-            box-shadow: inset 0 -1px 0 rgba(0,0,0,0.3);
-        }
-        .btn.amber { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
-        .btn.amber:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--amber-glow); }
-        .btn.amber:active:not(:disabled),
-        .btn.amber.held:not(:disabled) { box-shadow: inset 0 2px 4px rgba(0,0,0,0.6), 0 0 10px var(--amber-glow); }
-        .btn.red { color: var(--red); text-shadow: 0 0 4px var(--red-glow); border-color: #401414; }
-        .btn.red:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--red-glow); }
-        .btn.sky { color: var(--sky); text-shadow: 0 0 4px var(--sky-glow); border-color: #143047; }
-        .btn.sky:hover:not(:disabled) { box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 0 8px var(--sky-glow); }
         .btn.active {
-            background: linear-gradient(180deg, #1a3a29 0%, #0e2519 100%);
-            box-shadow:
-                inset 0 0 0 1px #26583d,
-                0 0 10px var(--phosphor-glow);
+            background: rgba(124, 242, 156, 0.09);
+            border-color: var(--stroke-hi);
+            box-shadow: inset 0 0 0 1px rgba(124, 242, 156, 0.25),
+                        0 0 8px var(--phosphor-glow);
         }
-        .btn.small { font-size: 12px; padding: 8px 4px; letter-spacing: 0.06em; }
-        .btn.wide { grid-column: 1 / -1; }
+        .btn.small { padding: 5px 3px; font-size: 11px; letter-spacing: 0.06em; }
+        .btn.wide  { grid-column: 1 / -1; }
+        .btn.red   { color: var(--red);   text-shadow: 0 0 3px var(--red-glow);   border-color: rgba(239, 83, 80, 0.4); }
+        .btn.red:hover:not(:disabled)   { background: rgba(239, 83, 80, 0.08); }
+        .btn.amber { color: var(--amber); text-shadow: 0 0 3px var(--amber-glow); border-color: rgba(242, 179, 76, 0.4); }
+        .btn.amber:hover:not(:disabled) { background: rgba(242, 179, 76, 0.07); }
+        .btn.sky   { color: var(--sky);   text-shadow: 0 0 3px var(--sky-glow);   border-color: rgba(110, 198, 255, 0.35); }
+        .btn.sky:hover:not(:disabled)   { background: rgba(110, 198, 255, 0.07); }
+        .btn.ghost { color: var(--ink-dim); text-shadow: none; border-color: var(--stroke-lo); }
+        .btn.ghost:hover:not(:disabled) { color: var(--phosphor); border-color: var(--stroke); }
+        .btn:disabled { opacity: 0.35; cursor: not-allowed; text-shadow: none; }
 
         /* Toggle switch */
         .toggle-row {
@@ -466,255 +441,135 @@
             justify-content: space-between;
             align-items: center;
             gap: 8px;
-            padding: 6px 4px;
+            padding: 4px 2px;
         }
-        .toggle-row .label {
-            font-size: 12.5px;
-            font-weight: 500;
-            letter-spacing: 0.06em;
-            color: var(--ink);
-        }
-        .toggle-row .aux {
-            font-size: 11.5px;
-            color: var(--ink-dim);
-            letter-spacing: 0.02em;
-        }
+        .toggle-row .label { font-size: var(--body); color: var(--ink); letter-spacing: 0.06em; }
+        .toggle-row .aux   { font-size: var(--lbl); color: var(--ink-dim); letter-spacing: 0.02em; }
         .toggle {
-            width: 44px;
-            height: 22px;
-            border-radius: 12px;
-            background: #050807;
-            border: 1px solid #0d1310;
+            width: 40px; height: 20px;
+            border: 1px solid var(--stroke-lo);
+            background: var(--panel);
+            border-radius: 10px;
             position: relative;
             cursor: pointer;
             flex-shrink: 0;
         }
         .toggle::after {
             content: '';
-            width: 16px;
-            height: 16px;
+            width: 14px; height: 14px;
             border-radius: 50%;
             background: var(--off);
-            position: absolute;
-            top: 2px;
-            left: 2px;
+            position: absolute; top: 2px; left: 2px;
             transition: left 0.15s, background 0.15s, box-shadow 0.15s;
         }
         .toggle.on::after {
-            left: 24px;
+            left: 22px;
             background: var(--phosphor);
-            box-shadow: 0 0 8px var(--phosphor-glow);
+            box-shadow: 0 0 6px var(--phosphor-glow);
         }
 
-        /* Big readouts (focus PWM, zoom PWM) */
-        .readout {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
+        /* Transect capture-type sub-row: appears only when the TRANSECT
+           segment is armed, so the operator picks per-leg TIMELAPSE
+           (2 Hz images) or VIDEO (.ts) without a hidden dropdown. */
+        .transect-sub {
+            display: none;
+            grid-template-columns: 62px 1fr 1fr;
+            align-items: center;
+            gap: 4px;
+            margin-top: 6px;
         }
-        .readout .box {
-            background: #050807;
-            border: 1px solid #0d1310;
-            border-radius: 4px;
-            padding: 6px 8px;
-            text-align: center;
-        }
-        .readout .label {
-            font-size: 11px;
-            font-weight: 500;
+        .transect-sub.visible { display: grid; }
+        .tx-sub-key {
+            font-size: var(--lbl);
+            font-weight: 700;
             letter-spacing: 0.12em;
             color: var(--ink-dim);
-            margin-bottom: 4px;
-        }
-        .readout .value {
-            font: 700 20px var(--mono);
-            letter-spacing: 0.02em;
-            color: var(--phosphor);
-            text-shadow: 0 0 6px var(--phosphor-glow);
-        }
-        .readout .value.dim { color: var(--ink-dim); text-shadow: none; }
-        .readout .sub {
-            font-size: 11px;
-            font-weight: 500;
-            color: var(--ink-dim);
-            letter-spacing: 0.04em;
-            margin-top: 3px;
+            padding-left: 2px;
         }
 
-        /* Mode select buttons (RECORD tab) */
+        /* Segmented record-mode switch */
         .mode-switch {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 4px;
-            padding: 3px;
-            background: var(--panel-inset);
-            border-radius: 4px;
-            border: 1px solid #0a120e;
-            margin-bottom: 8px;
+            border: 1px solid var(--stroke-lo);
+            border-radius: var(--radius);
+            overflow: hidden;
         }
         .mode-switch .btn {
+            border: none;
+            border-right: 1px solid var(--stroke-lo);
+            border-radius: 0;
             padding: 6px 0;
-            font-size: 12px;
-            letter-spacing: 0.06em;
-            border: 1px solid transparent;
-            background: transparent;
+            font-size: 11.5px;
             color: var(--phosphor-dim);
             text-shadow: none;
+            letter-spacing: 0.08em;
         }
+        .mode-switch .btn:last-child { border-right: none; }
         .mode-switch .btn.active {
             color: var(--phosphor);
             text-shadow: 0 0 4px var(--phosphor-glow);
-            background: linear-gradient(180deg, #10231a 0%, #0a1912 100%);
-            box-shadow: inset 0 0 0 1px #1f4a34, 0 0 6px var(--phosphor-glow);
+            background: rgba(124, 242, 156, 0.06);
+            box-shadow: inset 0 -2px 0 var(--stroke-hi);
         }
-        .mode-switch .btn:disabled { opacity: 0.55; cursor: not-allowed; }
 
-        /* Capture-type dropdown */
-        .capture-row {
-            display: none;
-            align-items: center;
+        /* File info + storage */
+        .file-info, .storage-row {
+            display: grid;
             gap: 6px;
-            font-size: 11.5px;
-            font-weight: 500;
-            letter-spacing: 0.08em;
-            color: var(--ink-dim);
-        }
-        .capture-row.visible { display: flex; }
-        .capture-row select {
-            flex: 1;
-            background: #050807;
-            color: var(--phosphor);
-            border: 1px solid #0d1310;
-            border-radius: 4px;
-            padding: 4px 6px;
-            font: 700 12.5px var(--mono);
-            letter-spacing: 0.03em;
-        }
-        .capture-row select:disabled { opacity: 0.5; }
-
-        .file-info {
-            display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 8px;
             align-items: center;
-            padding: 6px 8px;
-            background: #050807;
-            border: 1px solid #0d1310;
-            border-radius: 4px;
-            font-size: 12.5px;
-            font-weight: 500;
-            min-height: 34px;
-        }
-        .file-name {
+            border: 1px solid var(--stroke-lo);
+            border-radius: var(--radius);
+            padding: 5px 7px;
+            font-size: var(--lbl);
+            letter-spacing: 0.05em;
             color: var(--ink-dim);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            letter-spacing: 0.02em;
+            margin-top: 6px;
+            background: var(--panel);
+            min-height: 28px;
         }
-        .file-size {
-            color: var(--phosphor);
-            font-weight: 700;
-            text-shadow: 0 0 4px var(--phosphor-glow);
-        }
-        .file-size.timelapse { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
-        .file-size.transect  { color: var(--sky);   text-shadow: 0 0 4px var(--sky-glow); }
-
-        /* Which drive the next frame actually lands on, and how much room is
-           left on it. Always visible, because "there is no space" is worth
-           knowing before a survey rather than after the failover. */
-        .storage-row {
-            display: grid;
-            grid-template-columns: auto 1fr;
-            gap: 8px;
-            align-items: center;
-            padding: 6px 8px;
-            background: #050807;
-            border: 1px solid #0d1310;
-            border-radius: 4px;
-            font-size: 12.5px;
-            font-weight: 500;
-            min-height: 34px;
-        }
+        .file-info { grid-template-columns: 1fr auto; }
+        .file-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .file-size { color: var(--phosphor); font-weight: 700; text-shadow: 0 0 3px var(--phosphor-glow); }
+        .file-size.timelapse { color: var(--amber); text-shadow: 0 0 3px var(--amber-glow); }
+        .file-size.transect  { color: var(--sky);   text-shadow: 0 0 3px var(--sky-glow); }
+        /* Three columns: [tier chip] [free-space] [optional WIPE button].
+           The wipe button is only rendered when USB is the active tier;
+           when hidden the trailing column collapses because the button
+           itself is display:none. Grid auto-tracks handle the reflow. */
+        .storage-row { grid-template-columns: auto 1fr auto; }
         .storage-row .dest {
             font-weight: 700;
-            letter-spacing: 0.1em;
+            letter-spacing: 0.12em;
             padding: 1px 6px;
-            border: 1px solid #1b2f33;
-            border-radius: 3px;
+            border: 1px solid var(--stroke-lo);
+            border-radius: 2px;
             color: var(--ink-dim);
         }
-        .storage-row .dest.usb {
-            color: var(--sky);
-            border-color: #1d3b47;
-            text-shadow: 0 0 4px var(--sky-glow);
-        }
-        .storage-row .dest.sd {
-            color: var(--phosphor);
-            border-color: #17321f;
-            text-shadow: 0 0 4px var(--phosphor-glow);
-        }
-        .storage-row .free {
-            text-align: right;
-            color: var(--ink-dim);
-            font-weight: 700;
-        }
-        .storage-row .free.low  { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
-        .storage-row .free.crit { color: var(--red);   text-shadow: 0 0 4px var(--red-glow); }
-        /* Spans both columns so the failover reason gets a full line. */
+        .storage-row .dest.sd  { color: var(--phosphor); border-color: var(--stroke); text-shadow: 0 0 3px var(--phosphor-glow); }
+        .storage-row .dest.usb { color: var(--sky);      border-color: rgba(110, 198, 255, 0.35); text-shadow: 0 0 3px var(--sky-glow); }
+        .storage-row .free { text-align: right; color: var(--phosphor); text-shadow: 0 0 3px var(--phosphor-glow); }
+        .storage-row .free.low  { color: var(--amber); text-shadow: 0 0 3px var(--amber-glow); }
+        .storage-row .free.crit { color: var(--red);   text-shadow: 0 0 3px var(--red-glow); }
         .storage-row .swap {
             grid-column: 1 / -1;
-            font-size: 11.5px;
-            font-weight: 500;
+            font-size: var(--lbl);
             color: var(--amber);
-            letter-spacing: 0.02em;
         }
         .storage-row .swap:empty { display: none; }
 
         .stats-row {
-            font-size: 12px;
-            font-weight: 500;
+            font-size: var(--lbl);
             color: var(--ink-dim);
             letter-spacing: 0.02em;
-            padding: 0 2px;
+            padding: 2px 2px 0;
             display: flex;
             justify-content: space-between;
             gap: 8px;
         }
         .stats-row .warn { color: var(--amber); }
 
-        .duration {
-            font-family: var(--mono);
-            font-size: 14px;
-            font-weight: 700;
-            color: var(--ink-dim);
-            letter-spacing: 0.03em;
-        }
-        .duration.active { color: var(--red); }
-        .duration.active.timelapse { color: var(--amber); }
-        .duration.active.transect  { color: var(--sky); }
-
-        .error-msg {
-            padding: 6px 8px;
-            background: #2b0808;
-            border: 1px solid #501313;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: 500;
-            letter-spacing: 0.02em;
-            color: #ffb4b4;
-            display: none;
-        }
-
-        .hint {
-            font-size: 11.5px;
-            font-weight: 500;
-            color: var(--ink-dim);
-            letter-spacing: 0.02em;
-            padding: 2px 4px;
-        }
-
-        /* Depth-jog PWM tuning fields */
+        /* Depth-jog µs tuning + surf-track KV readouts */
         .jog-tune {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -726,181 +581,371 @@
             align-items: center;
             justify-content: space-between;
             gap: 6px;
-            font-size: 11px;
-            font-weight: 500;
-            letter-spacing: 0.06em;
+            font-size: var(--lbl);
+            letter-spacing: 0.08em;
             color: var(--ink-dim);
-            background: var(--panel-inset);
-            border: 1px solid #14261d;
-            border-radius: 3px;
+            border: 1px solid var(--stroke-lo);
+            border-radius: var(--radius);
             padding: 3px 6px;
+            background: var(--panel);
         }
         .jog-tune input {
-            width: 52px;
-            background: #050807;
-            border: 1px solid #1c3a2a;
-            border-radius: 2px;
+            width: 54px;
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid var(--stroke-lo);
             color: var(--amber);
-            font-family: inherit;
+            font-family: var(--display);
             font-size: 13px;
             text-align: center;
-            padding: 2px 0;
+            padding: 1px 0;
         }
-        .jog-tune input:focus {
-            outline: none;
-            border-color: var(--amber);
-            box-shadow: 0 0 5px var(--amber-glow);
-        }
+        .jog-tune input:focus { outline: none; border-bottom-color: var(--amber); }
 
-        /* Surf-track target-altitude cell and status readout. Same
-           two-column grid the depth strip uses so the widget's visual
-           rhythm matches. The engaged/tracking/holding tint on
-           #surfState is applied by JS via classes below. */
         .surf-target-cell {
             display: flex;
             align-items: center;
             justify-content: center;
             gap: 4px;
-            padding: 4px 6px;
-            border: 1px solid #14313a;
-            border-radius: 3px;
-            background: var(--panel-inset);
+            border: 1px solid var(--stroke);
+            border-radius: var(--radius);
+            padding: 3px 6px;
+            background: var(--panel);
         }
-        .surf-target-label {
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.06em;
-            color: var(--ink-dim);
-        }
-        .surf-target {
-            font-family: 'Orbitron', var(--mono);
-            font-weight: 800;
-            font-size: 22px;
-            color: var(--sky);
-            text-shadow: 0 0 6px var(--sky-glow);
-        }
-        .surf-target-unit {
-            font-size: 12px;
-            color: var(--ink-dim);
-            letter-spacing: 0.06em;
-        }
+        .surf-target-label { font-size: var(--lbl); font-weight: 700; letter-spacing: 0.08em; color: var(--ink-dim); }
+        .surf-target       { font-family: var(--display); font-weight: 700; font-size: var(--value-lg); color: var(--sky); text-shadow: 0 0 6px var(--sky-glow); letter-spacing: 0.03em; }
+        .surf-target-unit  { font-size: 11px; color: var(--ink-dim); letter-spacing: 0.06em; }
         .surf-readout {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(3, 1fr);
             gap: 6px;
             margin-top: 6px;
         }
         .surf-cell {
             display: flex;
-            align-items: baseline;
+            flex-direction: column;
+            align-items: center;
+            gap: 1px;
+            padding: 3px 4px;
+            background: var(--panel);
+            border: 1px solid var(--stroke-lo);
+            border-radius: var(--radius);
+            text-align: center;
+        }
+        .surf-label { font-size: var(--lbl); font-weight: 700; letter-spacing: 0.08em; color: var(--ink-dim); }
+        .surf-value { font-family: var(--display); font-weight: 700; font-size: 15px; color: var(--phosphor); text-shadow: 0 0 4px var(--phosphor-glow); min-width: 2ch; text-align: center; }
+        .surf-value.dim { color: var(--ink-dim); text-shadow: none; }
+        .surf-unit  { font-size: 10.5px; color: var(--ink-dim); letter-spacing: 0.06em; }
+
+        /* SURF TRACK state pill styles kept because the poller writes them. */
+        #surfState { padding: 1px 6px; border-radius: 2px; border: 1px solid transparent; }
+        #surfState.tracking { color: var(--phosphor); border-color: var(--stroke); background: rgba(124, 242, 156, 0.06); }
+        #surfState.holding  { color: var(--amber);    border-color: rgba(242, 179, 76, 0.4); background: rgba(242, 179, 76, 0.06); }
+
+        /* Combined OPTICS section: two labelled rows (ZOOM / FOCUS)
+           share one card. The left key column keeps the two rows
+           visually aligned even though their button counts differ. */
+        .optics-row {
+            display: grid;
+            grid-template-columns: 48px 1fr;
+            align-items: center;
+            gap: 8px;
+        }
+        .optics-row + .optics-row { margin-top: 6px; }
+        .optics-key {
+            font-size: var(--lbl);
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            color: var(--ink-dim);
+        }
+        .optics-btns { margin-top: 0; }
+
+        /* Optics preset chips: one row per chip so the label + PWM
+           readout + explicit REMOVE button always fit without wrapping
+           into an ambiguous glyph. Left side is the "apply this preset"
+           hit target; the right end is the "delete this preset" button. */
+        .preset-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
+        .presets {
+            display: flex;
+            flex-direction: column;
             gap: 4px;
-            padding: 4px 6px;
-            background: var(--panel-inset);
-            border: 1px solid #14261d;
-            border-radius: 3px;
+            margin-top: 6px;
         }
-        .surf-label {
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.06em;
+        .preset-empty {
+            font-size: var(--lbl);
             color: var(--ink-dim);
+            letter-spacing: 0.02em;
+            padding: 4px 2px;
         }
-        .surf-value {
-            font-family: 'Orbitron', var(--mono);
-            font-weight: 700;
-            font-size: 18px;
+        .preset-chip {
+            display: grid;
+            grid-template-columns: 1fr auto auto;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid var(--stroke-lo);
+            border-radius: var(--radius);
+            padding: 3px 3px 3px 8px;
+            font-size: var(--lbl);
+            letter-spacing: 0.08em;
+            color: var(--phosphor-dim);
+            background: var(--panel);
+        }
+        .preset-chip:hover { color: var(--phosphor); border-color: var(--stroke); }
+        .preset-chip.active {
             color: var(--phosphor);
-            text-shadow: 0 0 4px var(--phosphor-glow);
-            min-width: 2ch;
-            text-align: right;
+            border-color: var(--stroke-hi);
+            text-shadow: 0 0 3px var(--phosphor-glow);
         }
-        .surf-value.dim {
+        .preset-chip .apply {
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: inherit;
+            letter-spacing: inherit;
+            color: inherit;
+            background: none;
+            border: 0;
+            padding: 3px 0;
+            text-align: left;
+        }
+        .preset-chip .apply .name {
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            color: var(--phosphor);
+            text-shadow: 0 0 3px var(--phosphor-glow);
+        }
+        .preset-chip .apply .sub {
             color: var(--ink-dim);
+            font-size: 10px;
+        }
+        .preset-chip .del {
+            font-family: var(--mono);
+            font-weight: 700;
+            font-size: 10.5px;
+            letter-spacing: 0.14em;
+            color: var(--ink-dim);
+            border: 1px solid var(--stroke-lo);
+            border-radius: 2px;
+            background: transparent;
+            padding: 3px 8px;
+            cursor: pointer;
             text-shadow: none;
         }
-        .surf-unit {
-            font-size: 11px;
-            color: var(--ink-dim);
+        .preset-chip .del:hover {
+            color: var(--red);
+            border-color: rgba(239, 83, 80, 0.45);
+            background: rgba(239, 83, 80, 0.08);
+            text-shadow: 0 0 3px var(--red-glow);
+        }
+        .preset-add {
+            display: flex;
+            gap: 4px;
+            margin-top: 6px;
+        }
+        .preset-add input {
+            flex: 1;
+            background: var(--panel);
+            border: 1px solid var(--stroke-lo);
+            border-radius: 2px;
+            color: var(--phosphor);
+            font-family: var(--mono);
+            font-size: 11.5px;
+            padding: 4px 6px;
             letter-spacing: 0.06em;
         }
-        /* SURF TRACK state pill in the section title. Amber while
-           holding (loop is off the stick but engaged), phosphor while
-           tracking, sky-glow while lit but disabled/inactive. */
-        #surfState {
-            padding: 1px 6px;
-            border-radius: 2px;
-            border: 1px solid transparent;
+        .preset-add input:focus { outline: none; border-color: var(--stroke); }
+        .preset-add input:disabled {
+            color: var(--ink-dim);
+            border-color: var(--stroke-lo);
+            cursor: not-allowed;
         }
-        #surfState.tracking {
-            color: var(--phosphor);
-            border-color: #1e402c;
-            background: #071410;
+
+        .error-msg {
+            padding: 6px 8px;
+            background: #2b0808;
+            border: 1px solid #501313;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.02em;
+            color: #ffb4b4;
+            display: none;
+            margin-top: 8px;
         }
-        #surfState.holding {
-            color: var(--amber);
-            border-color: #4a3a16;
-            background: #191207;
-        }
-        /* Small nudge buttons -- share the .btn.small footprint from
-           the optics tab. */
     </style>
 </head>
 <body>
+
 <div class="mfd">
     <div class="brand">
-        <div class="name">TOWFISH MFD</div>
-        <div class="sub">V0.9</div>
+        <div class="name">TowFish</div>
+        <div class="ver">V0.99</div>
     </div>
 
-    <div class="screen">
-        <!-- Tab strip -->
-        <div class="tabs" role="tablist">
-            <button class="tab active" data-tab="record">RECORD</button>
-            <button class="tab" data-tab="vehicle">VEHICLE</button>
-            <button class="tab" data-tab="optics">OPTICS</button>
+    <div class="head-row">
+        <div class="depth-cell water">
+            <div class="lbl-stack"><span>WATER</span><span>DEPTH</span></div>
+            <div class="val dim" id="pingValue">--</div>
+            <div class="unit">m</div>
         </div>
+        <div class="depth-cell fish">
+            <div class="lbl-stack"><span>FISH</span><span>DEPTH</span></div>
+            <div class="val dim" id="depthValue">--</div>
+            <div class="unit">m</div>
+        </div>
+        <div class="clock">
+            <span class="t" id="clockT">--:--:--</span>
+            <span class="src sync-off" id="clockSrc">UNSYNCED</span>
+        </div>
+    </div>
 
-        <!-- Persistent status strip -->
-        <div class="strip">
-            <div class="lamp disarmed" id="armLamp"><span class="dot"></span><span id="armLabel">SAFE</span></div>
-            <div class="mode-readout unknown" id="modeReadout">--</div>
-            <div class="rec-lamp" id="recLamp"><span class="dot"></span><span id="recLabel">IDLE</span></div>
-            <div class="strip-depth">
-                <div class="depth-cell">
-                    <span class="dlabel">DEPTH</span>
-                    <span class="dvalue dim" id="depthValue">--</span>
-                    <span class="dunit">m</span>
-                    <span class="jog-flag" id="jogFlag">· JOG</span>
+    <div class="lamps">
+        <span class="lamp disarmed" id="armLamp"><span class="dot"></span><span id="armLabel">SAFE</span></span>
+        <span class="mode-wrap"><span class="mode-key">Mode:</span><span class="mode-readout unknown" id="modeReadout">--</span></span>
+        <span class="rec-lamp" id="recLamp"><span class="dot"></span><span id="recLabel">IDLE</span></span>
+    </div>
+
+    <div class="mini">
+        <div class="cell">
+            <div class="lbl">TILT</div>
+            <div class="val dim" id="miniTilt">--</div>
+        </div>
+        <div class="cell">
+            <div class="lbl">ZOOM</div>
+            <div class="val dim" id="miniZoom">--</div>
+        </div>
+        <div class="cell">
+            <div class="lbl">FOCUS</div>
+            <div class="val dim" id="miniFocus">--</div>
+        </div>
+        <div class="cell">
+            <div class="lbl">DUR</div>
+            <div class="val duration dim" id="duration">00:00:00</div>
+        </div>
+    </div>
+
+    <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="fly">FLY</button>
+        <button class="tab"        data-tab="cam">CAM</button>
+    </div>
+
+    <div class="panels">
+    <!-- ===================== FLY ===================== -->
+    <section class="panel active" id="panel-fly">
+        <!-- DEPTH JOG sits at the top: the immediate manual RC3 override
+             (UP/DOWN thrust + µs tuning) and the SURF TRACK setpoint jog
+             (± 0.5 m target altitude + ALT/CMD/ERR readouts) are the
+             two ways the pilot changes depth, so they share one card. -->
+        <div class="section">
+            <div class="section-title">DEPTH JOG <span class="aux off" id="jogState">RC3 NEUTRAL &middot; 1500</span></div>
+            <div class="row">
+                <button class="btn amber" id="thrustUpBtn">&#9650; UP</button>
+                <button class="btn amber" id="thrustDownBtn">&#9660; DOWN</button>
+            </div>
+            <div class="jog-tune">
+                <label>UP &micro;s <input type="number" id="jogUpPwm" min="1501" max="1900" step="10" value="1600"></label>
+                <label>DN &micro;s <input type="number" id="jogDownPwm" min="1100" max="1499" step="10" value="1400"></label>
+            </div>
+            <div class="jog-divider">
+                <span>SURF TRACK TARGET</span>
+                <span class="aux off" id="surfState">DISABLED</span>
+            </div>
+            <div class="row three">
+                <button class="btn small" data-surf-target="-0.5">&#9660; 0.5</button>
+                <div class="surf-target-cell">
+                    <span class="surf-target-label">TGT</span>
+                    <span class="surf-target" id="surfTargetVal">4.0</span>
+                    <span class="surf-target-unit">m</span>
                 </div>
-                <div class="depth-cell ping">
-                    <span class="dlabel">PING</span>
-                    <span class="dvalue dim" id="pingValue">--</span>
-                    <span class="dunit">m</span>
+                <button class="btn small" data-surf-target="0.5">&#9650; 0.5</button>
+            </div>
+            <div class="surf-readout">
+                <div class="surf-cell">
+                    <span class="surf-label">ALT</span>
+                    <span class="surf-value dim" id="surfAlt">--</span>
+                    <span class="surf-unit">m</span>
+                </div>
+                <div class="surf-cell">
+                    <span class="surf-label">CMD</span>
+                    <span class="surf-value dim" id="surfCmd">--</span>
+                </div>
+                <div class="surf-cell">
+                    <span class="surf-label">ERR</span>
+                    <span class="surf-value dim" id="surfErr">--</span>
+                    <span class="surf-unit">m</span>
                 </div>
             </div>
-            <div class="strip-mini">
-                <div class="cell"><div class="label">TILT</div><div class="value dim" id="miniTilt">--</div></div>
-                <div class="cell"><div class="label">ZOOM</div><div class="value dim" id="miniZoom">--</div></div>
-                <div class="cell"><div class="label">FOCUS</div><div class="value dim" id="miniFocus">--</div></div>
-                <div class="cell"><div class="label">DUR</div><div class="value duration dim" id="duration">00:00:00</div></div>
+            <!-- Mode-aware jog hint was dropped to reclaim vertical space;
+                 flight-mode text at the top of the widget already tells the
+                 pilot what happens when they release RC3. surfHint is kept
+                 (hidden by default) so surf-track can surface its state. -->
+            <div class="hint" id="surfHint" style="display:none;"></div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">ARMING</div>
+            <div class="row">
+                <button class="btn red"   id="vehArmBtn">ARM</button>
+                <button class="btn amber" id="vehDisarmBtn">DISARM</button>
             </div>
         </div>
 
-        <!-- RECORD -->
-        <section class="panel active" id="panel-record">
+        <div class="section">
+            <div class="section-title">FLIGHT MODE</div>
+            <!-- SURF TRK carries its explanation as a title-attr tooltip so
+                 the section stays compact for piloting. -->
+            <div class="row four">
+                <button class="btn small" id="vehManualBtn">MANUAL</button>
+                <button class="btn small" id="vehStabilizeBtn">STABILIZE</button>
+                <button class="btn small" id="vehAltHoldBtn">ALT&nbsp;HOLD</button>
+                <button class="btn small sky" id="vehSurfTrackBtn"
+                        title="Holds a set altitude over the seabed using the boat Ping sonar. Autopilot goes to ALT_HOLD; the extension biases RC3.">SURF&nbsp;TRK</button>
+            </div>
+        </div>
+
+        <!-- Camera mount + white balance share one card. TILT DOWN and
+             ONE-PUSH AWB sit side by side (both are single-shot pilot
+             actions), with the AWB loop toggle underneath. Trims roughly
+             one section header of vertical space vs. two cards. -->
+        <div class="section">
+            <div class="section-title">CAMERA</div>
+            <div class="row two">
+                <button class="btn" id="tiltDownBtn">TILT DOWN (-70&deg;)</button>
+                <button class="btn sky" id="awbOnceBtn">ONE-PUSH AWB</button>
+            </div>
+            <div class="toggle-row">
+                <div>
+                    <div class="label">AWB LOOP (2 MIN)</div>
+                    <div class="aux" id="awbLoopStatus">off in transect</div>
+                </div>
+                <div class="toggle" id="awbLoopToggle" role="switch" aria-checked="false"></div>
+            </div>
+            <div class="hint" id="awbLastHint">no AWB triggered yet</div>
+        </div>
+    </section>
+
+    <!-- ===================== CAM ===================== -->
+    <section class="panel" id="panel-cam">
+        <div class="section">
+            <div class="section-title">RECORD</div>
             <div class="mode-switch" id="modeSwitch">
-                <button class="btn small active" id="modeTransectBtn" data-mode="transect">TRANSECT</button>
-                <button class="btn small" id="modeVideoBtn" data-mode="video">VIDEO</button>
-                <button class="btn small" id="modeTimelapseBtn" data-mode="timelapse">TIMELAPSE</button>
+                <button class="btn active" id="modeTransectBtn" data-mode="transect">TRANSECT</button>
+                <button class="btn"        id="modeVideoBtn"    data-mode="video">VIDEO</button>
+                <button class="btn"        id="modeTimelapseBtn" data-mode="timelapse">TIMELAPSE</button>
             </div>
-            <div class="capture-row visible" id="captureRow">
-                <span>CAPTURE</span>
-                <select id="transectCapture">
-                    <option value="timelapse">Images 2 Hz / leg</option>
-                    <option value="video">Video (.ts / leg)</option>
-                </select>
+            <!-- Transect sub-mode: only visible when TRANSECT is the
+                 armed segment. Picks between "images at 2 Hz per leg"
+                 (timelapse) and "one .ts file per leg" (video). -->
+            <div class="transect-sub" id="transectSub">
+                <span class="tx-sub-key">PER LEG</span>
+                <button class="btn small" id="txCapTimelapseBtn" data-tx-cap="timelapse">TIMELAPSE</button>
+                <button class="btn small" id="txCapVideoBtn"     data-tx-cap="video">VIDEO</button>
             </div>
-            <button class="btn wide" id="actionBtn">START RECORDING</button>
+            <div class="row" style="margin-top:6px;">
+                <button class="btn wide" id="actionBtn">START RECORDING</button>
+            </div>
             <div class="file-info">
                 <span class="file-name" id="fileName">No files yet</span>
                 <span class="file-size" id="fileSize"></span>
@@ -908,122 +953,64 @@
             <div class="storage-row" id="storageRow">
                 <span class="dest" id="storageDest">--</span>
                 <span class="free" id="storageFree">--</span>
+                <!-- Only rendered when the active tier is USB; SD is never
+                     wipeable from the widget (see /usb/wipe backend). The
+                     button is also disabled whenever the recorder or the
+                     transect monitor is running so we cannot yank the
+                     filesystem out from under an in-flight file. -->
+                <button class="btn small red" id="usbWipeBtn" hidden>WIPE USB</button>
                 <span class="swap" id="storageSwap"></span>
             </div>
             <div class="stats-row" id="statsRow"></div>
-        </section>
+        </div>
 
-        <!-- VEHICLE -->
-        <section class="panel" id="panel-vehicle">
-            <div class="section">
-                <div class="section-title">ARMING</div>
-                <div class="row">
-                    <button class="btn red"   id="vehArmBtn">ARM</button>
-                    <button class="btn amber" id="vehDisarmBtn">DISARM</button>
+        <!-- Zoom + focus share one card: two labelled rows of buttons and
+             the trim/commanded readout as the section's aux label. Live
+             PWMs live in the mini strip at the top of the widget, so the
+             old PWM/SET readout tiles would just have duplicated them. -->
+        <div class="section">
+            <div class="section-title">OPTICS <span class="aux" id="focusTrimLabel">TRIM 61.0%</span></div>
+            <div class="optics-row">
+                <span class="optics-key">ZOOM</span>
+                <div class="optics-btns row three">
+                    <button class="btn small" data-zoom="out">OUT</button>
+                    <button class="btn small" data-zoom="half">HALF</button>
+                    <button class="btn small" data-zoom="full">FULL</button>
                 </div>
             </div>
-            <div class="section">
-                <div class="section-title">FLIGHT MODE</div>
-                <div class="row three">
-                    <button class="btn" id="vehStabilizeBtn">STABILIZE</button>
-                    <button class="btn" id="vehAltHoldBtn">ALT_HOLD</button>
-                    <button class="btn sky" id="vehSurfTrackBtn">SURF TRACK</button>
-                </div>
-                <div class="hint">
-                    SURF TRACK holds a set altitude over the seabed using the
-                    boat's Ping sonar. Autopilot is put in ALT_HOLD; the
-                    extension biases RC3.
+            <div class="optics-row">
+                <span class="optics-key">FOCUS</span>
+                <div class="optics-btns row four">
+                    <button class="btn small" data-focus-delta="-2.0">&laquo;</button>
+                    <button class="btn small" data-focus-delta="-0.4">&lsaquo;</button>
+                    <button class="btn small" data-focus-delta="0.4">&rsaquo;</button>
+                    <button class="btn small" data-focus-delta="2.0">&raquo;</button>
                 </div>
             </div>
-            <div class="section" id="surfTrackSection">
-                <div class="section-title">SURF TRACK <span class="aux" id="surfState">DISABLED</span></div>
-                <div class="row three">
-                    <button class="btn small" data-surf-target="-0.5">▼ 0.5</button>
-                    <div class="surf-target-cell">
-                        <span class="surf-target-label">TGT</span>
-                        <span class="surf-target" id="surfTargetVal">4.0</span>
-                        <span class="surf-target-unit">m</span>
-                    </div>
-                    <button class="btn small" data-surf-target="+0.5">▲ 0.5</button>
-                </div>
-                <div class="surf-readout">
-                    <div class="surf-cell">
-                        <span class="surf-label">ALT</span>
-                        <span class="surf-value" id="surfAlt">--</span>
-                        <span class="surf-unit">m</span>
-                    </div>
-                    <div class="surf-cell">
-                        <span class="surf-label">CMD</span>
-                        <span class="surf-value" id="surfCmd">--</span>
-                    </div>
-                </div>
-                <div class="hint" id="surfHint">Not engaged.</div>
-            </div>
-            <div class="section">
-                <div class="section-title">DEPTH JOG <span class="aux" id="jogState">RC3 NEUTRAL · 1500</span></div>
-                <div class="row">
-                    <button class="btn amber" id="thrustUpBtn">▲ UP</button>
-                    <button class="btn amber" id="thrustDownBtn">▼ DOWN</button>
-                </div>
-                <div class="jog-tune">
-                    <label>UP µs <input type="number" id="jogUpPwm" min="1501" max="1900" step="10" value="1600"></label>
-                    <label>DN µs <input type="number" id="jogDownPwm" min="1100" max="1499" step="10" value="1400"></label>
-                </div>
-                <div class="hint" id="jogHint">RELEASE TO HAND OFF TO ALT_HOLD</div>
-            </div>
-            <div class="section">
-                <div class="section-title">CAMERA MOUNT</div>
-                <div class="row">
-                    <button class="btn wide" id="tiltDownBtn">TILT DOWN (-70°)</button>
-                </div>
-            </div>
-        </section>
+        </div>
 
-        <!-- OPTICS -->
-        <section class="panel" id="panel-optics">
-            <div class="section">
-                <div class="section-title">ZOOM</div>
-                <div class="row three">
-                    <button class="btn" data-zoom="out">OUT</button>
-                    <button class="btn" data-zoom="half">HALF</button>
-                    <button class="btn" data-zoom="full">FULL</button>
-                </div>
+        <div class="section">
+            <div class="section-title">OPTICS PRESETS <span class="aux off" id="presetsCount">0 / 4</span></div>
+            <div class="preset-actions">
+                <button class="btn small amber" id="opticsApplyDefaultBtn">APPLY DEFAULT</button>
+                <button class="btn small ghost" id="opticsSetDefaultBtn">SET DEFAULT</button>
+                <button class="btn small ghost" id="focusRefreshBtn">REFRESH</button>
             </div>
-            <div class="section">
-                <div class="section-title">FOCUS <span class="aux" id="focusTrimLabel">TRIM 61.0%</span></div>
-                <div class="readout">
-                    <div class="box"><div class="label">PWM</div><div class="value" id="focusPwmBig">----</div><div class="sub" id="focusPctSub">--%</div></div>
-                    <div class="box"><div class="label">SET</div><div class="value" id="focusTargetBig">----</div><div class="sub">RANGE</div></div>
-                </div>
-                <div class="row four" style="margin-top:8px;">
-                    <button class="btn small" data-focus-delta="-2.0">◀◀</button>
-                    <button class="btn small" data-focus-delta="-0.4">◀</button>
-                    <button class="btn small" data-focus-delta="0.4">▶</button>
-                    <button class="btn small" data-focus-delta="2.0">▶▶</button>
-                </div>
-                <div class="row" style="margin-top:6px;">
-                    <button class="btn amber small" id="focusTrimBtn">SNAP TO TRIM</button>
-                    <button class="btn small" id="focusRefreshBtn">REFRESH</button>
-                </div>
+            <div class="presets" id="opticsPresetList"></div>
+            <div class="preset-add">
+                <input type="text" id="opticsPresetName" placeholder="name new preset" maxlength="16">
+                <button class="btn small" id="opticsPresetSaveBtn">SAVE CURRENT</button>
             </div>
-            <div class="section">
-                <div class="section-title">WHITE BALANCE</div>
-                <div class="row stack">
-                    <button class="btn sky"   id="awbOnceBtn">ONE-PUSH AWB</button>
-                    <div class="toggle-row">
-                        <div>
-                            <div class="label">LOOP (2 MIN)</div>
-                            <div class="aux" id="awbLoopStatus">off in transect</div>
-                        </div>
-                        <div class="toggle" id="awbLoopToggle" role="switch" aria-checked="false"></div>
-                    </div>
-                </div>
-                <div class="hint" id="awbLastHint">no AWB triggered yet</div>
-            </div>
-        </section>
-
-        <div class="error-msg" id="errorMsg" style="margin-top:8px;"></div>
+        </div>
+    </section>
     </div>
+
+    <div class="error-msg" id="errorMsg"></div>
+
+    <!-- jogFlag has moved off the depth strip -- state lives in the DEPTH JOG
+         section title's aux label. This span keeps the legacy poller-write
+         hook alive without occupying header space. -->
+    <span id="jogFlag" style="display:none;"></span>
 </div>
 
 <script>
@@ -1059,14 +1046,18 @@ const modeVideoBtn     = $('modeVideoBtn');
 const modeTimelapseBtn = $('modeTimelapseBtn');
 const modeTransectBtn  = $('modeTransectBtn');
 const statsRow         = $('statsRow');
-const captureRow       = $('captureRow');
-const transectCapture  = $('transectCapture');
+const transectSub          = $('transectSub');
+const txCapTimelapseBtn    = $('txCapTimelapseBtn');
+const txCapVideoBtn        = $('txCapVideoBtn');
 
 let selectedMode = 'transect';
 let serverMode = 'idle';
 let transectMonState = 'disabled';
 let startTime = null;
 let durationTimer = null;
+// Transect per-leg capture flavor. Synced from the server via /status
+// and /config; the two sub-buttons under the TRANSECT segment write it.
+let transectCaptureType = 'timelapse';
 
 function isActive() {
     return serverMode === 'video' || serverMode === 'timelapse' || serverMode === 'transect';
@@ -1138,9 +1129,49 @@ function renderRecordUI() {
     modeTimelapseBtn.disabled = lock;
     modeTransectBtn.disabled = lock;
 
-    captureRow.classList.toggle('visible', m === 'transect');
-    transectCapture.disabled = transectOwned;
+    // Transect capture-type sub-row: only expose the picker when
+    // TRANSECT is the armed segment. While the monitor already owns
+    // the recorder, the sub-buttons freeze until it is disabled.
+    if (transectSub) {
+        transectSub.classList.toggle('visible', m === 'transect');
+        if (txCapTimelapseBtn) {
+            txCapTimelapseBtn.classList.toggle('active', transectCaptureType === 'timelapse');
+            txCapTimelapseBtn.disabled = transectOwned;
+        }
+        if (txCapVideoBtn) {
+            txCapVideoBtn.classList.toggle('active', transectCaptureType === 'video');
+            txCapVideoBtn.disabled = transectOwned;
+        }
+    }
 }
+
+async function setTransectCaptureType(val) {
+    if (val !== 'timelapse' && val !== 'video') return;
+    if (val === transectCaptureType) return;
+    if (isTransectOwned()) return;
+    const previous = transectCaptureType;
+    transectCaptureType = val;
+    renderRecordUI();
+    try {
+        const res = await fetch('/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transect_capture_type: val }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+            showError(data.message || 'Failed to set capture type');
+            transectCaptureType = previous;
+            renderRecordUI();
+        }
+    } catch (e) {
+        showError('Connection error');
+        transectCaptureType = previous;
+        renderRecordUI();
+    }
+}
+if (txCapTimelapseBtn) txCapTimelapseBtn.addEventListener('click', () => setTransectCaptureType('timelapse'));
+if (txCapVideoBtn)     txCapVideoBtn.addEventListener('click',     () => setTransectCaptureType('video'));
 
 function startDurationTimer(serverDurationSec) {
     if (serverDurationSec !== undefined && serverDurationSec > 0) {
@@ -1203,18 +1234,6 @@ actionBtn.addEventListener('click', async () => {
         showError('Connection error');
         actionBtn.disabled = false;
     }
-});
-
-transectCapture.addEventListener('change', async () => {
-    try {
-        const res = await fetch('/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ transect_capture_type: transectCapture.value }),
-        });
-        const data = await res.json();
-        if (!data.success) showError(data.message || 'Failed to set capture type');
-    } catch (e) { showError('Connection error'); }
 });
 
 // -- VEHICLE tab -------------------------------------------------------------
@@ -1421,7 +1440,10 @@ document.querySelectorAll('[data-focus-delta]').forEach(btn => {
     window.addEventListener('pointerup', stop);
     window.addEventListener('pointercancel', stop);
 });
-$('focusTrimBtn').addEventListener('click', () => focusPost({ trim: true }));
+// Legacy SNAP TO TRIM is now surfaced through OPTICS PRESETS -> APPLY DEFAULT.
+if ($('focusTrimBtn')) {
+    $('focusTrimBtn').addEventListener('click', () => focusPost({ trim: true }));
+}
 $('focusRefreshBtn').addEventListener('click', () => {
     focusTargetPwm = null;
     pollStatus();
@@ -1439,6 +1461,48 @@ $('awbLoopToggle').addEventListener('click', async () => {
         setAwbToggle(!!data.awb_loop_enabled);
     }
 });
+
+// WIPE USB: destructive. Two safeguards on top of the backend guards --
+// the button itself only appears while USB is the active tier, and we
+// always require an explicit confirm() acknowledging the device path.
+const usbWipeBtn = $('usbWipeBtn');
+if (usbWipeBtn) {
+    usbWipeBtn.addEventListener('click', async () => {
+        if (usbWipeBtn.disabled) return;
+        const dev = usbWipeBtn.dataset.device || 'the USB drive';
+        const fs  = usbWipeBtn.dataset.fstype  || 'exFAT';
+        const ok = window.confirm(
+            `WIPE USB\n\n` +
+            `This will ERASE every file on ${dev} and reformat it as ${fs}.\n` +
+            `The onboard SD card is not touched.\n\n` +
+            `Continue?`
+        );
+        if (!ok) return;
+        const prevText = usbWipeBtn.textContent;
+        usbWipeBtn.disabled = true;
+        usbWipeBtn.textContent = 'WIPING\u2026';
+        try {
+            const res = await fetch('/usb/wipe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ confirm: true }),
+            });
+            const data = await res.json();
+            if (!res.ok || !data.success) {
+                showError(data.message || 'USB wipe failed');
+            } else {
+                fileNameEl.textContent = data.message || `Wiped ${dev}`;
+                fileSizeEl.textContent = '';
+                fileSizeEl.classList.remove('timelapse', 'transect');
+            }
+        } catch (e) {
+            showError('Connection error');
+        } finally {
+            usbWipeBtn.textContent = prevText;
+            pollStatus();
+        }
+    });
+}
 
 function setAwbToggle(on) {
     $('awbLoopToggle').classList.toggle('on', on);
@@ -1459,9 +1523,15 @@ async function pollStatus() {
         serverMode = newMode;
         const tx = data.transect || null;
         transectMonState = tx && tx.enabled ? (tx.state || 'waiting') : 'disabled';
-        if (tx && transectCapture !== document.activeElement && !isTransectOwned()) {
+        // Keep the local capture-type selection in sync with the server.
+        // The old dropdown listened for `document.activeElement`; the new
+        // sub-buttons are click-only and never hold focus, so we always
+        // trust the server's authoritative value when the monitor is idle.
+        if (tx && !isTransectOwned()) {
             const cfg = tx.configured_capture_type || tx.capture_type;
-            if (cfg) transectCapture.value = cfg;
+            if (cfg && cfg !== transectCaptureType) {
+                transectCaptureType = cfg;
+            }
         }
         if (isActive()) {
             if (selectedMode !== serverMode && !isTransectOwned()) {
@@ -1505,6 +1575,8 @@ async function pollStatus() {
             modeReadout.textContent = veh.custom_mode != null ? `MODE ${veh.custom_mode}` : '--';
             modeReadout.className = 'mode-readout unknown';
         }
+        renderModeBtnActive(veh.mode_label || null);
+        renderSyncSource(data.time_sync || null);
 
         // Depth readout -- ArduSub's baro/pressure depth estimate, always
         // visible on the strip regardless of which tab is open.
@@ -1543,12 +1615,11 @@ async function pollStatus() {
         const jogPwm = thr.pwm != null ? thr.pwm : 1500;
         const jogSource = thr.source || null; // 'operator' | 'surftrack'
         const jogFlag = $('jogFlag');
-        jogFlag.className = 'jog-flag' + (dir ? ' ' + dir : '');
-        // Every state is the same character count so the flag's box never
-        // changes size. The arrow already carries the direction, and the
-        // DEPTH JOG title below spells it out in full.
-        jogFlag.textContent = dir === 'up' ? '\u25B2 JOG'
-                            : dir === 'down' ? '\u25BC JOG' : '\u00B7 JOG';
+        if (jogFlag) {
+            jogFlag.className = 'jog-flag' + (dir ? ' ' + dir : '');
+            jogFlag.textContent = dir === 'up' ? '\u25B2 JOG'
+                                : dir === 'down' ? '\u25BC JOG' : '\u00B7 JOG';
+        }
         const jogState = $('jogState');
         if (jogState) {
             // Prefix with AUTO when the surf-track loop is the one
@@ -1621,6 +1692,20 @@ async function pollStatus() {
             surfCmdEl.textContent = surf.enabled ? 'HOLD' : '--';
             surfCmdEl.classList.toggle('dim', !surf.enabled);
         }
+        // ERR readout: signed miss vs. target. Same value the surfHint
+        // used to bake into a sentence, promoted to its own cell so the
+        // pilot can watch tracking quality without reading prose.
+        const surfErrEl = $('surfErr');
+        if (surfErrEl) {
+            if (typeof surf.error_m === 'number') {
+                const sign = surf.error_m > 0 ? '+' : '';
+                surfErrEl.textContent = `${sign}${surf.error_m.toFixed(2)}`;
+                surfErrEl.classList.remove('dim');
+            } else {
+                surfErrEl.textContent = '--';
+                surfErrEl.classList.add('dim');
+            }
+        }
         // Human-readable hint that shows what the loop is doing right
         // now, or why it is not doing anything.
         if (!surf.enabled) {
@@ -1659,18 +1744,22 @@ async function pollStatus() {
         durationEl.classList.toggle('transect',  serverMode === 'transect');
         durationEl.classList.toggle('dim', !isActive());
 
-        // OPTICS panel readout
-        $('focusPwmBig').textContent  = opt.focus_pwm != null ? opt.focus_pwm : '----';
-        $('focusPwmBig').className    = 'value' + (opt.focus_pwm == null ? ' dim' : '');
-        $('focusPctSub').textContent  = opt.focus_pct != null ? `${opt.focus_pct.toFixed(1)}%` : '--%';
-        // "SET" tile is the expected PWM after the last successful focus
-        // POST. Server tells us via /optics/focus's response, but as a
-        // useful passive display we just mirror the live PWM here when
-        // no in-flight target is known.
-        $('focusTargetBig').textContent = focusTargetPwm != null ? focusTargetPwm : (opt.focus_pwm != null ? opt.focus_pwm : '----');
-        $('focusTrimLabel').textContent = opt.focus_trim_pct != null
-            ? `TRIM ${opt.focus_trim_pct.toFixed(1)}%`
-            : 'TRIM 61.0%';
+        // OPTICS aux label. The dedicated PWM/SET readout tiles are
+        // gone -- the mini strip at the top of the widget already shows
+        // live focus PWM, so we only surface the trim (target %) and,
+        // during a nudge/preset transient, the last commanded SET PWM.
+        const focusTrimEl = $('focusTrimLabel');
+        if (focusTrimEl) {
+            const trim = opt.focus_trim_pct != null
+                ? `TRIM ${opt.focus_trim_pct.toFixed(1)}%`
+                : 'TRIM 61.0%';
+            const settling = focusTargetPwm != null
+                          && opt.focus_pwm != null
+                          && Math.abs(focusTargetPwm - opt.focus_pwm) > 3;
+            focusTrimEl.textContent = settling
+                ? `${trim} \u00b7 SET ${focusTargetPwm}`
+                : trim;
+        }
 
         // AWB toggle + hint
         setAwbToggle(!!data.awb_loop_enabled);
@@ -1762,6 +1851,24 @@ function renderStorage(data) {
         ? `switched to SD \u2014 USB ${data.usb_failover_reason === 'full'
             ? 'ran out of space' : 'was disconnected'}`
         : '';
+
+    // WIPE USB button: only visible when USB is the active tier, only
+    // enabled while recorder + transect monitor are idle. SD is never
+    // wipeable from the widget -- the /usb/wipe backend targets USB only.
+    const wipeBtn = $('usbWipeBtn');
+    if (wipeBtn) {
+        const usbActive = onUsb && !!usb.mounted;
+        wipeBtn.hidden = !usbActive;
+        const busy = isActive() || isTransectOwned();
+        wipeBtn.disabled = busy;
+        wipeBtn.title = !usbActive
+            ? ''
+            : busy
+                ? 'Stop recording / disable transect monitor before wiping USB'
+                : `Erase all files on ${usb.device || 'USB drive'}`;
+        wipeBtn.dataset.device = usb.device || '';
+        wipeBtn.dataset.fstype = usb.fstype || '';
+    }
 }
 
 function setMini(id, pwm, text) {
@@ -1797,6 +1904,284 @@ pollStatus();
 pollFileSize();
 setInterval(pollStatus,  2000);
 setInterval(pollFileSize, 1000);
+
+
+// ============================================================================
+// Additions for the compact FLY / CAM layout
+// ----------------------------------------------------------------------------
+// * Clock + sync-source chip in the header (from /status.time_sync).
+// * MANUAL flight-mode button alongside STABILIZE / ALT_HOLD / SURF TRACK.
+// * OPTICS PRESETS section on CAM: apply / set default + named user presets,
+//   persisted through /config so they follow the tablet.
+// ============================================================================
+
+// -- Clock: browser wall-clock ticked every second, coloured by sync state.
+//    The sync-source chip mirrors /status.time_sync so the operator sees when
+//    the towfish autopilot is running on GPS-derived UTC (dataflash RTC good)
+//    vs the Pi's own clock (sidecars still UTC-aligned) vs unsynced (dataflash
+//    RTC will open at 0).
+function _renderClock() {
+    const el = $('clockT');
+    if (!el) return;
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    el.textContent = pad(d.getHours()) + ':' + pad(d.getMinutes())
+                   + ':' + pad(d.getSeconds());
+}
+function renderSyncSource(ts) {
+    const el = $('clockSrc');
+    if (!el) return;
+    el.className = 'src';
+    let label;
+    if (ts && ts.state === 'synced' && ts.source === 'boat_gps') {
+        label = 'BOAT GPS';   el.classList.add('sync-boat');
+    } else if (ts && ts.state === 'synced' && ts.source === 'container_clock') {
+        label = 'PI NTP';     el.classList.add('sync-pi');
+    } else if (ts && ts.source === 'container_clock') {
+        label = 'PI (WAIT)';  el.classList.add('sync-pi');
+    } else {
+        label = 'UNSYNCED';   el.classList.add('sync-off');
+    }
+    el.textContent = label;
+}
+_renderClock();
+setInterval(_renderClock, 1000);
+
+// -- MANUAL flight-mode button
+if ($('vehManualBtn')) {
+    $('vehManualBtn').addEventListener('click',
+        () => postJson('/vehicle/mode', { mode: 'manual' }));
+}
+
+// Highlight whichever flight-mode button matches the autopilot's live mode.
+// SURF TRACK is handled separately (its own controller class), so it is left
+// out of this map -- it toggles via the surfBtn.active class further down.
+const _MODE_BTN = {
+    STABILIZE: 'vehStabilizeBtn',
+    ALT_HOLD:  'vehAltHoldBtn',
+    MANUAL:    'vehManualBtn',
+};
+function renderModeBtnActive(modeLabel) {
+    Object.values(_MODE_BTN).forEach(id => {
+        const el = $(id);
+        if (el) el.classList.remove('active');
+    });
+    if (modeLabel && _MODE_BTN[modeLabel]) {
+        const el = $(_MODE_BTN[modeLabel]);
+        if (el) el.classList.add('active');
+    }
+}
+
+// ----------------------------------------------------------------------------
+// OPTICS PRESETS
+//
+// Config schema on the server (see main.py):
+//   optics_default: { zoom_pct, focus_pct }
+//   optics_presets: [{ name, zoom_pct, focus_pct }, ...]
+//
+// All mutations go through POST /config, which persists to
+// subreels_towfish_config.json. On extension boot the backend applies
+// optics_default after the tilt-down/zoom-out kick, so a fresh container
+// comes up on the operator's chosen rig without an extra button press.
+// ----------------------------------------------------------------------------
+const ZOOM_PWM_MIN = 935;
+const ZOOM_PWM_MAX = 1850;
+const FOCUS_PWM_MIN = 870;
+const FOCUS_PWM_MAX = 2130;
+function zoomPctToPwm(pct)  { return Math.round(ZOOM_PWM_MIN  + (ZOOM_PWM_MAX  - ZOOM_PWM_MIN)  * (pct / 100)); }
+function focusPctToPwm(pct) { return Math.round(FOCUS_PWM_MIN + (FOCUS_PWM_MAX - FOCUS_PWM_MIN) * (pct / 100)); }
+
+let opticsDefault = { zoom_pct: 0.0, focus_pct: 61.03 };
+let opticsPresets = [];
+// Matches _OPTICS_PRESET_LIST_MAX in app/main.py. The server sanitiser will
+// silently truncate anything past this on POST; the widget enforces it up
+// front so the SAVE CURRENT button gives clear feedback instead of a POST
+// that appears to succeed but drops the entry.
+const OPTICS_PRESET_LIMIT = 4;
+
+async function loadOpticsConfig() {
+    try {
+        const res = await fetch('/config?_=' + Date.now());
+        const d = await res.json();
+        if (d.optics_default && typeof d.optics_default === 'object') {
+            opticsDefault = d.optics_default;
+        }
+        if (Array.isArray(d.optics_presets)) opticsPresets = d.optics_presets;
+    } catch (_) {}
+    renderPresetChips();
+}
+
+function updatePresetsCount() {
+    const count = $('presetsCount');
+    if (count) {
+        count.textContent = `${opticsPresets.length} / ${OPTICS_PRESET_LIMIT}`;
+        count.className = 'aux ' + (opticsPresets.length >= OPTICS_PRESET_LIMIT ? 'hot' : 'off');
+    }
+    // SAVE CURRENT and the name field grey out at the ceiling so the
+    // operator sees why nothing new can land.
+    const saveBtn = $('opticsPresetSaveBtn');
+    const nameEl  = $('opticsPresetName');
+    if (saveBtn) saveBtn.disabled = opticsPresets.length >= OPTICS_PRESET_LIMIT;
+    if (nameEl) {
+        nameEl.disabled    = opticsPresets.length >= OPTICS_PRESET_LIMIT;
+        nameEl.placeholder = opticsPresets.length >= OPTICS_PRESET_LIMIT
+            ? 'remove a preset to add another'
+            : 'name new preset';
+    }
+}
+
+function renderPresetChips() {
+    const list = $('opticsPresetList');
+    if (!list) return;
+    list.innerHTML = '';
+    updatePresetsCount();
+    if (opticsPresets.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'preset-empty';
+        empty.textContent = 'no presets yet -- save the current zoom/focus to seed one';
+        list.appendChild(empty);
+        return;
+    }
+    opticsPresets.forEach(p => {
+        const chip = document.createElement('div');
+        chip.className = 'preset-chip';
+
+        // Left side: tap to apply. Rendered as a real <button> so a
+        // finger tap gives the same visual/audio feedback the other
+        // controls do, and screen readers announce it as an action.
+        const apply = document.createElement('button');
+        apply.type = 'button';
+        apply.className = 'apply';
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = p.name;
+        const sub = document.createElement('span');
+        sub.className = 'sub';
+        sub.textContent = `${zoomPctToPwm(p.zoom_pct)} / ${focusPctToPwm(p.focus_pct)}`;
+        apply.appendChild(name);
+        apply.appendChild(sub);
+        apply.title = `Apply ${p.name}`;
+        apply.addEventListener('click', () => applyOpticsPreset(p));
+
+        // Right side: explicit REMOVE button. Word-labeled so nobody
+        // has to guess whether a bare glyph means "close" or "delete".
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'del';
+        del.textContent = 'REMOVE';
+        del.title = `Delete ${p.name}`;
+        del.addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteOpticsPreset(p.name);
+        });
+
+        chip.appendChild(apply);
+        chip.appendChild(del);
+        list.appendChild(chip);
+    });
+}
+
+async function persistPresets() {
+    await postJson('/config', {
+        optics_default: opticsDefault,
+        optics_presets: opticsPresets,
+    });
+}
+
+async function applyOpticsPreset(p) {
+    if (!p) return;
+    // Fire both channels; the server writes camera focus/zoom via
+    // MAV_CMD_SET_CAMERA_*. Ordering does not matter -- the RadCam accepts
+    // them independently.
+    await postJson('/optics/zoom',  { pct: p.zoom_pct });
+    await postJson('/optics/focus', { pct: p.focus_pct });
+    // Optimistic UI: reflect the target immediately; poll will reconcile.
+    focusTargetPwm = focusPctToPwm(p.focus_pct);
+}
+
+async function setDefaultFromLive() {
+    // Grab the live PWMs off /status to describe the operator's current rig,
+    // convert to pct and stash as the new default.
+    try {
+        const res = await fetch('/status');
+        const d = await res.json();
+        const opt = d.optics || {};
+        const zpwm = opt.zoom_pwm  || ZOOM_PWM_MIN;
+        const fpwm = opt.focus_pwm || focusPctToPwm(opticsDefault.focus_pct);
+        opticsDefault = {
+            zoom_pct:  (zpwm - ZOOM_PWM_MIN)  * 100 / (ZOOM_PWM_MAX  - ZOOM_PWM_MIN),
+            focus_pct: (fpwm - FOCUS_PWM_MIN) * 100 / (FOCUS_PWM_MAX - FOCUS_PWM_MIN),
+        };
+        await persistPresets();
+        _flashDefaultLabel();
+    } catch (_) {}
+}
+
+async function saveCurrentAsPreset() {
+    const nameEl = $('opticsPresetName');
+    if (!nameEl) return;
+    const name = String(nameEl.value || '').trim().toUpperCase().slice(0, 16);
+    if (!name) return;
+    // Overwriting an existing chip is always fine (net count unchanged);
+    // adding a brand-new one is blocked once we hit the ceiling so the
+    // operator has to remove one first.
+    const isOverwrite = opticsPresets.some(p => p.name === name);
+    if (!isOverwrite && opticsPresets.length >= OPTICS_PRESET_LIMIT) {
+        showError(`Preset limit is ${OPTICS_PRESET_LIMIT} -- remove one first.`);
+        return;
+    }
+    try {
+        const res = await fetch('/status');
+        const d = await res.json();
+        const opt = d.optics || {};
+        const zpwm = opt.zoom_pwm  || ZOOM_PWM_MIN;
+        const fpwm = opt.focus_pwm || focusPctToPwm(opticsDefault.focus_pct);
+        const preset = {
+            name,
+            zoom_pct:  (zpwm - ZOOM_PWM_MIN)  * 100 / (ZOOM_PWM_MAX  - ZOOM_PWM_MIN),
+            focus_pct: (fpwm - FOCUS_PWM_MIN) * 100 / (FOCUS_PWM_MAX - FOCUS_PWM_MIN),
+        };
+        // Overwrite existing preset with the same name so a user can
+        // "update" without deleting first.
+        opticsPresets = opticsPresets.filter(p => p.name !== name);
+        opticsPresets.push(preset);
+        nameEl.value = '';
+        await persistPresets();
+        renderPresetChips();
+    } catch (_) {}
+}
+
+async function deleteOpticsPreset(name) {
+    opticsPresets = opticsPresets.filter(p => p.name !== name);
+    await persistPresets();
+    renderPresetChips();
+}
+
+function _flashDefaultLabel() {
+    const btn = $('opticsSetDefaultBtn');
+    if (!btn) return;
+    const original = btn.textContent;
+    btn.textContent = 'DEFAULT SAVED';
+    btn.classList.add('active');
+    setTimeout(() => { btn.textContent = original; btn.classList.remove('active'); }, 1600);
+}
+
+if ($('opticsApplyDefaultBtn')) {
+    $('opticsApplyDefaultBtn').addEventListener('click', () => applyOpticsPreset(opticsDefault));
+}
+if ($('opticsSetDefaultBtn')) {
+    $('opticsSetDefaultBtn').addEventListener('click', () => setDefaultFromLive());
+}
+if ($('opticsPresetSaveBtn')) {
+    $('opticsPresetSaveBtn').addEventListener('click', () => saveCurrentAsPreset());
+}
+if ($('opticsPresetName')) {
+    $('opticsPresetName').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') saveCurrentAsPreset();
+    });
+}
+
+loadOpticsConfig();
 </script>
 </body>
 </html>

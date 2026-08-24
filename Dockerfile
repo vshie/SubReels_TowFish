@@ -77,7 +77,7 @@ ENV FLASK_APP=main.py
 # Expose ports
 EXPOSE 5423 8765
 
-LABEL version="1.0.0"
+LABEL version="0.99"
 
 ARG IMAGE_NAME
 LABEL permissions='\
