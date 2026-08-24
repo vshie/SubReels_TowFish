@@ -1462,18 +1462,30 @@ function buildParamCard(p) {
     // extension actually converts carry a stock value, so the boat's
     // survey preferences render without this.
     let conv = null;
-    if (p.stock !== null && p.stock !== undefined) {
+    if (p.as_flown !== null && p.as_flown !== undefined) {
+        const tol = Math.max(1e-4, Math.abs(p.default) * 1e-3);
+        const changed = Math.abs(p.as_flown - p.default) > tol;
         conv = document.createElement('div');
         conv.className = 'pcard-conv';
-        const from = document.createElement('span');
-        from.className = 'from';
-        from.textContent = `BLUEROV2 ${fmt(p.stock, p.decimals)}${p.unit || ''}`;
-        const arrow = document.createElement('span');
-        arrow.textContent = '\u2192';
-        const to = document.createElement('span');
-        to.className = 'to';
-        to.textContent = `TOWFISH ${fmt(p.default, p.decimals)}${p.unit || ''}`;
-        conv.append(from, arrow, to);
+        if (changed) {
+            const from = document.createElement('span');
+            from.className = 'from';
+            from.textContent = `FLOWN ${fmt(p.as_flown, p.decimals)}${p.unit || ''}`;
+            const arrow = document.createElement('span');
+            arrow.textContent = '\u2192';
+            const to = document.createElement('span');
+            to.className = 'to';
+            to.textContent = `TARGET ${fmt(p.default, p.decimals)}${p.unit || ''}`;
+            conv.append(from, arrow, to);
+        } else {
+            // Nothing to convert: the survey arrived at this value and
+            // we are holding it so a reset cannot undo it.
+            const held = document.createElement('span');
+            held.className = 'to';
+            held.textContent =
+                `FIELD-VALIDATED, HELD AT ${fmt(p.default, p.decimals)}${p.unit || ''}`;
+            conv.append(held);
+        }
     }
 
     const values = document.createElement('div');

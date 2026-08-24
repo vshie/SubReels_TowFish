@@ -485,6 +485,44 @@ PARAM_SPECS = [
                 "to WP_SPEED so the boat does not fight its own mission.",
     },
     {
+        "name": "RNGFND1_MAX",
+        "vehicle": "boat",
+        "default": 100.0,
+        "unit": "m",
+        "decimals": 0,
+        "min": 5.0,
+        "max": 200.0,
+        "presets": [7.0, 30.0, 100.0],
+        "enforce": True,
+        "desc": "Longest sounding the boat's echosounder will report. "
+                "Anything past this is dropped before the extension ever "
+                "sees it, so the 7 m it was set to made every altitude "
+                "over a deeper bottom simply missing -- raising it in the "
+                "field was the single biggest fix of mission 241. Enforced "
+                "rather than merely offered because a silent 7 m ceiling "
+                "looks exactly like water too deep to read.",
+    },
+    {
+        "name": "ATC_RAT_RLL_P",
+        "vehicle": "towfish",
+        "default": 0.04,
+        "unit": "",
+        "decimals": 3,
+        "min": 0.0,
+        "max": 0.5,
+        "presets": [0.02, 0.04, 0.07, 0.135],
+        "enforce": True,
+        "desc": "Roll axis rate controller P gain, and the one piece of "
+                "roll tuning that actually happened at sea: walked from "
+                "0.11 to 0.07 to 0.04 in two steps during the survey. "
+                "Held here so a reflash or a reset cannot quietly undo "
+                "it. Worth re-checking on the first tow, though -- 0.04 "
+                "was found with rate D at 0.0004, effectively none, and "
+                "the D target is now 0.0072. Real damping usually buys "
+                "back some P rather than needing less of it, so if roll "
+                "feels sluggish this is the gain to walk back up.",
+    },
+    {
         "name": "ATC_ANG_RLL_P",
         "vehicle": "towfish",
         "default": 0.00,
@@ -678,14 +716,19 @@ PARAM_SPECS = [
     },
 ]
 
-# What each towfish parameter was set to before conversion, read straight
-# off the vehicle's own mission 241 parameter dump (tools/param_audit.py).
-# These are the BlueROV2 values the frame was commissioned with, and the
-# setup console shows them beside each target so an operator can see what
-# the extension changed rather than having to trust that it changed the
-# right things. Not populated for the boat -- an ArduRover tow boat is not
-# being converted from anything, its targets are just survey preferences.
-TOWFISH_STOCK = {
+# What each managed parameter was actually set to at the end of mission
+# 241, read off the vehicles' own dataflash dumps (tools/param_audit.py
+# and tools/survey_end_params.py). The setup console shows this beside
+# each target so an operator can see what the extension changes rather
+# than having to trust that it changes the right things.
+#
+# Deliberately "as flown" and not "ArduSub default". For most of these
+# the two are the same thing, but not all: ATC_RAT_RLL_D was 0.0004
+# against an ArduSub default of 0.0036, and ATC_RAT_RLL_P had been walked
+# from 0.11 down to 0.04 in two steps during the survey itself. Calling
+# those a BlueROV2 value would have been wrong, and only the flown value
+# is something the logs can actually prove.
+PARAM_AS_FLOWN = {
     "PILOT_SPEED_UP": 100.0,
     "PILOT_SPEED_DN": 0.0,
     "MOT_THST_EXPO": 0.65,
@@ -698,11 +741,24 @@ TOWFISH_STOCK = {
     "ATC_RAT_RLL_D": 0.0004,
     "ATC_RAT_RLL_FLTE": 5.0,
     "ATC_RAT_RLL_FLTD": 2.0,
+    # These two the survey arrived at and we are preserving rather than
+    # changing, so target == as-flown and the console shows no arrow.
+    "ATC_RAT_RLL_P": 0.04,
+    "RNGFND1_MAX": 100.0,
 }
 
 for _spec in PARAM_SPECS:
-    if _spec["name"] in TOWFISH_STOCK:
-        _spec["stock"] = TOWFISH_STOCK[_spec["name"]]
+    if _spec["name"] in PARAM_AS_FLOWN:
+        _spec["as_flown"] = PARAM_AS_FLOWN[_spec["name"]]
+    # Every towfish parameter is part of the conversion away from stock
+    # thruster-ROV behaviour, so all of them are enforced at startup. On
+    # the boat only the ones carrying an explicit flag are: the rest are
+    # survey preferences that belong to whoever is driving it, and the
+    # boat may not even be the same hull between missions.
+    if _spec["vehicle"] == "towfish":
+        _spec["enforce"] = True
+    else:
+        _spec["enforce"] = bool(_spec.get("enforce"))
 
 PARAM_SPECS_BY_NAME = {spec["name"]: spec for spec in PARAM_SPECS}
 
@@ -8082,8 +8138,12 @@ def _param_snapshot():
                                     "min", "max", "desc")},
             "presets": spec.get("presets"),
             "default": spec["default"],
-            # The BlueROV2 value this target replaces, when there is one.
-            "stock": spec.get("stock"),
+            # What this parameter was actually set to at the end of
+            # mission 241, when we know. Equal to the target for the two
+            # values the survey itself arrived at and we are preserving.
+            "as_flown": spec.get("as_flown"),
+            # Whether startup enforcement re-asserts this one.
+            "enforce": bool(spec.get("enforce")),
             # True when the saved target is not the shipped recommendation.
             # Legitimate after a deliberate edit, but it is also what a
             # stale config looks like, so the console says so out loud
@@ -8304,14 +8364,42 @@ PARAM_ENFORCE_RETRY_S = 60.0
 PARAM_ENFORCE_MAX_ATTEMPTS = 15
 
 
+def _param_enforce_pending(names):
+    """Of ``names``, which are not yet confirmed on target?
+
+    Read back from the recorded readings rather than trusting the job
+    counters, so a parameter only leaves the retry list once a vehicle
+    has actually told us it holds the target value.
+    """
+    with _param_lock:
+        readings = {n: dict(_param_readings.get(n) or {}) for n in names}
+    pending = []
+    for name in names:
+        reading = readings.get(name) or {}
+        if reading.get("error"):
+            pending.append(name)
+            continue
+        if _param_matches(PARAM_SPECS_BY_NAME[name], reading.get("value"),
+                          param_targets.get(name)) is not True:
+            pending.append(name)
+    return pending
+
+
 def _param_enforce_worker():
-    """Re-assert the towfish targets once the autopilot is up and safe."""
-    names = [s["name"] for s in PARAM_SPECS if s["vehicle"] == "towfish"]
+    """Re-assert the managed targets once the vehicles are up and safe.
+
+    Retries narrow to the parameters still unconfirmed. That matters
+    because the fish is routinely powered before the boat: without it, an
+    offline boat would keep the whole batch failing and drag the towfish
+    set through a pointless re-read every minute for a quarter of an hour.
+    """
+    names = [s["name"] for s in PARAM_SPECS if s.get("enforce")]
     if not names:
         return
     time.sleep(PARAM_ENFORCE_SETTLE_S)
+    pending = list(names)
     for attempt in range(1, PARAM_ENFORCE_MAX_ATTEMPTS + 1):
-        started, why = _param_start_job("enforce", names)
+        started, why = _param_start_job("enforce", pending)
         if not started:
             # An operator-triggered batch owns the PARAM_VALUE mailbox.
             # Theirs is the more specific intent, so stand down.
@@ -8324,15 +8412,17 @@ def _param_enforce_worker():
                 if not _param_job["running"]:
                     job = dict(_param_job)
                     break
-        if not job.get("deferred") and not job.get("failures"):
+        pending = _param_enforce_pending(pending)
+        if not pending:
             logger.info("Parameter enforcement: %s", job.get("message"))
             return
-        logger.info("Parameter enforcement attempt %d/%d: %s",
-                    attempt, PARAM_ENFORCE_MAX_ATTEMPTS, job.get("message"))
+        logger.info("Parameter enforcement attempt %d/%d: %s -- still "
+                    "pending: %s", attempt, PARAM_ENFORCE_MAX_ATTEMPTS,
+                    job.get("message"), ", ".join(pending))
         time.sleep(PARAM_ENFORCE_RETRY_S)
     logger.warning("Parameter enforcement gave up after %d attempts; "
-                   "towfish parameters may be off target",
-                   PARAM_ENFORCE_MAX_ATTEMPTS)
+                   "still off target: %s",
+                   PARAM_ENFORCE_MAX_ATTEMPTS, ", ".join(pending))
 
 
 def _start_param_enforcement():

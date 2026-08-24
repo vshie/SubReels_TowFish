@@ -164,27 +164,51 @@ print("\ncontrol-surface corrections are present and point away from stock")
 # The stock ArduSub value each of these is correcting, straight off the
 # mission 241 parameter dump. The test is that the target actually
 # differs -- a spec whose target equals the stock value corrects nothing.
-for name, stock in main.TOWFISH_STOCK.items():
+# Values the survey itself arrived at: we hold these rather than change
+# them, so target == as-flown is correct and the console shows no arrow.
+PRESERVED = {"ATC_RAT_RLL_P", "RNGFND1_MAX"}
+
+for name, flown in main.PARAM_AS_FLOWN.items():
     spec = main.PARAM_SPECS_BY_NAME.get(name)
     check(f"{name}: spec exists", spec is not None)
     if spec is None:
         continue
-    check(f"{name}: spec is on the towfish", spec["vehicle"] == "towfish")
-    check(f"{name}: target differs from BlueROV2 stock {stock:g}",
-          main._param_matches(spec, stock, spec["default"]) is False,
-          f"target {spec['default']:g} == stock")
-    check(f"{name}: stock is carried on the spec",
-          spec.get("stock") == stock)
+    check(f"{name}: as-flown value is carried on the spec",
+          spec.get("as_flown") == flown)
+    same = main._param_matches(spec, flown, spec["default"])
+    if name in PRESERVED:
+        check(f"{name}: preserved at the value the survey reached",
+              same is True, f"target {spec['default']:g} != flown {flown:g}")
+    else:
+        check(f"{name}: target differs from the {flown:g} it flew",
+              same is False, f"target {spec['default']:g} == flown")
 
-check("every towfish spec declares what it converts from",
-      all(s.get("stock") is not None
+check("every towfish spec records what it flew",
+      all(s.get("as_flown") is not None
           for s in main.PARAM_SPECS if s["vehicle"] == "towfish"),
       "missing: " + ", ".join(s["name"] for s in main.PARAM_SPECS
                               if s["vehicle"] == "towfish"
-                              and s.get("stock") is None))
-check("boat specs carry no stock value -- they are preferences, not a conversion",
-      all(s.get("stock") is None
-          for s in main.PARAM_SPECS if s["vehicle"] == "boat"))
+                              and s.get("as_flown") is None))
+
+# ---------------------------------------------------------------------------
+print("\nenforcement scope")
+# ---------------------------------------------------------------------------
+
+check("every towfish parameter is enforced",
+      all(s["enforce"] for s in main.PARAM_SPECS
+          if s["vehicle"] == "towfish"))
+check("RNGFND1_MAX is enforced even though it lives on the boat",
+      main.PARAM_SPECS_BY_NAME["RNGFND1_MAX"]["enforce"] is True)
+check("the boat's survey preferences are not enforced",
+      all(s["enforce"] is False for s in main.PARAM_SPECS
+          if s["vehicle"] == "boat" and s["name"] != "RNGFND1_MAX"),
+      "enforced: " + ", ".join(s["name"] for s in main.PARAM_SPECS
+                               if s["vehicle"] == "boat" and s["enforce"]
+                               and s["name"] != "RNGFND1_MAX"))
+check("ATC_RAT_RLL_P is managed so a reflash cannot undo the field tuning",
+      "ATC_RAT_RLL_P" in main.PARAM_SPECS_BY_NAME)
+check("ATC_RAT_RLL_P holds the value the survey ended on",
+      main.PARAM_SPECS_BY_NAME["ATC_RAT_RLL_P"]["default"] == 0.04)
 
 # The two that caused the mission-241 dive behaviour specifically.
 check("PILOT_SPEED_DN is set explicitly, not left at 0",
@@ -373,6 +397,19 @@ run_worker("apply", tf, client, armed=True)
 check("operator apply still writes while armed",
       len(client.writes) == len(tf), f"wrote {len(client.writes)}")
 
+# The armed gate is about the fish's mixer, so it must not hold up the
+# boat's echosounder range.
+reset_param_state()
+mixed = dict(on_target)
+mixed["RNGFND1_MAX"] = 7.0
+client = FakeClient(mixed)
+job = run_worker("enforce", tf + ["RNGFND1_MAX"], client, armed=True)
+check("armed fish defers but the boat's RNGFND1_MAX is still enforced",
+      [n for n, _ in client.writes] == ["RNGFND1_MAX"],
+      f"wrote {client.writes}")
+check("the deferred towfish half is still reported deferred",
+      job["deferred"] is True)
+
 # ---------------------------------------------------------------------------
 print("\nenforcement treats an unreachable autopilot as a failure")
 # ---------------------------------------------------------------------------
@@ -405,6 +442,50 @@ check("the other drifted parameters were still corrected",
 check("snapshot state is failed", main._param_enforce_snapshot()["state"] == "failed")
 
 # ---------------------------------------------------------------------------
+print("\nretries narrow to what is still unconfirmed")
+# ---------------------------------------------------------------------------
+
+# The fish is routinely powered before the boat, so a retry must not drag
+# the whole set through another pass because one vehicle was late.
+reset_param_state()
+half = dict(on_target)
+half["RNGFND1_MAX"] = 7.0
+client = FakeClient(half, fail={"RNGFND1_MAX"})
+all_enforced = [s["name"] for s in main.PARAM_SPECS if s["enforce"]]
+run_worker("enforce", all_enforced, client)
+pending = main._param_enforce_pending(all_enforced)
+check("only the unreachable parameter is retried", pending == ["RNGFND1_MAX"],
+      f"pending {pending}")
+
+# Once it answers, nothing is pending and the worker stops.
+reset_param_state()
+client = FakeClient(half)
+run_worker("enforce", all_enforced, client)
+check("nothing pending once every parameter reads back on target",
+      main._param_enforce_pending(all_enforced) == [],
+      str(main._param_enforce_pending(all_enforced)))
+
+# A parameter that read back a wrong value counts as pending even when
+# no error was raised -- a silent clamp must not look like success.
+reset_param_state()
+
+
+class StubbornClient(FakeClient):
+    def write(self, name, value, param_type=None, timeout_s=5.0):
+        self.writes.append((name, value))
+        # ArduPilot clamped it, or something else owns the parameter.
+        self.vehicle_values[name] = 0.0
+        return {"name": name, "value": 0.0, "type": None,
+                "index": 0, "count": 1}
+
+
+client = StubbornClient(drifted)
+run_worker("enforce", tf, client)
+check("a value that would not stick stays pending",
+      "ATC_RAT_RLL_D" in main._param_enforce_pending(tf),
+      str(main._param_enforce_pending(tf)))
+
+# ---------------------------------------------------------------------------
 print("\nsnapshot shape")
 # ---------------------------------------------------------------------------
 
@@ -427,9 +508,12 @@ with mock.patch.object(main, "_boat_vehicle_ids", return_value=(1, 1)):
 check("/params still lists every spec",
       len(full["params"]) == len(main.PARAM_SPECS))
 check("/params is JSON-serialisable", isinstance(json.dumps(full), str))
-check("/params carries stock so the console can show the conversion",
-      all(row["stock"] == main.TOWFISH_STOCK[row["name"]]
-          for row in full["params"] if row["name"] in main.TOWFISH_STOCK))
+check("/params carries as_flown so the console can show the conversion",
+      all(row["as_flown"] == main.PARAM_AS_FLOWN[row["name"]]
+          for row in full["params"] if row["name"] in main.PARAM_AS_FLOWN))
+check("/params says which parameters are enforced",
+      {r["name"] for r in full["params"] if r["enforce"]}
+      == {s["name"] for s in main.PARAM_SPECS if s["enforce"]})
 check("/params exposes superseded saved values",
       isinstance(full.get("superseded"), list))
 check("/params flags nothing as overridden when targets are the shipped set",
