@@ -128,9 +128,13 @@ Pre-survey configuration only, at full page width:
 ### Cockpit MFD widget (`/widget`)
 
 Everything used while a survey is running — record/timelapse/transect mode
-selection, arm/disarm, flight mode, depth jog, camera tilt, zoom, focus and
-white balance. Add it to Cockpit as a custom widget pointing at
+selection, arm/disarm, flight mode, depth jog, camera tilt and white balance.
+Add it to Cockpit as a custom widget pointing at
 `http://<vehicle>/"port number from Available Services for the extension"/widget`.
+Zoom and focus controls (plus their presets) are gated by the
+`HAS_ZOOM_FOCUS` flag in `app/main.py` and hidden by default for the
+fixed-lens 4k Cam; flip the flag to `True` to restore them for a
+variable-zoom RadCam build.
 
 ## ArduRover & ArduSub configuration
 

@@ -275,6 +275,13 @@
         .mini .duration.active.timelapse { color: var(--amber); text-shadow: 0 0 4px var(--amber-glow); }
         .mini .duration.active.transect  { color: var(--sky);   text-shadow: 0 0 4px var(--sky-glow); }
 
+        /* Fixed-lens 4k Cam: hide zoom/focus surfaces without deleting
+           the markup, so restoring is one flag on the backend. The mini
+           strip collapses from 4 columns (TILT ZOOM FOCUS DUR) to 2
+           (TILT DUR) so it does not leave two dead gaps. */
+        body.no-zoom-focus .optics-only { display: none !important; }
+        body.no-zoom-focus .mini { grid-template-columns: repeat(2, 1fr); }
+
         /* Tabs */
         .tabs {
             display: grid;
@@ -776,7 +783,7 @@
         }
     </style>
 </head>
-<body>
+<body class="no-zoom-focus">
 
 <div class="mfd">
     <div class="brand">
@@ -812,11 +819,11 @@
             <div class="lbl">TILT</div>
             <div class="val dim" id="miniTilt">--</div>
         </div>
-        <div class="cell">
+        <div class="cell optics-only">
             <div class="lbl">ZOOM</div>
             <div class="val dim" id="miniZoom">--</div>
         </div>
-        <div class="cell">
+        <div class="cell optics-only">
             <div class="lbl">FOCUS</div>
             <div class="val dim" id="miniFocus">--</div>
         </div>
@@ -967,8 +974,10 @@
         <!-- Zoom + focus share one card: two labelled rows of buttons and
              the trim/commanded readout as the section's aux label. Live
              PWMs live in the mini strip at the top of the widget, so the
-             old PWM/SET readout tiles would just have duplicated them. -->
-        <div class="section">
+             old PWM/SET readout tiles would just have duplicated them.
+             .optics-only lets a fixed-lens 4k Cam hide the whole card
+             without touching the JS that wires these buttons. -->
+        <div class="section optics-only">
             <div class="section-title">OPTICS <span class="aux" id="focusTrimLabel">TRIM 61.0%</span></div>
             <div class="optics-row">
                 <span class="optics-key">ZOOM</span>
@@ -989,7 +998,7 @@
             </div>
         </div>
 
-        <div class="section">
+        <div class="section optics-only">
             <div class="section-title">OPTICS PRESETS <span class="aux off" id="presetsCount">0 / 4</span></div>
             <div class="preset-actions">
                 <button class="btn small amber" id="opticsApplyDefaultBtn">APPLY DEFAULT</button>
@@ -1733,6 +1742,11 @@ async function pollStatus() {
         else if (serverMode === 'transect')  { recLamp.classList.add('transect');  recLabel.textContent = 'XT'; }
         else if (isTransectOwned() && transectMonState === 'waiting') { recLamp.classList.add('armed-transect'); recLabel.textContent = 'STBY'; }
         else { recLabel.textContent = 'IDLE'; }
+
+        // Camera capability: fixed-lens 4k Cam hides ZOOM/FOCUS surfaces.
+        // Default is `no-zoom-focus` in the HTML so nothing flashes before
+        // the first poll lands.
+        document.body.classList.toggle('no-zoom-focus', data.has_zoom_focus === false);
 
         // Optics mini
         const opt = data.optics || {};

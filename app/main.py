@@ -969,6 +969,18 @@ def _effective_depth_ceiling_m():
     return max(SURF_MAX_DEPTH_MIN_M, ceiling)
 
 
+# ── Camera capability flag ────────────────────────────────────────────────
+# Fixed-focus/fixed-zoom 4k Cam variant: zoom and focus controls are hidden
+# and the boot worker only seats tilt. Set to True to restore the
+# variable-zoom 4k Cam (RadCam) UI, presets, and boot commands -- every
+# route, persisted preset, MAVLink writer, and EXIF path below is left in
+# place so restoring is a one-line flip.
+#
+# The widget reads this off /status (has_zoom_focus) so a later on-the-fly
+# switch can simply promote it to a /config key without another UI change.
+HAS_ZOOM_FOCUS = False
+
+
 # ── Optics defaults + user-named presets ─────────────────────────────────
 # The widget's OPTICS PRESETS section persists two things through /config:
 #
@@ -7206,15 +7218,25 @@ def _startup_optics_worker() -> None:
     ``optics_default`` config (widget's SET DEFAULT button); this makes
     a cold container come up on the operator's chosen survey rig, just
     like MAX TILT DOWN reseats the mount.
+
+    When ``HAS_ZOOM_FOCUS`` is False (fixed-lens 4k Cam), zoom/focus are
+    skipped -- sending them would only poke SERVO11/12 with no receiver.
     """
     writer = get_default_writer()
     default = _sanitize_optics_default(optics_default)
-    logger.info("Startup optics init: tilt=DOWN, zoom_pct=%.2f, focus_pct=%.2f",
-                default["zoom_pct"], default["focus_pct"])
+    if HAS_ZOOM_FOCUS:
+        logger.info("Startup optics init: tilt=DOWN, zoom_pct=%.2f, focus_pct=%.2f",
+                    default["zoom_pct"], default["focus_pct"])
+    else:
+        logger.info("Startup optics init: tilt=DOWN (zoom/focus disabled -- fixed lens)")
     for attempt in range(1, _STARTUP_OPTICS_MAX_ATTEMPTS + 1):
         ok_tilt  = writer.tilt_down()
-        ok_zoom  = writer.set_camera_zoom_range(default["zoom_pct"])
-        ok_focus = writer.set_camera_focus_range(default["focus_pct"])
+        if HAS_ZOOM_FOCUS:
+            ok_zoom  = writer.set_camera_zoom_range(default["zoom_pct"])
+            ok_focus = writer.set_camera_focus_range(default["focus_pct"])
+        else:
+            ok_zoom = True
+            ok_focus = True
         if ok_tilt and ok_zoom and ok_focus:
             logger.info("Startup optics init succeeded on attempt %d", attempt)
             return
@@ -7704,6 +7726,11 @@ def get_status():
             # Live tilt / focus / zoom PWM readouts so the OPTICS tab
             # can render a phosphor readout without a separate call.
             "optics": get_optics_snapshot(),
+            # Camera capability flag -- widget hides ZOOM/FOCUS controls,
+            # mini cells, and presets when False. Kept on /status (rather
+            # than a persisted config key) so a future on-the-fly picker
+            # can promote it without changing the widget contract.
+            "has_zoom_focus": HAS_ZOOM_FOCUS,
             # AWB timer state so the toggle UI can show whether the
             # 2-min loop is actively running.
             "awb_loop_enabled": awb_loop_enabled,
