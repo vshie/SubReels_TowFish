@@ -5812,6 +5812,27 @@ _heartbeat_cache = {"custom_mode": None, "armed": None,
                     "mode_label": None, "ts": 0.0}
 
 
+def _note_commanded_vehicle_state(*, armed=None, custom_mode=None) -> None:
+    """Keep the short-lived heartbeat cache coherent with accepted commands.
+
+    Without this hint, the launch guard can replay an armed-MANUAL snapshot
+    for almost a second after a mode/disarm command and briefly reassert the
+    full-up override in the new state. A real HEARTBEAT replaces this hint
+    when the cache TTL expires.
+    """
+    with _heartbeat_cache_lock:
+        if armed is not None:
+            _heartbeat_cache["armed"] = bool(armed)
+        if custom_mode is not None:
+            _heartbeat_cache["custom_mode"] = int(custom_mode)
+            _heartbeat_cache["mode_label"] = {
+                MODE_STABILIZE: "STABILIZE",
+                MODE_ALT_HOLD: "ALT_HOLD",
+                MODE_MANUAL: "MANUAL",
+            }.get(int(custom_mode))
+        _heartbeat_cache["ts"] = time.monotonic()
+
+
 def _cached_heartbeat_snapshot() -> dict:
     """Return the last HEARTBEAT within ``_HEARTBEAT_CACHE_TTL_S``, or refetch.
 
@@ -6002,9 +6023,12 @@ def _apply_awb_loop_state_change() -> None:
 # backend thread so a dropped browser event still times out (i.e. the
 # thrust stops even if the client goes away).
 #
-# Two writers now share this path: the widget's operator hold (source
-# ``"operator"``) and the surf-track controller (source ``"surftrack"``).
-# Operator wins outright -- any operator hit while surf-track is
+# Three writers share this path: the widget's operator hold (source
+# ``"operator"``), the surf-track controller (source ``"surftrack"``),
+# and the MANUAL-mode launch guard (source ``"launch_guard"``).
+# The launch guard has highest priority because its full-up command is a
+# bottom-strike interlock. Otherwise operator wins outright -- any operator
+# hit while surf-track is
 # commanding RC3 replaces the command and starts the operator cooldown,
 # during which surf-track refuses to write. This means the arrows can
 # always take back the stick, and it means a brushed button briefly
@@ -6014,7 +6038,7 @@ _thrust_stop_event = threading.Event()
 _thrust_direction: str | None = None
 _thrust_deadline: float | None = None
 _thrust_pwm: int = Z_PWM_NEUTRAL
-_thrust_source: str | None = None  # 'operator' | 'surftrack' | None
+_thrust_source: str | None = None  # operator | surftrack | launch_guard | None
 # Monotonic timestamp of the last operator hit. Surf-track refuses to
 # write for ``SURF_OPERATOR_COOLDOWN_S`` after this, so an operator
 # UP/DOWN gets a clean handoff back to ALT_HOLD before the controller
@@ -6116,11 +6140,13 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
 
     ``direction`` is ``"up"``/``"down"``/``None``; ``None`` stops the
     override (short-circuits to ``_stop_thrust_thread``). ``source`` is
-    ``"operator"`` or ``"surftrack"``.
+    ``"operator"``, ``"surftrack"``, or ``"launch_guard"``.
 
-    Operator writes always win: they replace whatever the surf-track loop
-    was doing and stamp ``_thrust_operator_last_hit`` so the loop stays
-    off the channel for ``SURF_OPERATOR_COOLDOWN_S`` afterwards.
+    The launch guard wins whenever it is active, preventing an operator
+    DOWN command from defeating the shore-launch interlock. Otherwise
+    operator writes replace whatever the surf-track loop was doing and
+    stamp ``_thrust_operator_last_hit`` so the loop stays off the channel
+    for ``SURF_OPERATOR_COOLDOWN_S`` afterwards.
     Surf-track writes are refused (returned as ``False``) while the
     operator is either holding or in cooldown, so the two sources cannot
     fight for the same channel.
@@ -6134,10 +6160,14 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
         with _thrust_lock:
             active_source = _thrust_source
         if source == "operator":
+            if active_source == "launch_guard":
+                return False
             _stop_thrust_thread()
             with _thrust_lock:
                 _thrust_operator_last_hit = time.monotonic()
         elif active_source == "surftrack":
+            _stop_thrust_thread()
+        elif source == "launch_guard" and active_source == "launch_guard":
             _stop_thrust_thread()
         return True
     if direction not in ("up", "down"):
@@ -6146,6 +6176,10 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
     now = time.monotonic()
     with _thrust_lock:
         if source == "operator":
+            if (_thrust_source == "launch_guard"
+                    and _thrust_deadline is not None
+                    and now < _thrust_deadline):
+                return False
             _thrust_operator_last_hit = now
         elif source == "surftrack":
             # An operator hit or cooldown blocks the loop entirely, so
@@ -6159,6 +6193,12 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
                     and now - _thrust_operator_last_hit
                     < SURF_OPERATOR_COOLDOWN_S):
                 return False
+            if (_thrust_source == "launch_guard"
+                    and _thrust_deadline is not None
+                    and now < _thrust_deadline):
+                return False
+        elif source == "launch_guard":
+            pass
         else:
             return False
         _thrust_direction = direction
@@ -6195,6 +6235,78 @@ def get_thrust_status_snapshot() -> dict:
         "channel": Z_CHANNEL,
         "source": source if active else None,
     }
+
+
+# --- MANUAL-mode shore-launch lift guard -----------------------------
+#
+# This winged towfish dives at its passive/disarmed surface position. During
+# a shore launch MANUAL is the intentional transit mode, so an armed fish in
+# MANUAL must never be allowed to retain neutral/down wing collective. Keep
+# RC3 at its full-up endpoint until either condition clears. All writes use
+# the shared thrust path above, giving this safety interlock priority over
+# widget jog and surf-track commands without creating a second RC3 writer.
+_LAUNCH_LIFT_POLL_S = 0.2
+
+
+class LaunchLiftGuard:
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._active = False
+
+    def _tick(self) -> None:
+        hb = _cached_heartbeat_snapshot()
+        should_lift = (
+            hb.get("armed") is True
+            and hb.get("custom_mode") == MODE_MANUAL
+        )
+        with self._lock:
+            was_active = self._active
+
+        if should_lift:
+            _set_thrust_command("up", Z_PWM_MAX, source="launch_guard")
+            if not was_active:
+                logger.warning(
+                    "Launch lift guard active: armed MANUAL, RC3 full up (%d)",
+                    Z_PWM_MAX,
+                )
+            with self._lock:
+                self._active = True
+        elif was_active:
+            _set_thrust_command(None, Z_PWM_NEUTRAL, source="launch_guard")
+            logger.info("Launch lift guard released")
+            with self._lock:
+                self._active = False
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.warning("Launch lift guard tick failed", exc_info=True)
+            self._stop_event.wait(_LAUNCH_LIFT_POLL_S)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="launch-lift-guard", daemon=True,
+        )
+        self._thread.start()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            active = self._active
+        return {
+            "active": active,
+            "pwm": Z_PWM_MAX if active else Z_PWM_NEUTRAL,
+            "condition": "armed_manual",
+        }
+
+
+_launch_lift_guard = LaunchLiftGuard()
 
 
 # --- Surf-track altitude-hold controller -----------------------------
@@ -7269,6 +7381,16 @@ def vehicle_arm():
         return jsonify({"success": False, "message": "armed required"}), 400
     want_armed = bool(data['armed'])
     ok = get_default_writer().arm(want_armed)
+    if ok:
+        _note_commanded_vehicle_state(armed=want_armed)
+    if ok and want_armed:
+        # Do not wait for the next HEARTBEAT-cache refresh when arming from
+        # MANUAL: start the launch-safe wing command immediately.
+        hb = _cached_heartbeat_snapshot()
+        if hb.get("custom_mode") == MODE_MANUAL:
+            _set_thrust_command("up", Z_PWM_MAX, source="launch_guard")
+    elif ok:
+        _set_thrust_command(None, Z_PWM_NEUTRAL, source="launch_guard")
     return jsonify({"success": ok, "armed": want_armed}), (200 if ok else 502)
 
 
@@ -7282,7 +7404,17 @@ def vehicle_mode():
             "success": False,
             "message": f"mode must be one of {sorted(_ALLOWED_MODE_NAMES)}",
         }), 400
-    ok = get_default_writer().set_mode(_ALLOWED_MODE_NAMES[mode_name])
+    requested_mode = _ALLOWED_MODE_NAMES[mode_name]
+    ok = get_default_writer().set_mode(requested_mode)
+    if ok:
+        _note_commanded_vehicle_state(custom_mode=requested_mode)
+    if (ok and requested_mode == MODE_MANUAL
+            and _cached_heartbeat_snapshot().get("armed") is True):
+        # Prime RC3 before the autopilot's next HEARTBEAT reports the new
+        # mode so an already-armed fish drives its wings up immediately.
+        _set_thrust_command("up", Z_PWM_MAX, source="launch_guard")
+    elif ok:
+        _set_thrust_command(None, Z_PWM_NEUTRAL, source="launch_guard")
     return jsonify({"success": ok, "mode": mode_name}), (200 if ok else 502)
 
 
@@ -7332,7 +7464,12 @@ def vehicle_thrust():
                             "message": "pwm must be numeric"}), 400
     pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
 
-    _set_thrust_command(direction, pwm, source="operator")
+    accepted = _set_thrust_command(direction, pwm, source="operator")
+    if not accepted:
+        return jsonify({
+            "success": False,
+            "message": "armed MANUAL launch guard owns RC3 at full up",
+        }), 409
     return jsonify({"success": True, "direction": direction, "pwm": pwm})
 
 
@@ -7702,6 +7839,10 @@ def get_status():
             # Live depth-jog RC3 override so the widget can show the
             # simulated pilot input the autopilot is actually receiving.
             "thrust": get_thrust_status_snapshot(),
+            # Shore-launch interlock: armed MANUAL always commands full-up
+            # wing collective so the passively diving fish cannot strike
+            # bottom while the boat drives away.
+            "launch_lift": _launch_lift_guard.snapshot(),
             # Surf-track altitude-hold controller state. Always present
             # (populated by the module singleton) so the widget can
             # render the state machine without null checks.
@@ -8643,6 +8784,15 @@ if __name__ == '__main__':
         _start_param_enforcement()
     except Exception as e:
         logger.warning(f"Parameter enforcement failed to start: {e}")
+
+    # Hold both control surfaces fully up whenever the fish is armed in
+    # MANUAL. This is the shore-launch safety posture: the fish can be
+    # driven away from land without its passive dive tendency carrying it
+    # into the bottom.
+    try:
+        _launch_lift_guard.start()
+    except Exception as e:
+        logger.warning(f"Launch lift guard failed to start: {e}")
 
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)
