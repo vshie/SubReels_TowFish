@@ -1402,14 +1402,15 @@ def _mav_get_message(url):
         logger.debug("mavlink2rest GET %s failed: %s", url, e)
         return None
 
-# Minimum signal quality a DISTANCE_SENSOR reading must carry to enter
-# the ring buffer. DISTANCE_SENSOR.signal_quality is 0..100 with 0
+# Minimum signal quality a DISTANCE_SENSOR reading must carry before it
+# is stored or shown. DISTANCE_SENSOR.signal_quality is 0..100 with 0
 # meaning "unknown" (either the driver did not populate it, or the
 # firmware is too old to publish it). Ping1D reports low integers when
-# it has lost bottom lock -- an 88 m return sitting at quality 1 will
-# otherwise pass ``in_range`` alone once we are off the autopilot echo
-# and its ``RNGFND1_MAX`` filter.
-_SONAR_MIN_QUALITY = 50
+# it has lost bottom lock -- an in-air return around 90 m at quality 17
+# still sits inside the driver's [min, max] window, so range alone does
+# not reject it. Anything reported below this floor is dropped from the
+# ring buffer and blanked on the water-depth readout.
+_SONAR_MIN_QUALITY = 90
 # Physical cap replacing the autopilot echo's ``RNGFND1_MAX`` filter.
 # Wider than any real survey range this vehicle will fly, but tight
 # enough that a bad-lock 90 m return still gets rejected. Matches the
@@ -1467,6 +1468,10 @@ def get_ping_sonar_snapshot():
         # older Ping firmware, so pass through only when it's a real number.
         "signal_quality": (quality if isinstance(quality, (int, float)) and quality > 0
                            else None),
+        # Floor shared with SonarHistory._classify_sample and the widget
+        # water-depth cell. A reported quality under this value is not a
+        # depth we will display or fly on.
+        "min_signal_quality": _SONAR_MIN_QUALITY,
         "orientation": orientation,
         # Server-side timestamp of the last mavlink2rest update for this
         # message. Same string across repeated GETs of an idle publisher,
@@ -1575,7 +1580,8 @@ class SonarHistory:
         backstop for the moment ``in_range`` is loosened by the driver
         moving to a wider envelope), and ``"low_quality"`` when the
         driver reports a real ``signal_quality`` under
-        :data:`_SONAR_MIN_QUALITY`.
+        :data:`_SONAR_MIN_QUALITY` (the same floor the widget uses to
+        blank the water-depth readout).
 
         ``signal_quality == None`` (older Ping firmware that does not
         publish quality at all) is treated as acceptable so this vehicle

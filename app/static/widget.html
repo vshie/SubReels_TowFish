@@ -1599,18 +1599,20 @@ async function pollStatus() {
         }
 
         // BlueBoat Ping sonar -- water depth under the surface craft.
-        // Shown only when the sonar has a bottom lock (reading within the
-        // sensor's [min,max] range); out-of-range / no-lock and an offline
-        // boat both fall back to --. A reported signal_quality below 30 is
-        // flagged amber as a low-confidence hit.
+        // Shown only with a bottom lock inside the sensor's [min, max]
+        // and a reported confidence at or above the server's floor
+        // (90). Out of range, low confidence, and an offline boat all
+        // fall back to --. A missing quality (older firmware) is still
+        // shown, matching the ring-buffer gate.
         const ping = data.ping_sonar || {};
         const pingValue = $('pingValue');
         pingValue.classList.remove('dim', 'warn');
-        if (typeof ping.distance_m === 'number' && ping.in_range) {
+        const pingMinQ = typeof ping.min_signal_quality === 'number'
+            ? ping.min_signal_quality : 90;
+        const pingLow = typeof ping.signal_quality === 'number'
+            && ping.signal_quality < pingMinQ;
+        if (typeof ping.distance_m === 'number' && ping.in_range && !pingLow) {
             pingValue.textContent = ping.distance_m.toFixed(1);
-            if (typeof ping.signal_quality === 'number' && ping.signal_quality < 30) {
-                pingValue.classList.add('warn');
-            }
         } else {
             pingValue.textContent = '--';
             pingValue.classList.add('dim');
