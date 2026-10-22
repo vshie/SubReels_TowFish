@@ -971,6 +971,18 @@
             <div class="stats-row" id="statsRow"></div>
         </div>
 
+        <!-- Camera tilt hold. Each press steps the mount 3 us of servo travel (~0.3 deg) from the last
+             commanded angle (holding repeats) and the mount stays there
+             until another step or TILT DOWN on the FLY tab. Not
+             .optics-only: the fixed-lens 4k Cam still tilts. -->
+        <div class="section">
+            <div class="section-title">TILT <span class="aux" id="tiltCmdLabel">HELD --</span></div>
+            <div class="row two">
+                <button class="btn" id="tiltUpBtn">&#9650; UP</button>
+                <button class="btn" id="tiltDnBtn">&#9660; DOWN</button>
+            </div>
+        </div>
+
         <!-- Zoom + focus share one card: two labelled rows of buttons and
              the trim/commanded readout as the section's aux label. Live
              PWMs live in the mini strip at the top of the widget, so the
@@ -1266,7 +1278,42 @@ $('vehArmBtn').addEventListener('click',    () => postJson('/vehicle/arm',  { ar
 $('vehDisarmBtn').addEventListener('click', () => postJson('/vehicle/arm',  { armed: false }));
 $('vehStabilizeBtn').addEventListener('click', () => postJson('/vehicle/mode', { mode: 'stabilize' }));
 $('vehAltHoldBtn').addEventListener('click',   () => postJson('/vehicle/mode', { mode: 'althold' }));
-$('tiltDownBtn').addEventListener('click',     () => postJson('/vehicle/tilt-down', {}));
+$('tiltDownBtn').addEventListener('click',     () => postJson('/vehicle/tilt-down', {}).then(showTiltCmd));
+
+// Tilt arrows: one 3 us (~0.3 deg) step per press, repeating while held. Each step
+// waits for the previous POST so a long hold cannot queue a burst of
+// stale commands behind a slow link.
+function showTiltCmd(data) {
+    if (data && typeof data.pitch_deg === 'number') {
+        $('tiltCmdLabel').textContent = `HELD ${data.pitch_deg.toFixed(1)}\u00b0`;
+    }
+}
+function bindTiltStep(el, direction) {
+    let timer = null;
+    let held = false;
+    const step = async () => {
+        showTiltCmd(await postJson('/vehicle/tilt', { direction }));
+        if (held) timer = setTimeout(step, 250);
+    };
+    const stop = () => {
+        held = false;
+        clearTimeout(timer); timer = null;
+        el.classList.remove('held');
+    };
+    el.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        if (held) return;
+        held = true;
+        try { el.setPointerCapture(e.pointerId); } catch (_) { /* pre-capture browsers */ }
+        el.classList.add('held');
+        step();
+    });
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
+    window.addEventListener('blur', stop);
+}
+bindTiltStep($('tiltUpBtn'), 'up');
+bindTiltStep($('tiltDnBtn'), 'down');
 
 // Operator-tunable jog PWM. The field value is what gets sent to the
 // autopilot on RC3 while a button is held, and the surf-track loop uses
@@ -1601,17 +1648,16 @@ async function pollStatus() {
         // BlueBoat Ping sonar -- water depth under the surface craft.
         // Shown only with a bottom lock inside the sensor's [min, max]
         // and a reported confidence at or above the server's floor
-        // (90). Out of range, low confidence, and an offline boat all
-        // fall back to --. A missing quality (older firmware) is still
-        // shown, matching the ring-buffer gate.
+        // (90). Out of range, low or missing confidence, and an offline
+        // boat all fall back to --, matching the ring-buffer gate.
         const ping = data.ping_sonar || {};
         const pingValue = $('pingValue');
         pingValue.classList.remove('dim', 'warn');
         const pingMinQ = typeof ping.min_signal_quality === 'number'
             ? ping.min_signal_quality : 90;
-        const pingLow = typeof ping.signal_quality === 'number'
-            && ping.signal_quality < pingMinQ;
-        if (typeof ping.distance_m === 'number' && ping.in_range && !pingLow) {
+        const pingConfident = typeof ping.signal_quality === 'number'
+            && ping.signal_quality >= pingMinQ;
+        if (typeof ping.distance_m === 'number' && ping.in_range && pingConfident) {
             pingValue.textContent = ping.distance_m.toFixed(1);
         } else {
             pingValue.textContent = '--';
@@ -1752,6 +1798,11 @@ async function pollStatus() {
 
         // Optics mini
         const opt = data.optics || {};
+        showTiltCmd({ pitch_deg: opt.tilt_cmd_deg });
+        $('tiltUpBtn').disabled = typeof opt.tilt_cmd_deg === 'number'
+            && opt.tilt_cmd_deg >= opt.tilt_cmd_max_deg;
+        $('tiltDnBtn').disabled = typeof opt.tilt_cmd_deg === 'number'
+            && opt.tilt_cmd_deg <= opt.tilt_cmd_min_deg;
         setMini('miniTilt',  opt.tilt_pwm,  opt.tilt_deg != null ? `${opt.tilt_pwm} / ${opt.tilt_deg.toFixed(0)}°` : (opt.tilt_pwm != null ? String(opt.tilt_pwm) : '--'));
         setMini('miniZoom',  opt.zoom_pwm,  opt.zoom_pwm != null ? String(opt.zoom_pwm) : '--');
         setMini('miniFocus', opt.focus_pwm, opt.focus_pwm != null ? String(opt.focus_pwm) : '--');

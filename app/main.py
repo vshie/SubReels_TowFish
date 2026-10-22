@@ -46,6 +46,7 @@ from mavlink_writer import (
     Z_PWM_NEUTRAL,
     Z_PWM_MIN,
     Z_PWM_MAX,
+    TILT_PITCH_DOWN_DEG,
     focus_pwm_to_pct,
     focus_pct_to_pwm,
     FOCUS_PWM_MIN as MAV_FOCUS_PWM_MIN,
@@ -981,11 +982,31 @@ def _effective_depth_ceiling_m():
 HAS_ZOOM_FOCUS = False
 
 
+# ── Camera tilt hold ─────────────────────────────────────────────────────
+# The CAM tab's tilt arrows step the mount by CAMERA_TILT_STEP_PWM worth of
+# SERVO16 travel from the last commanded angle, and the fly page's TILT DOWN resets it to straight
+# down. The mount runs MAVLINK_TARGETING, so the autopilot holds whatever
+# pitch it was last sent; persisting the angle means a container restart
+# reseats the operator's tilt instead of snapping back to straight down.
+# Limits mirror MNT1_PITCH_MIN / MNT1_PITCH_MAX.
+CAMERA_TILT_MIN_DEG = TILT_PITCH_DOWN_DEG
+CAMERA_TILT_MAX_DEG = 70.0
+# Step size in servo microseconds. The mount only takes angles, so the
+# route converts this to degrees through the SERVO16 calibration below
+# (TILT_PWM_MIN/MAX <-> MNT1_PITCH_MIN/MAX): 3 us is ~0.32 deg.
+CAMERA_TILT_STEP_PWM = 3
+DEFAULT_CAMERA_TILT_DEG = TILT_PITCH_DOWN_DEG
+
+
+def _sanitize_camera_tilt_deg(raw, fallback=DEFAULT_CAMERA_TILT_DEG):
+    return _sanitize_float(raw, CAMERA_TILT_MIN_DEG, CAMERA_TILT_MAX_DEG, fallback)
+
+
 # ── Optics defaults + user-named presets ─────────────────────────────────
 # The widget's OPTICS PRESETS section persists two things through /config:
 #
 #   optics_default  {zoom_pct, focus_pct}
-#       Applied on extension boot after the tilt-down/zoom-out kick, so a
+#       Applied on extension boot after the tilt/zoom-out kick, so a
 #       cold container comes up on the operator's chosen survey rig without
 #       an extra button press. Seeded from the last mission's survey mark
 #       (SERVO11=935, SERVO12=1637 -- the same 61.03 % commanded by the
@@ -1088,6 +1109,7 @@ def load_config():
         "tether_length_m": DEFAULT_TETHER_LENGTH_M,
         "optics_default": dict(DEFAULT_OPTICS_DEFAULT),
         "optics_presets": [dict(p) for p in DEFAULT_OPTICS_PRESETS],
+        "camera_tilt_deg": DEFAULT_CAMERA_TILT_DEG,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -1133,6 +1155,8 @@ def load_config():
         defaults.get("tether_length_m"))
     defaults["optics_default"] = _sanitize_optics_default(defaults.get("optics_default"))
     defaults["optics_presets"] = _sanitize_optics_presets(defaults.get("optics_presets"))
+    defaults["camera_tilt_deg"] = _sanitize_camera_tilt_deg(
+        defaults.get("camera_tilt_deg"))
     return defaults
 
 def save_config(cfg):
@@ -1246,7 +1270,10 @@ def _pick_fastest_distance_sensor(vehicles: dict):
     ``vehicles`` is the JSON body of ``/mavlink2rest/mavlink/vehicles``.
     We look at every (system, component) pair, keep the one whose
     ``DISTANCE_SENSOR`` has the highest live ``frequency``, and return
-    ``None`` if nothing publishes one.
+    ``None`` if nothing publishes one. A publisher that fills in
+    ``signal_quality`` beats a faster one that leaves it 0 ("unknown"):
+    the sample gate rejects unrated soundings, so the fast-but-unrated
+    source would otherwise starve the ring buffer and the depth readout.
 
     Discovering by measured rate rather than hardcoding ``1/194``
     survives the Ping driver migrating to a different component id --
@@ -1279,9 +1306,12 @@ def _pick_fastest_distance_sensor(vehicles: dict):
                     .get("frequency"))
             if not isinstance(freq, (int, float)):
                 freq = 0.0
-            if best is None or freq > best[2]:
-                best = (sysid, compid, float(freq))
-    return best
+            quality = (ds.get("message") or {}).get("signal_quality")
+            rated = isinstance(quality, (int, float)) and quality > 0
+            rank = (rated, float(freq))
+            if best is None or rank > best[0]:
+                best = (rank, (sysid, compid, float(freq)))
+    return best[1] if best is not None else None
 
 
 def _boat_sonar_ids():
@@ -1405,7 +1435,8 @@ def _mav_get_message(url):
 # Minimum signal quality a DISTANCE_SENSOR reading must carry before it
 # is stored or shown. DISTANCE_SENSOR.signal_quality is 0..100 with 0
 # meaning "unknown" (either the driver did not populate it, or the
-# firmware is too old to publish it). Ping1D reports low integers when
+# firmware is too old to publish it); an unknown quality is treated as
+# failing the floor, not passing it. Ping1D reports low integers when
 # it has lost bottom lock -- an in-air return around 90 m at quality 17
 # still sits inside the driver's [min, max] window, so range alone does
 # not reject it. Anything reported below this floor is dropped from the
@@ -1579,13 +1610,15 @@ class SonarHistory:
         the reading exceeds :data:`_SONAR_MAX_RANGE_M` (a physical
         backstop for the moment ``in_range`` is loosened by the driver
         moving to a wider envelope), and ``"low_quality"`` when the
-        driver reports a real ``signal_quality`` under
+        driver reports no ``signal_quality`` or one under
         :data:`_SONAR_MIN_QUALITY` (the same floor the widget uses to
         blank the water-depth readout).
 
-        ``signal_quality == None`` (older Ping firmware that does not
-        publish quality at all) is treated as acceptable so this vehicle
-        keeps working after a driver downgrade.
+        A missing quality (``None``: the publisher sent 0 / "unknown")
+        is rejected rather than trusted -- an unrated sounding is exactly
+        the reading the floor exists to keep out of altitude and surf
+        track. :func:`_pick_fastest_distance_sensor` prefers a publisher
+        that does rate its soundings, so this only bites when none does.
         """
         if not snap:
             return None, "no_link"
@@ -1600,8 +1633,8 @@ class SonarHistory:
         if distance_m > _SONAR_MAX_RANGE_M:
             return None, "over_cap"
         quality = snap.get("signal_quality")
-        if (isinstance(quality, (int, float))
-                and quality < _SONAR_MIN_QUALITY):
+        if (not isinstance(quality, (int, float))
+                or quality < _SONAR_MIN_QUALITY):
             return None, "low_quality"
         return (float(distance_m), update_id), None
 
@@ -1824,6 +1857,7 @@ surf_max_depth_m = _cfg["surf_max_depth_m"]
 tether_length_m = _cfg["tether_length_m"]
 optics_default = _cfg["optics_default"]
 optics_presets = _cfg["optics_presets"]
+camera_tilt_deg = _cfg["camera_tilt_deg"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -1849,6 +1883,7 @@ def _persist_config():
         "tether_length_m": tether_length_m,
         "optics_default": optics_default,
         "optics_presets": optics_presets,
+        "camera_tilt_deg": camera_tilt_deg,
     })
 
 # Recording-storage state
@@ -5773,6 +5808,10 @@ def get_optics_snapshot() -> dict:
     return {
         "tilt_pwm": tilt_pwm,
         "tilt_deg": tilt_deg,
+        # Held mount command from the tilt arrows / TILT DOWN.
+        "tilt_cmd_deg": camera_tilt_deg,
+        "tilt_cmd_min_deg": CAMERA_TILT_MIN_DEG,
+        "tilt_cmd_max_deg": CAMERA_TILT_MAX_DEG,
         "focus_pwm": focus_pwm,
         "focus_pct": (round(focus_pct, 2) if focus_pct is not None else None),
         "focus_pwm_min": MAV_FOCUS_PWM_MIN,
@@ -7328,7 +7367,7 @@ _STARTUP_OPTICS_RETRY_S = 3.0
 
 
 def _startup_optics_worker() -> None:
-    """After Flask boots, seat tilt + the saved default zoom / focus.
+    """After Flask boots, seat the held tilt + the saved default zoom / focus.
 
     mavlink2rest may not be ready the instant the container starts, so
     retry a bounded number of times with a short sleep between tries.
@@ -7343,12 +7382,14 @@ def _startup_optics_worker() -> None:
     writer = get_default_writer()
     default = _sanitize_optics_default(optics_default)
     if HAS_ZOOM_FOCUS:
-        logger.info("Startup optics init: tilt=DOWN, zoom_pct=%.2f, focus_pct=%.2f",
-                    default["zoom_pct"], default["focus_pct"])
+        logger.info("Startup optics init: tilt=%.1f, zoom_pct=%.2f, focus_pct=%.2f",
+                    camera_tilt_deg, default["zoom_pct"], default["focus_pct"])
     else:
-        logger.info("Startup optics init: tilt=DOWN (zoom/focus disabled -- fixed lens)")
+        logger.info("Startup optics init: tilt=%.1f (zoom/focus disabled -- fixed lens)",
+                    camera_tilt_deg)
     for attempt in range(1, _STARTUP_OPTICS_MAX_ATTEMPTS + 1):
-        ok_tilt  = writer.tilt_down()
+        # Reseat the operator's held tilt (straight down until they move it).
+        ok_tilt  = writer.mount_pitch(camera_tilt_deg)
         if HAS_ZOOM_FOCUS:
             ok_zoom  = writer.set_camera_zoom_range(default["zoom_pct"])
             ok_focus = writer.set_camera_focus_range(default["focus_pct"])
@@ -7424,10 +7465,57 @@ def vehicle_mode():
     return jsonify({"success": ok, "mode": mode_name}), (200 if ok else 502)
 
 
+_camera_tilt_lock = threading.Lock()
+
+
+def _command_camera_tilt(pitch_deg):
+    """Send the mount to ``pitch_deg`` and remember it as the held tilt.
+
+    The angle is only stored (and persisted) once mavlink2rest accepts
+    the command, so a dropped write leaves the next arrow press stepping
+    from where the mount really is rather than from a phantom target.
+    """
+    global camera_tilt_deg
+    pitch_deg = _sanitize_camera_tilt_deg(pitch_deg, camera_tilt_deg)
+    ok = get_default_writer().mount_pitch(pitch_deg)
+    if ok:
+        camera_tilt_deg = pitch_deg
+        _persist_config()
+    return ok
+
+
 @app.route('/vehicle/tilt-down', methods=['POST'])
 def vehicle_tilt_down():
-    ok = get_default_writer().tilt_down()
-    return jsonify({"success": ok, "pitch_deg": -70.0}), (200 if ok else 502)
+    with _camera_tilt_lock:
+        ok = _command_camera_tilt(TILT_PITCH_DOWN_DEG)
+    return jsonify({"success": ok, "pitch_deg": camera_tilt_deg}), (200 if ok else 502)
+
+
+def camera_tilt_step_deg():
+    """Mount angle covered by CAMERA_TILT_STEP_PWM of SERVO16 travel."""
+    deg_per_us = ((TILT_MOUNT_PITCH_MAX_DEG - TILT_MOUNT_PITCH_MIN_DEG)
+                  / (TILT_PWM_MAX - TILT_PWM_MIN))
+    return CAMERA_TILT_STEP_PWM * deg_per_us
+
+
+@app.route('/vehicle/tilt', methods=['POST'])
+def vehicle_tilt_step():
+    """Step the held camera tilt up or down.
+
+    Body: ``{"direction": "up"|"down"}``. Steps CAMERA_TILT_STEP_PWM of
+    servo travel (converted to degrees, since the mount takes angles) from
+    the last commanded angle, clamped to the mount's pitch limits. The
+    mount holds the result until another step or TILT DOWN.
+    """
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get('direction', '')).strip().lower()
+    if direction not in ('up', 'down'):
+        return jsonify({"success": False,
+                        "message": "direction must be up or down"}), 400
+    step = camera_tilt_step_deg() * (1 if direction == 'up' else -1)
+    with _camera_tilt_lock:
+        ok = _command_camera_tilt(camera_tilt_deg + step)
+    return jsonify({"success": ok, "pitch_deg": camera_tilt_deg}), (200 if ok else 502)
 
 
 @app.route('/vehicle/thrust', methods=['POST'])
@@ -8757,7 +8845,7 @@ if __name__ == '__main__':
     except Exception as e:
         logger.warning(f"USB health watcher failed to start: {e}")
 
-    # Fire tilt-down + zoom-Out once as soon as the extension is up so
+    # Reseat the held tilt + zoom-Out once as soon as the extension is up so
     # the operator doesn't have to touch the widget just to prep the
     # camera. Runs in a background thread with bounded retries in case
     # mavlink2rest is still coming up.

@@ -300,6 +300,7 @@ recordings.
 | GET | `/timelapse/start`, `/timelapse/stop` | 2 Hz snapshot capture |
 | GET/POST | `/transect/enable`, `/transect/disable` | Mission-triggered capture |
 | POST | `/vehicle/surftrack` | Enable/disable the altitude-over-bottom hold |
+| POST | `/vehicle/tilt`, `/vehicle/tilt-down` | Step the held camera tilt 3 µs of servo travel (~0.3°) up/down, or reset it to straight down |
 | GET | `/params` | Parameter specs, targets, last readings and job state |
 | POST | `/params/check` | Read parameters from the vehicles |
 | POST | `/params/apply` | Write saved targets to the vehicles |
