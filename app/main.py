@@ -7876,11 +7876,15 @@ def get_status():
         # Disk-free for the *active* recording target so the UI shows
         # the right number when writing to USB. Falls back to the local
         # extension volume otherwise.
+        # A transect leg records through either the video session or the
+        # timelapse session depending on its capture type, so check both;
+        # keying transect on ``tl`` alone reported the SD card's free space
+        # under the USB label for every video transect.
         active_dir = None
-        if mode == MODE_VIDEO and sess is not None:
-            active_dir = sess._out_dir
-        elif mode in (MODE_TIMELAPSE, MODE_TRANSECT) and tl is not None:
+        if mode in (MODE_TIMELAPSE, MODE_TRANSECT) and tl is not None:
             active_dir = tl._survey_dir
+        elif mode in (MODE_VIDEO, MODE_TRANSECT) and sess is not None:
+            active_dir = sess._out_dir
         disk_free = _read_disk_free_mb(active_dir)
         local_disk_free = _read_disk_free_mb(LOCAL_RECORDING_DIR)
         active_start = start_time if mode == MODE_VIDEO else (tl.start_time if (tl and mode == MODE_TIMELAPSE) else None)

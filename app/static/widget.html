@@ -1579,14 +1579,18 @@ async function pollStatus() {
         serverMode = newMode;
         const tx = data.transect || null;
         transectMonState = tx && tx.enabled ? (tx.state || 'waiting') : 'disabled';
-        // Keep the local capture-type selection in sync with the server.
-        // The old dropdown listened for `document.activeElement`; the new
-        // sub-buttons are click-only and never hold focus, so we always
-        // trust the server's authoritative value when the monitor is idle.
-        if (tx && !isTransectOwned()) {
-            const cfg = tx.configured_capture_type || tx.capture_type;
-            if (cfg && cfg !== transectCaptureType) {
-                transectCaptureType = cfg;
+        // Keep the capture-type highlight in sync with the server on every
+        // poll. While a transect runs it shows what the live session is
+        // actually capturing (snapshotted at session start); idle, it shows
+        // the configured type the next session will use. Skipping the sync
+        // while the monitor owned the recorder left a widget loaded
+        // mid-transect stuck on its hardcoded 'timelapse' default.
+        if (tx) {
+            const cap = isTransectOwned()
+                ? (tx.capture_type || tx.configured_capture_type)
+                : (tx.configured_capture_type || tx.capture_type);
+            if (cap && cap !== transectCaptureType) {
+                transectCaptureType = cap;
             }
         }
         if (isActive()) {
