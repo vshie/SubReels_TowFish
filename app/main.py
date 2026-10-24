@@ -386,9 +386,11 @@ SURF_ROLL_CLEAR_DEG = 10.0  # exit hysteresis (half the entry limit)
 # (-16 deg median, -24 deg when diving hardest on 23 Oct), so the old
 # 25 deg trip fired on ordinary straight-leg flight and its full-UP
 # answer dumped ~0.9 m each time; in turns it pushed an already nose-up
-# fish further up. Instead, past this angle the loop stops pushing
-# *further* in the direction the fish is already pitched and hands RC3
-# back to ALT_HOLD. It never reverses toward the surface.
+# fish further up. Past this angle the loop simply steps back:
+#   * nose down: no more DOWN commands (UP is still allowed);
+#   * nose up (typically the tether pulling in a turn): no commands at
+#     all -- RC3 is released and ALT_HOLD does what it wants until the
+#     attitude relaxes. Nothing here reacts to turns on its own.
 SURF_PITCH_SOFT_LIMIT_DEG = 35.0
 
 # Attitude has to sit inside the clear window for this long before
@@ -7016,13 +7018,12 @@ class SurfTrackController:
             return True, None
 
         direction = "down" if error > 0 else "up"
-        # Soft pitch limit: stop adding to a pitch that is already steep
-        # in the commanded direction (nose down for "down", nose up for
-        # "up"); ALT_HOLD holds depth until the attitude relaxes.
+        # Soft pitch limit: steeply nose down, stop adding DOWN; steeply
+        # nose up, stop commanding either way and leave it to ALT_HOLD.
         pitch = self._last_pitch_deg
         if isinstance(pitch, (int, float)) and (
                 (direction == "down" and pitch < -SURF_PITCH_SOFT_LIMIT_DEG)
-                or (direction == "up" and pitch > SURF_PITCH_SOFT_LIMIT_DEG)):
+                or pitch > SURF_PITCH_SOFT_LIMIT_DEG):
             self._last_command = None
             self._last_down_gate_reason = "pitch_limit"
             self._down_since = None

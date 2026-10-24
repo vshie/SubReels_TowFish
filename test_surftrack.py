@@ -579,11 +579,19 @@ check("nose-up 60 deg does not enter recovery", ctrl.state == "tracking",
       f"got state={ctrl.state}")
 check("nose-up 60 deg: no up command added", not any(c[0] == "up" for c in calls),
       f"got {calls}")
-# Nose up but the fish is too shallow -> wants down: allowed.
+# Nose up but the fish is too shallow -> would want down: still hands off.
 calls = drive(ctrl, fish_depth=4.0, now=950.5,
               attitude={"roll": 0.0, "pitch": 60.0})
-check("nose-up 60 deg and too shallow: down still allowed",
-      any(c[0] == "down" for c in calls), f"got {calls}")
+check("nose-up 60 deg and too shallow: no down command either",
+      not any(c[0] in ("up", "down") for c in calls), f"got {calls}")
+check("nose-up 60 deg: reason pitch_limit",
+      ctrl._last_down_gate_reason == "pitch_limit",
+      f"got gate={ctrl._last_down_gate_reason}")
+# Steeply nose down but too deep -> wants up: allowed.
+calls = drive(ctrl, fish_depth=8.0, now=951.0,
+              attitude={"roll": 0.0, "pitch": -40.0})
+check("nose-down 40 deg and too deep: up still allowed",
+      any(c[0] == "up" for c in calls), f"got {calls}")
 
 # ---------------------------------------------------------------------------
 # Speed gate: down refused when boat is stalled
