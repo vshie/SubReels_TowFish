@@ -72,7 +72,11 @@ scope, tow speed and depth. Planned work:
 
 - **Transect auto capture** — watches the tow boat's mission over `mavlink2rest`
   and rolls a new file or image folder at every `MISSION_CURRENT.seq` change,
-  keeping the RTSP pipeline alive across leg boundaries.
+  keeping the RTSP pipeline alive across leg boundaries. Per-leg capture
+  defaults to timelapse stills on every start; video is opt-in per survey.
+  An armed transect survives a restart: if the Pi resets mid-survey, the
+  monitor re-arms itself with the same capture type when the extension comes
+  back, and only DISABLE TRANSECT clears it.
 - **Geotagged stills** — 2 Hz JPEGs with GPS position, height above the seabed
   and full towfish attitude written into EXIF plus Pix4D-namespace XMP
   (`Camera:Yaw/Pitch/Roll` and `GPSXYAccuracy`/`GPSZAccuracy`, read by Agisoft

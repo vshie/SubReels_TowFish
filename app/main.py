@@ -1110,6 +1110,8 @@ def load_config():
         "optics_default": dict(DEFAULT_OPTICS_DEFAULT),
         "optics_presets": [dict(p) for p in DEFAULT_OPTICS_PRESETS],
         "camera_tilt_deg": DEFAULT_CAMERA_TILT_DEG,
+        "transect_armed": False,
+        "transect_armed_capture_type": None,
     }
     try:
         if os.path.exists(CONFIG_FILE):
@@ -1157,6 +1159,9 @@ def load_config():
     defaults["optics_presets"] = _sanitize_optics_presets(defaults.get("optics_presets"))
     defaults["camera_tilt_deg"] = _sanitize_camera_tilt_deg(
         defaults.get("camera_tilt_deg"))
+    defaults["transect_armed"] = bool(defaults.get("transect_armed"))
+    if defaults.get("transect_armed_capture_type") not in VALID_TRANSECT_CAPTURE_TYPES:
+        defaults["transect_armed_capture_type"] = None
     return defaults
 
 def save_config(cfg):
@@ -1858,6 +1863,12 @@ tether_length_m = _cfg["tether_length_m"]
 optics_default = _cfg["optics_default"]
 optics_presets = _cfg["optics_presets"]
 camera_tilt_deg = _cfg["camera_tilt_deg"]
+# Whether the operator left the transect monitor enabled, and with which
+# capture type. Survives a restart so a Pi brownout mid-survey resumes
+# capture instead of silently dropping it; only an operator DISABLE
+# clears it.
+transect_armed = _cfg["transect_armed"]
+transect_armed_capture_type = _cfg["transect_armed_capture_type"]
 
 def _persist_config():
     """Snapshot the currently-live config globals to disk."""
@@ -1884,6 +1895,8 @@ def _persist_config():
         "optics_default": optics_default,
         "optics_presets": optics_presets,
         "camera_tilt_deg": camera_tilt_deg,
+        "transect_armed": transect_armed,
+        "transect_armed_capture_type": transect_armed_capture_type,
     })
 
 # Recording-storage state
@@ -8259,7 +8272,6 @@ def transect_enable():
     vehicle is armed, in AUTO, and actually navigating. Mutually
     exclusive with manual MODE_VIDEO and MODE_TIMELAPSE.
     """
-    global _transect_monitor
     with _mode_lock:
         if mode == MODE_VIDEO:
             return jsonify({"success": False,
@@ -8270,14 +8282,7 @@ def transect_enable():
         if _transect_monitor is not None and _transect_monitor.state != "disabled":
             return jsonify({"success": False, "message": "Already enabled"}), 400
         try:
-            if _transect_monitor is None:
-                _transect_monitor = TransectMonitor()
-            _transect_monitor.enable()
-            logger.info("Transect monitor enabled (tow_vehicle=%s)", tow_vehicle_ip)
-            # Kick the AWB loop only if the operator's toggle is on;
-            # the timer immediately fires one AWB, then rearms itself
-            # every AWB_LOOP_INTERVAL_S until transect is disabled.
-            _apply_awb_loop_state_change()
+            _enable_transect_monitor()
             return jsonify({"success": True,
                             "state": _transect_monitor.state,
                             "tow_vehicle_ip": tow_vehicle_ip,
@@ -8285,6 +8290,58 @@ def transect_enable():
         except Exception as e:
             logger.exception("Error in /transect/enable")
             return jsonify({"success": False, "message": str(e)}), 500
+
+
+def _enable_transect_monitor():
+    """Start the transect monitor and remember that it is armed.
+
+    Caller holds ``_mode_lock`` and has already checked that no manual
+    recording is running.
+    """
+    global _transect_monitor, transect_armed, transect_armed_capture_type
+    if _transect_monitor is None:
+        _transect_monitor = TransectMonitor()
+    _transect_monitor.enable()
+    transect_armed = True
+    transect_armed_capture_type = transect_capture_type
+    _persist_config()
+    logger.info("Transect monitor enabled (tow_vehicle=%s, capture=%s)",
+                tow_vehicle_ip, transect_capture_type)
+    # Kick the AWB loop only if the operator's toggle is on;
+    # the timer immediately fires one AWB, then rearms itself
+    # every AWB_LOOP_INTERVAL_S until transect is disabled.
+    _apply_awb_loop_state_change()
+
+
+def _restore_transect_after_restart():
+    """Boot-time transect setup.
+
+    A fresh start defaults the per-leg capture to timelapse stills; video
+    is a deliberate per-survey choice, not something that should linger
+    in the config from a previous day. If the monitor was still armed
+    when the extension last stopped -- in the field that is almost always
+    a Pi brownout, not an operator -- re-arm it with the capture type it
+    was running, so the next leg the boat flies is recorded without
+    anyone having to notice the reset.
+    """
+    global transect_capture_type
+    if not transect_armed:
+        if transect_capture_type != DEFAULT_TRANSECT_CAPTURE_TYPE:
+            logger.info("Transect capture reset to %s on boot (was %s)",
+                        DEFAULT_TRANSECT_CAPTURE_TYPE, transect_capture_type)
+            transect_capture_type = DEFAULT_TRANSECT_CAPTURE_TYPE
+            _persist_config()
+        return
+    transect_capture_type = (transect_armed_capture_type
+                             or DEFAULT_TRANSECT_CAPTURE_TYPE)
+    with _mode_lock:
+        if mode != MODE_IDLE:
+            return
+        _enable_transect_monitor()
+    log_event("transect_resumed",
+              f"Transect monitor re-armed after restart ({transect_capture_type})")
+    logger.warning("Transect monitor was armed at shutdown; re-armed (%s)",
+                   transect_capture_type)
 
 @app.route('/transect/disable', methods=['GET', 'POST'])
 def transect_disable():
@@ -8294,7 +8351,12 @@ def transect_disable():
     cleanly via :func:`_stop_video_session` and the trailing leg's
     manifest row is finalised first.
     """
-    global _transect_monitor
+    global _transect_monitor, transect_armed
+    # An operator disable is the only thing that clears the armed flag, so
+    # it is cleared even when the monitor had already stopped on its own.
+    if transect_armed:
+        transect_armed = False
+        _persist_config()
     if _transect_monitor is None or _transect_monitor.state == "disabled":
         return jsonify({"success": True, "message": "Not enabled"})
     try:
@@ -8891,6 +8953,14 @@ if __name__ == '__main__':
         _launch_lift_guard.start()
     except Exception as e:
         logger.warning(f"Launch lift guard failed to start: {e}")
+
+    # Default per-leg capture to timelapse, or re-arm a transect that a
+    # brownout interrupted. After the samplers above so the monitor's first
+    # tick already has boat telemetry to look at.
+    try:
+        _restore_transect_after_restart()
+    except Exception as e:
+        logger.warning(f"Transect restore after restart failed: {e}")
 
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)
