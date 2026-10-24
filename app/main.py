@@ -382,8 +382,14 @@ SURF_MIN_DOWN_SPEED_MS = 0.7
 # it did at 13:48 in mission 241.
 SURF_ROLL_ABORT_DEG = 20.0
 SURF_ROLL_CLEAR_DEG = 10.0  # exit hysteresis (half the entry limit)
-SURF_PITCH_ABORT_DEG = 25.0
-SURF_PITCH_CLEAR_DEG = 12.5
+# Pitch is not a recovery trigger. The fish dives by pitching nose down
+# (-16 deg median, -24 deg when diving hardest on 23 Oct), so the old
+# 25 deg trip fired on ordinary straight-leg flight and its full-UP
+# answer dumped ~0.9 m each time; in turns it pushed an already nose-up
+# fish further up. Instead, past this angle the loop stops pushing
+# *further* in the direction the fish is already pitched and hands RC3
+# back to ALT_HOLD. It never reverses toward the surface.
+SURF_PITCH_SOFT_LIMIT_DEG = 35.0
 
 # Attitude has to sit inside the clear window for this long before
 # we consider leaving recovery.
@@ -6796,7 +6802,7 @@ class SurfTrackController:
             self._last_pitch_deg = pitch_deg
 
             # Recovery has the highest priority under an armed fish:
-            # a roll/pitch excursion beats every other hold reason
+            # a roll excursion or dive stall beats every other hold reason
             # because commanding up is safer than letting ALT_HOLD
             # continue to hunt a depth that just tumbled the vehicle.
             # The stall detector piggy-backs on this branch through
@@ -7010,6 +7016,18 @@ class SurfTrackController:
             return True, None
 
         direction = "down" if error > 0 else "up"
+        # Soft pitch limit: stop adding to a pitch that is already steep
+        # in the commanded direction (nose down for "down", nose up for
+        # "up"); ALT_HOLD holds depth until the attitude relaxes.
+        pitch = self._last_pitch_deg
+        if isinstance(pitch, (int, float)) and (
+                (direction == "down" and pitch < -SURF_PITCH_SOFT_LIMIT_DEG)
+                or (direction == "up" and pitch > SURF_PITCH_SOFT_LIMIT_DEG)):
+            self._last_command = None
+            self._last_down_gate_reason = "pitch_limit"
+            self._down_since = None
+            self._stall_track.clear()
+            return True, None
         raw_frac = abs(error) / max(surf_full_scale_error_m, 1e-6)
         frac = max(SURF_MIN_FRAC, min(1.0, raw_frac))
         if direction == "up":
@@ -7056,8 +7074,6 @@ class SurfTrackController:
             return None  # already inside; caller keeps state
         if isinstance(roll_deg, (int, float)) and abs(roll_deg) > SURF_ROLL_ABORT_DEG:
             return "roll_excursion"
-        if isinstance(pitch_deg, (int, float)) and abs(pitch_deg) > SURF_PITCH_ABORT_DEG:
-            return "pitch_excursion"
         return None
 
     def _check_stall_locked(self, now, fish_depth):
@@ -7096,9 +7112,7 @@ class SurfTrackController:
         # clear (they might come back showing a still-bad angle).
         roll_ok = (isinstance(roll_deg, (int, float))
                    and abs(roll_deg) < SURF_ROLL_CLEAR_DEG)
-        pitch_ok = (isinstance(pitch_deg, (int, float))
-                    and abs(pitch_deg) < SURF_PITCH_CLEAR_DEG)
-        if roll_ok and pitch_ok:
+        if roll_ok:
             if self._recovery_ok_since is None:
                 self._recovery_ok_since = now
             if now - self._recovery_ok_since >= SURF_RECOVERY_CLEAR_S:

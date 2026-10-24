@@ -544,17 +544,46 @@ check("snapshot reports recovery_cooldown_s",
 # ---------------------------------------------------------------------------
 # Recovery: pitch excursion also enters recovering
 # ---------------------------------------------------------------------------
-print("\nrecovery: pitch excursion also enters recovery")
+print("\npitch: no recovery, soft limit only stops pushing further")
+# Commanded depth 6 m, fish at 4 m -> wants to go down.
 ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
 ctrl._target_depth_m = 6.0
 ctrl._raw_target_depth_m = 6.0
-calls = drive(ctrl, fish_depth=6.0, now=900.0,
-              attitude={"roll": 0.0, "pitch": 30.0})
-check("pitch excursion -> recovering", ctrl.state == "recovering",
+calls = drive(ctrl, fish_depth=4.0, now=900.0,
+              attitude={"roll": 0.0, "pitch": -28.0})
+check("ordinary dive pitch (-28) does not enter recovery",
+      ctrl.state == "tracking", f"got state={ctrl.state}")
+check("ordinary dive pitch still commands down",
+      any(c[0] == "down" for c in calls), f"got {calls}")
+check("no full-up command at -28 deg", not any(c[0] == "up" for c in calls),
+      f"got {calls}")
+
+calls = drive(ctrl, fish_depth=4.0, now=900.5,
+              attitude={"roll": 0.0, "pitch": -40.0})
+check("past the soft limit nose down: stops commanding down",
+      not any(c[0] == "down" for c in calls), f"got {calls}")
+check("past the soft limit nose down: never drives up",
+      not any(c[0] == "up" for c in calls), f"got {calls}")
+check("past the soft limit: still tracking, reason pitch_limit",
+      ctrl.state == "tracking" and ctrl.hold_reason is None
+      and ctrl._last_down_gate_reason == "pitch_limit",
+      f"got state={ctrl.state} gate={ctrl._last_down_gate_reason}")
+
+# Nose up 60 deg while the fish is too deep -> wants up: hold, do not add up.
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
+calls = drive(ctrl, fish_depth=8.0, now=950.0,
+              attitude={"roll": 0.0, "pitch": 60.0})
+check("nose-up 60 deg does not enter recovery", ctrl.state == "tracking",
       f"got state={ctrl.state}")
-check("pitch excursion sets hold_reason 'pitch_excursion'",
-      ctrl.hold_reason == "pitch_excursion",
-      f"got hold_reason={ctrl.hold_reason}")
+check("nose-up 60 deg: no up command added", not any(c[0] == "up" for c in calls),
+      f"got {calls}")
+# Nose up but the fish is too shallow -> wants down: allowed.
+calls = drive(ctrl, fish_depth=4.0, now=950.5,
+              attitude={"roll": 0.0, "pitch": 60.0})
+check("nose-up 60 deg and too shallow: down still allowed",
+      any(c[0] == "down" for c in calls), f"got {calls}")
 
 # ---------------------------------------------------------------------------
 # Speed gate: down refused when boat is stalled
