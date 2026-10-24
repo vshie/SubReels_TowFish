@@ -282,6 +282,35 @@
         body.no-zoom-focus .optics-only { display: none !important; }
         body.no-zoom-focus .mini { grid-template-columns: repeat(2, 1fr); }
 
+        /* Attitude indicator: overlaid in the gap between TILT and DUR so
+           the strip's grid and height are untouched. The four-cell optics
+           layout has no gap, so it only shows on the fixed-lens build. */
+        .mini { position: relative; }
+        .ahi {
+            position: absolute; left: 50%; top: 50%;
+            transform: translate(-50%, -50%);
+            display: none; align-items: center; gap: 5px;
+            pointer-events: none;
+        }
+        body.no-zoom-focus .ahi { display: flex; }
+        /* Anchor TILT and DUR to the outer edges so the overlay has room
+           between them; the grid itself is unchanged. */
+        body.no-zoom-focus .mini .cell:first-child { text-align: left; padding-left: 4px; }
+        body.no-zoom-focus .mini .cell:nth-child(4) { text-align: right; padding-right: 4px; }
+        .ahi svg { display: block; overflow: visible; }
+        .ahi .sky  { fill: var(--sky);   fill-opacity: 0.32; }
+        .ahi .gnd  { fill: var(--amber); fill-opacity: 0.30; }
+        .ahi .hz   { stroke: var(--phosphor); stroke-width: 1; }
+        .ahi .ring { fill: none; stroke: var(--stroke-hi); stroke-width: 1; }
+        .ahi .ref  { fill: none; stroke: var(--phosphor); stroke-width: 1.6;
+                     stroke-linecap: round; stroke-linejoin: round; }
+        .ahi.stale #ahiHorizon { opacity: 0.25; }
+        .ahi.warn .ring { stroke: var(--red); }
+        .ahi-n { display: grid; justify-items: center; line-height: 1.05; min-width: 30px; }
+        .ahi-n .k { font-size: 9px; letter-spacing: 0.14em; font-weight: 700; color: var(--ink-dim); }
+        .ahi-n .v { font-family: var(--display); font-size: 11px; color: var(--phosphor); }
+        .ahi.stale .ahi-n .v { color: var(--ink-dim); }
+
         /* Tabs */
         .tabs {
             display: grid;
@@ -830,6 +859,22 @@
         <div class="cell">
             <div class="lbl">DUR</div>
             <div class="val duration dim" id="duration">00:00:00</div>
+        </div>
+        <div class="ahi stale" id="ahi" role="img" aria-label="Towfish attitude: no data">
+            <div class="ahi-n"><span class="k">ROLL</span><span class="v" id="ahiRoll">--</span></div>
+            <svg viewBox="-17 -17 34 34" width="32" height="32" aria-hidden="true">
+                <defs><clipPath id="ahiClip"><circle r="16"/></clipPath></defs>
+                <g clip-path="url(#ahiClip)">
+                    <g id="ahiHorizon">
+                        <rect class="sky" x="-60" y="-60" width="120" height="60"/>
+                        <rect class="gnd" x="-60" y="0" width="120" height="60"/>
+                        <line class="hz" x1="-60" y1="0" x2="60" y2="0"/>
+                    </g>
+                </g>
+                <circle class="ring" r="16"/>
+                <path class="ref" d="M-10 0 H-4 L0 3 L4 0 H10"/>
+            </svg>
+            <div class="ahi-n"><span class="k">PITCH</span><span class="v" id="ahiPitch">--</span></div>
         </div>
     </div>
 
@@ -1407,6 +1452,29 @@ const SURF_HOLD_REASONS = {
     'pitch_limit':       'pitch past 35°, ALT_HOLD in control',
 };
 
+// Attitude indicator. The horizon turns opposite the roll and drops as
+// the nose comes up, 0.36 px per degree so +/-45 deg fills the 16 px
+// radius. Roll past 45 deg rings the dial red; an inverted fish draws
+// the sky underneath, which is the point of showing it.
+const AHI_PX_PER_DEG = 0.36;
+function renderAttitude(att) {
+    const el = $('ahi');
+    const roll = typeof att.roll === 'number' ? att.roll : null;
+    const pitch = typeof att.pitch === 'number' ? att.pitch : null;
+    const fmt = v => (v > 0 ? '+' : '') + v.toFixed(0) + '\u00b0';
+    el.classList.toggle('stale', roll === null || pitch === null);
+    el.classList.toggle('warn', roll !== null && Math.abs(roll) > 45);
+    $('ahiRoll').textContent = roll === null ? '--' : fmt(roll);
+    $('ahiPitch').textContent = pitch === null ? '--' : fmt(pitch);
+    if (roll === null || pitch === null) {
+        el.setAttribute('aria-label', 'Towfish attitude: no data');
+        return;
+    }
+    const dy = Math.max(-40, Math.min(40, pitch * AHI_PX_PER_DEG));
+    $('ahiHorizon').setAttribute('transform', `rotate(${(-roll).toFixed(1)}) translate(0 ${dy.toFixed(2)})`);
+    el.setAttribute('aria-label', `Towfish roll ${fmt(roll)}, pitch ${fmt(pitch)}`);
+}
+
 // Hold-to-thrust: while pointer is down we ping /vehicle/thrust every
 // 200 ms with a keep-alive carrying the tuned PWM; on release we send
 // /vehicle/thrust/stop. A live hold keeps refreshing the backend's 3 s
@@ -1802,6 +1870,7 @@ async function pollStatus() {
         document.body.classList.toggle('no-zoom-focus', data.has_zoom_focus === false);
 
         // Optics mini
+        renderAttitude(data.attitude || {});
         const opt = data.optics || {};
         showTiltCmd({ pitch_deg: opt.tilt_cmd_deg });
         $('tiltUpBtn').disabled = typeof opt.tilt_cmd_deg === 'number'

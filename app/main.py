@@ -5808,11 +5808,12 @@ def _current_servo_pwm(channel: int) -> int | None:
     return None
 
 
-def get_optics_snapshot() -> dict:
+def get_optics_snapshot(attitude=None) -> dict:
     """Return the raw PWM for the tilt / focus / zoom outputs.
 
     Cheap enough to call from /status without saturating mavlink2rest.
-    Missing channels come back as None.
+    Missing channels come back as None. ``attitude`` lets /status pass
+    the ATTITUDE it already read so the vehicle pitch is not fetched twice.
     """
     tilt_pwm = _current_servo_pwm(TILT_SERVO_CHANNEL)
     focus_pwm = _current_servo_pwm(12)
@@ -5824,7 +5825,8 @@ def get_optics_snapshot() -> dict:
     if tilt_body is None:
         tilt_deg = None
     else:
-        veh_pitch = get_towfish_attitude().get('pitch') or 0.0
+        att = attitude if attitude is not None else get_towfish_attitude()
+        veh_pitch = att.get('pitch') or 0.0
         tilt_deg = round(tilt_body + veh_pitch, 1)
     return {
         "tilt_pwm": tilt_pwm,
@@ -7914,6 +7916,9 @@ def get_status():
         elif mode in (MODE_VIDEO, MODE_TRANSECT) and sess is not None:
             active_dir = sess._out_dir
         disk_free = _read_disk_free_mb(active_dir)
+        # One ATTITUDE read shared by the optics tilt and the widget's
+        # attitude indicator.
+        status_attitude = get_towfish_attitude() or {}
         local_disk_free = _read_disk_free_mb(LOCAL_RECORDING_DIR)
         active_start = start_time if mode == MODE_VIDEO else (tl.start_time if (tl and mode == MODE_TIMELAPSE) else None)
 
@@ -7992,7 +7997,15 @@ def get_status():
             "sonar_history": _sonar_history.snapshot(),
             # Live tilt / focus / zoom PWM readouts so the OPTICS tab
             # can render a phosphor readout without a separate call.
-            "optics": get_optics_snapshot(),
+            "optics": get_optics_snapshot(attitude=status_attitude),
+            # Towfish roll/pitch (deg, +roll right-down, +pitch nose-up)
+            # for the widget's attitude indicator.
+            "attitude": {
+                "roll": (round(status_attitude['roll'], 1)
+                         if status_attitude.get('roll') is not None else None),
+                "pitch": (round(status_attitude['pitch'], 1)
+                          if status_attitude.get('pitch') is not None else None),
+            },
             # Camera capability flag -- widget hides ZOOM/FOCUS controls,
             # mini cells, and presets when False. Kept on /status (rather
             # than a persisted config key) so a future on-the-fly picker
