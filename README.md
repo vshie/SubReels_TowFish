@@ -142,9 +142,8 @@ is a drag onto a view:
   widget with an iframe URL on the fish (default `192.168.2.2:5423`; change it
   on the link's own page in BlueOS, which also shows whether the fish is
   reachable). The widget then loads straight from the fish over the network.
-  Install it from BlueOS → Extensions → "+" with identifier
-  `vshie.subreels_towfish_link`, image `vshie/blueos-subreels_towfish_link`,
-  tag `main`, and the `permissions` label from `link/Dockerfile` as settings.
+  See [Tow boat: the Cockpit widget link](#tow-boat-the-cockpit-widget-link)
+  for the install steps.
 - **Cockpit connected to the towfish** (bench work): the TowFish extension
   advertises the widget itself, no link needed.
 
@@ -265,6 +264,61 @@ tells BlueOS to:
 The `/dev/video2` bind is inherited from the original video recorder and is not
 used here, since this extension captures over RTSP. Drop that one line if your
 towfish has no `/dev/video2`.
+
+#### Tow boat: the Cockpit widget link
+
+Cockpit only lists widgets from the BlueOS of the vehicle it is connected
+to. In the field that is the tow boat, not the towfish, so the boat needs a
+second, much smaller extension that tells its Cockpit where the towfish
+widget is. It's a different image from the towfish extension above and goes
+on the **boat**, not the fish. The same GitHub Action builds it from `link/`
+on every push to `main`.
+
+| | Towfish (above) | Tow boat link |
+| --- | --- | --- |
+| Install on | Towfish BlueOS | Tow boat BlueOS |
+| Docker image | `vshie/blueos-subreels_towfish` | `vshie/blueos-subreels_towfish_link` |
+| Port | 5423 (+ 8765) | 5424 |
+
+1. Open the **boat's** BlueOS and go to **Extensions → Installed Extensions →
+   +**.
+2. Fill in the dialog:
+   - **Extension Identifier:** `vshie.subreels_towfish_link`
+   - **Extension Name:** `SubReels: TowFish Link`
+   - **Docker image:** `vshie/blueos-subreels_towfish_link`
+   - **Docker tag:** `main`
+   - **Permissions:**
+
+   ```json
+   {
+     "ExposedPorts": {
+       "5424/tcp": {}
+     },
+     "HostConfig": {
+       "Binds": [
+         "/usr/blueos/extensions/subreels_towfish_link:/app/data"
+       ],
+       "PortBindings": {
+         "5424/tcp": [
+           {
+             "HostPort": ""
+           }
+         ]
+       },
+       "NetworkMode": "host"
+     }
+   }
+   ```
+
+3. Click **Create**, then open **SubReels: TowFish Link** from the boat's
+   BlueOS sidebar. It should report the towfish as reachable. If the towfish
+   isn't at `192.168.2.2:5423`, enter its address there and click **Save**.
+4. Connect Cockpit to the boat, open edit mode, and drag **SubReels TowFish**
+   from the extension widgets onto a view. The widget loads directly from the
+   towfish over the network.
+
+When Cockpit is connected straight to the towfish (bench work), the link isn't
+needed: the towfish extension lists the widget itself.
 
 #### Option B — Build a local image and install from file
 
