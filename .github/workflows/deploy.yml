@@ -39,3 +39,23 @@ jobs:
           author-email: ${{ vars.MY_EMAIL }}
           maintainer: ${{ vars.ORG_NAME }}
           maintainer-email: ${{ vars.ORG_EMAIL }}
+
+  # The tow boat side: a tiny service that advertises the fish's widget to
+  # the boat's Cockpit (link/). Published as blueos-subreels_towfish_link.
+  deploy-link-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Deploy BlueOS Extension
+        uses: BlueOS-community/Deploy-BlueOS-Extension@v1.2.0
+        with:
+          docker-username: ${{ secrets.DOCKER_USERNAME }}
+          docker-password: ${{ secrets.DOCKER_PASSWORD }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          image-name: 'subreels_towfish_link'
+          dockerfile-location: 'link'
+          author: ${{ vars.MY_NAME }}
+          author-email: ${{ vars.MY_EMAIL }}
+          maintainer: ${{ vars.ORG_NAME }}
+          maintainer-email: ${{ vars.ORG_EMAIL }}

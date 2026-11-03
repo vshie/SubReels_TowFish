@@ -133,8 +133,23 @@ Pre-survey configuration only, at full page width:
 
 Everything used while a survey is running — record/timelapse/transect mode
 selection, arm/disarm, flight mode, depth jog, camera tilt and white balance.
-Add it to Cockpit as a custom widget pointing at
-`http://<vehicle>/"port number from Available Services for the extension"/widget`.
+Cockpit lists it with the other extension widgets in edit mode, so adding it
+is a drag onto a view:
+
+- **Cockpit connected to the tow boat** (the normal setup): Cockpit only asks
+  the BlueOS of the vehicle it is connected to, so install the small
+  **SubReels: TowFish Link** extension on the boat as well. It advertises the
+  widget with an iframe URL on the fish (default `192.168.2.2:5423`; change it
+  on the link's own page in BlueOS, which also shows whether the fish is
+  reachable). The widget then loads straight from the fish over the network.
+  Install it from BlueOS → Extensions → "+" with identifier
+  `vshie.subreels_towfish_link`, image `vshie/blueos-subreels_towfish_link`,
+  tag `main`, and the `permissions` label from `link/Dockerfile` as settings.
+- **Cockpit connected to the towfish** (bench work): the TowFish extension
+  advertises the widget itself, no link needed.
+
+Without either, add a custom iframe widget pointing at
+`http://<towfish>:5423/widget`.
 Zoom and focus controls (plus their presets) are gated by the
 `HAS_ZOOM_FOCUS` flag in `app/main.py` and hidden by default for the
 fixed-lens 4k Cam; flip the flag to `True` to restore them for a
@@ -310,6 +325,7 @@ recordings.
 | POST | `/params/apply` | Write saved targets to the vehicles |
 | POST | `/params/targets` | Persist edited target values |
 | GET | `/list`, `/download/<file>` | Browse and fetch recordings |
+| GET | `/cockpit_extras.json` | Widget entry for a Cockpit connected to the towfish |
 
 The service listens on port 5423, with a WebSocket on 8765 publishing recording
 state to the Cockpit data lake.

@@ -4548,9 +4548,35 @@ def register_service():
         "company": "Blue Robotics",
         "version": "0.99",
         "webpage": "https://github.com/vshie/SubReels_TowFish",
-        "api": "https://github.com/bluerobotics/BlueOS-docker"
+        "api": "https://github.com/bluerobotics/BlueOS-docker",
+        "extras": {"cockpit": "/cockpit_extras.json"}
     }
     '''
+
+
+@app.route('/cockpit_extras.json')
+def cockpit_extras():
+    """Offer the widget to a Cockpit connected to this vehicle.
+
+    The widget fetches root paths (``/status``, ``/config``), so it must
+    load from this service's own port rather than through BlueOS's
+    ``/extensionv2/`` proxy. Cockpit used ``vehicle:5423`` to reach this
+    file, so ``request.host_url`` is an address it can also iframe.
+    Cockpit's page is served from port 80, which makes this fetch
+    cross-origin, hence the CORS header.
+    """
+    base = request.host_url.rstrip('/')
+    resp = jsonify({
+        "targetCockpitApiVersion": "1.0.0",
+        "targetSystem": "Cockpit",
+        "widgets": [{
+            "name": "SubReels TowFish",
+            "iframeUrl": f"{base}/widget",
+            "iconUrl": f"{base}/static/logo.png",
+        }],
+    })
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
