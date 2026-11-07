@@ -39,13 +39,34 @@ usable for to-scale model output, rather than no scaling or scaling via known ob
 ### Position estimation
 
 The fish is underwater and carries no GPS of its own, so its position is
-inferred from the boat's: every geotag is the tow vehicle's fix pushed
-backwards by a **static offset**, defaulting to 7 m. Both the distance and the
-heading it is laid back along are set in the setup console and persist across
-restarts.
+inferred from the boat's. Two models, chosen in the setup console:
 
-The heading source matters whenever the fish and the boat are not aligned —
-turns, crosswind, cross-current:
+- **Tether model** (default). From the tether length, the fish's depth and its
+  compass heading. On a straight leg the fish sits
+  `0.985 × √(L² − depth²) + 0.43 m` behind the boat's tow point: the tether
+  runs almost straight, and the fish's body is 0.43 m behind its tow point.
+  Through a turn the tether is modelled as a short chain of links, each
+  dragging the next (2 links on an 8 m tether, 3 on 16 m, 4 on 25 m). So the
+  fish cuts inside the boat's track, and coasts along its own heading when the
+  boat turns back and the tether goes slack (`app/towed_position.py`).
+  Scored against the simulator with realistic boat-GPS and compass error, the
+  p95 error through hairpins is about 3 m on 8–16 m of tether and 5.5 m on
+  25 m. A static 7 m offset was 7–21 m off there. Every photo's
+  `GPSXYAccuracy` carries the model's own 1-sigma estimate, larger in turns,
+  so photogrammetry down-weights turn frames. The model needs **tether
+  length**; until that is set, or if the boat fix drops out, the static offset
+  is used. SURF TRACK's sonar look-ahead uses the model's distance along the
+  boat's track to the fish.
+- **Static offset.** The boat's fix pushed backwards by a fixed distance
+  (default 7 m) along a chosen heading.
+
+**Line spacing** is read from the tow boat's mission over its mavlink2rest, or
+worked out from the waypoints it flies, and can be set by hand instead. The
+widget warns when the lines are tighter than the simulated minimum for the
+tether: about 12 m on 8 m of tether, 35 m on 25 m.
+
+For the static offset, the heading source matters whenever the fish and the
+boat are not aligned — turns, crosswind, cross-current:
 
 | Source | Use when |
 | --- | --- |
@@ -53,17 +74,12 @@ turns, crosswind, cross-current:
 | `boat` | the fish is yawing on the tether but the tow direction is steady |
 | `average` | a compromise between the two, taken as a circular mean so it stays correct across north |
 
-The console also carries a layback calculator: enter tether deployed and
-average towfish depth and it solves the right triangle for the horizontal leg,
-which is the offset from the tow point. A straight tether is the best case, so
-that result is an upper bound — real cable sags and the fish rides closer in.
+The console also carries a layback calculator for the static offset: enter the
+tether deployed and the average towfish depth, and it solves the right triangle
+for the horizontal leg.
 
-This is still a deliberate first approximation, and it remains the weakest link
-in the geotagging chain, since real layback varies continuously with cable
-scope, tow speed and depth. Planned work:
+Planned work:
 
-- a layback model that tracks scope, speed and depth live rather than holding a
-  configured constant
 - validating whichever model we adopt against an acoustic localization system
   carried on both the TowFish and the BlueBoat, so the estimate can be checked
   against a measured baseline instead of trusted on geometry alone
@@ -378,9 +394,10 @@ and upload it directly:
    coding quality at maximum.
 4. Choose a recording storage preference. USB is used when a drive with enough
    free space is mounted, otherwise recordings fall back to the local SD.
-5. Set the tow geometry. Use the layback calculator if you know the tether
-   length and working depth, and pick the heading source that matches how the
-   fish tracks behind the boat.
+5. Set the tow geometry: enter the **tether length** (the tether model needs
+   it), and the line spacing if the boat's mission can't be read. With the
+   static offset instead, use the layback calculator and pick the heading
+   source that matches how the fish tracks behind the boat.
 6. Run **Check All** in the survey parameters panel, adjust any targets, then
    **Apply Mismatched**.
 

@@ -311,7 +311,8 @@ def main(argv=None) -> int:
     tw.writerow(["t_sim", "t_boat", "hst", "north", "east", "depth", "roll", "pitch", "yaw",
                  "u", "v", "w", "p", "q", "r", "defl_port_deg", "defl_stbd_deg",
                  "servo5", "servo6", "tension_n", "boat_speed", "water_speed",
-                 "layback_m", "sitl_mode", "armed", "rc3", "jig", "surf", "rc2", "ar_twist"])
+                 "layback_m", "sitl_mode", "armed", "rc3", "jig", "surf", "rc2", "ar_twist",
+                 "est_n", "est_e", "est_unc"])
 
     t_sim = 0.0
     next_truth = 0.0
@@ -419,7 +420,8 @@ def main(argv=None) -> int:
                              int(bool(mav.armed)) if mav else 0, rc_now, int(phys.jig),
                              ext.label() if ext is not None else "",
                              rc2_now if rc2_now is not None else "",
-                             f"{ext.twist():.3f}" if ext is not None else ""])
+                             f"{ext.twist():.3f}" if ext is not None else "",
+                             *(ext.position_estimate() if ext is not None else ("", "", ""))])
             if time.time() - last_print > 10:
                 last_print = time.time()
                 r, p, _ = (math.degrees(a) for a in euler_from_quat(phys.q))

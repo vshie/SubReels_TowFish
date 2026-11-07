@@ -681,6 +681,10 @@
         #arState.idle    { color: var(--phosphor); border-color: var(--stroke); background: rgba(124, 242, 156, 0.06); }
         #arState.waiting { color: var(--amber);    border-color: rgba(242, 179, 76, 0.4); background: rgba(242, 179, 76, 0.06); }
         #arState.rescue  { color: var(--red);      border-color: var(--red-glow); background: rgba(239, 83, 80, 0.08); }
+        #posState { padding: 1px 6px; border-radius: 2px; border: 1px solid transparent; }
+        #posState.idle    { color: var(--phosphor); border-color: var(--stroke); background: rgba(124, 242, 156, 0.06); }
+        #posState.waiting { color: var(--amber);    border-color: rgba(242, 179, 76, 0.4); background: rgba(242, 179, 76, 0.06); }
+        #posHint.warn { color: var(--amber); }
         /* ATC_ANG_RLL_P = 0 on the fish: nothing levels it in a turn.
            Persistent while true; it rolled the fish inverted on 4 Nov. */
         .roll-p-warn {
@@ -969,6 +973,11 @@
                 <button class="btn small" id="arTwistResetBtn">RESET</button>
             </div>
             <div class="hint" id="arHint" style="display:none;"></div>
+            <div class="jog-divider">
+                <span>FISH POSITION</span>
+                <span class="aux off" id="posState">--</span>
+            </div>
+            <div class="hint" id="posHint"></div>
         </div>
 
         <div class="section">
@@ -1462,6 +1471,40 @@ $('arTwistResetBtn').addEventListener('click', () => {
         postJson('/vehicle/autoright', { reset_twist: true });
     }
 });
+
+// Towfish position model (tether length + chain model through turns) and
+// the transect spacing check against the simulated minimum for the tether.
+const SPACING_SRC = { operator: 'set', mission: 'mission', flown: 'flown' };
+function renderFishPosition(tp, sp) {
+    const pill = $('posState');
+    const hint = $('posHint');
+    pill.className = 'aux';
+    const parts = [];
+    if (tp.mode === 'fixed') {
+        pill.textContent = 'STATIC';
+        pill.classList.add('off');
+        parts.push('Static offset in use (setup page).');
+    } else if (!tp.active) {
+        pill.textContent = 'STATIC';
+        pill.classList.add('waiting');
+        parts.push(tp.reason === 'tether length not set'
+            ? 'Enter TETHER LENGTH on the setup page to use the tether model.'
+            : `Tether model waiting: ${tp.reason || 'no data'}; static offset in use.`);
+    } else {
+        pill.textContent = tp.slack ? 'SLACK' : tp.turning ? 'TURN' : 'MODEL';
+        pill.classList.add(tp.slack || tp.turning ? 'waiting' : 'idle');
+        parts.push(`Layback ${Number(tp.layback_m).toFixed(1)} m, ±${Number(tp.uncertainty_m).toFixed(1)} m`
+                   + (tp.slack ? ' (tether slack)' : tp.turning ? ' (turning)' : '') + '.');
+    }
+    if (sp.spacing_m != null) {
+        let s = `Lines ${Number(sp.spacing_m).toFixed(0)} m (${SPACING_SRC[sp.source] || sp.source})`;
+        if (sp.below_minimum) s += `: tighter than ${sp.recommended_min_m} m for this tether, expect a wobble in each turn.`;
+        else s += '.';
+        parts.push(s);
+    }
+    hint.textContent = parts.join(' ');
+    hint.classList.toggle('warn', !!sp.below_minimum);
+}
 
 function renderAutoRight(ar) {
     autoRightEnabled = !!ar.enabled;
@@ -1973,6 +2016,7 @@ async function pollStatus() {
             surfHintEl.textContent = `Dives blocked: ${gate}. ${surfHintEl.textContent}`;
         }
         renderAutoRight(data.autoright || {});
+        renderFishPosition(data.towed_position || {}, data.transect_spacing || {});
         surfHintEl.style.display = showHint ? '' : 'none';
 
         // Rec lamp

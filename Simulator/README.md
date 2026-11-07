@@ -90,6 +90,14 @@ run IDs.
 | Max depth | `sweep.py maxdepth` | Deepest the fish holds on a straight 1 m/s tow, per tether length (wings saturated down). |
 | Line spacing | `sweep.py spacing --vertical-pwm V --roll-frac R` | Narrowest hairpin spacing with \|roll\| < 45° and no auto-righting, per tether length and working depth (4, 8 and 12 m). |
 
+`analysis/position_eval.py` scores the extension's towfish position estimators
+(`app/towed_position.py`, the exact code it ships) against every run with a cable log. The boat
+tow point is cable node 0 and the truth is `truth.csv` north/east. The estimators get only what
+the extension reads (boat fix, course and speed; fish depth and compass heading; the tether
+length) at 5 Hz. Options add drifting boat-GPS error, compass noise and bias. Runs flown with
+`--extension` also log the extension's live estimate as `est_n`, `est_e`, `est_unc` in
+`truth.csv`.
+
 `analysis/tether_statics.py` is a steady towed-cable solver. It takes the fish-end force
 from the max-depth runs and gives depth for any tether length, with C_n, salt-water and
 speed bands. `tests/test_physics.py` checks it against the lumped cable.

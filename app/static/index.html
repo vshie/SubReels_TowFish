@@ -885,6 +885,42 @@
             </div>
             <div class="field-grid">
                 <div class="field">
+                    <label>POSITION MODEL</label>
+                    <div class="field-row">
+                        <div class="seg" id="towPositionMode">
+                            <button class="btn preset" data-mode="model">TETHER MODEL</button>
+                            <button class="btn preset" data-mode="fixed">STATIC OFFSET</button>
+                        </div>
+                        <span class="saved" id="towPositionModeSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        TETHER MODEL places the fish from the tether length, its depth and
+                        heading, and follows it through turns (it cuts inside the boat's
+                        track and coasts when the tether goes slack). In simulation it was
+                        3&ndash;4&times; closer than a static offset in hairpins. It needs
+                        <code>TETHER LENGTH</code> below; until that is set, and whenever
+                        the boat fix drops out, the static offset is used.
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="transectSpacing">LINE SPACING</label>
+                    <div class="field-row">
+                        <input type="number" id="transectSpacing" step="0.5" min="0" max="1000" placeholder="auto" autocomplete="off">
+                        <span class="unit">m</span>
+                        <button class="btn" id="transectSpacingSave">SAVE</button>
+                        <span class="saved" id="transectSpacingSaved">OK</span>
+                    </div>
+                    <div class="hint">
+                        Transect line spacing. <code>0</code> = automatic: read from the tow
+                        boat's mission, else worked out from the waypoints it flies. The widget
+                        warns when the lines are tighter than the simulated minimum for the
+                        tether (about 12&nbsp;m on 8&nbsp;m of tether, 35&nbsp;m on 25&nbsp;m).
+                        <span id="transectSpacingNow"></span>
+                    </div>
+                </div>
+
+                <div class="field">
                     <label for="towOffset">STATIC OFFSET</label>
                     <div class="field-row">
                         <input type="number" id="towOffset" step="0.1" min="0" max="300" placeholder="7.0" autocomplete="off">
@@ -974,7 +1010,8 @@
                         <span class="saved" id="tetherLengthSaved">OK</span>
                     </div>
                     <div class="hint">
-                        Physical tether length deployed. When set, surf-track's
+                        Physical tether length deployed. It drives the towfish position
+                        model (layback and turns) and, when set, surf-track's
                         effective ceiling is squeezed to 70&nbsp;% of this value so the
                         loop cannot ask for more scope than the cable can give --
                         the winch itself becomes a stall risk otherwise. Leave at
@@ -1129,6 +1166,18 @@ async function refreshStatus() {
     }
 
     renderStorage(data);
+    renderSpacing(data.transect_spacing);
+}
+
+const SPACING_SOURCES = { operator: 'set here', mission: "from the boat's mission",
+                          flown: 'from the waypoints flown' };
+function renderSpacing(sp) {
+    const el = $('transectSpacingNow');
+    if (!el) return;
+    if (!sp || sp.spacing_m == null) { el.textContent = 'Now: not known yet.'; return; }
+    let text = `Now: ${Number(sp.spacing_m).toFixed(1)} m (${SPACING_SOURCES[sp.source] || sp.source}).`;
+    if (sp.below_minimum) text += ` Tighter than the ${sp.recommended_min_m} m minimum for this tether.`;
+    el.textContent = text;
 }
 
 function renderStorage(d) {
@@ -1234,6 +1283,8 @@ async function loadConfig() {
         if (d.surf_full_scale_error_m != null) $('surfFullScaleError').value = Number(d.surf_full_scale_error_m).toFixed(1);
         if (d.surf_max_depth_m != null) $('surfMaxDepth').value = Number(d.surf_max_depth_m).toFixed(0);
         if (d.tether_length_m != null) $('tetherLength').value = Number(d.tether_length_m).toFixed(0);
+        if (d.tow_position_mode) markPositionMode(d.tow_position_mode);
+        if (d.transect_spacing_m != null) $('transectSpacing').value = d.transect_spacing_m > 0 ? Number(d.transect_spacing_m).toFixed(1) : '';
     } catch (e) {
         showError(`Could not load configuration: ${e.message}`);
     }
@@ -1324,6 +1375,31 @@ headingButtons.forEach((btn) => {
         markHeadingSource(btn.dataset.source);
         saveConfigField({ tow_heading_source: btn.dataset.source }, 'towHeadingSaved');
     });
+});
+
+const positionModeButtons = Array.from(
+    $('towPositionMode').querySelectorAll('button[data-mode]'));
+function markPositionMode(mode) {
+    positionModeButtons.forEach((btn) => btn.classList.toggle('selected', btn.dataset.mode === mode));
+}
+positionModeButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+        markPositionMode(btn.dataset.mode);
+        saveConfigField({ tow_position_mode: btn.dataset.mode }, 'towPositionModeSaved');
+    });
+});
+
+$('transectSpacingSave').addEventListener('click', () => {
+    const raw = $('transectSpacing').value.trim();
+    const value = raw === '' ? 0 : parseFloat(raw);
+    if (!Number.isFinite(value) || value < 0 || value > 1000) {
+        showError('Line spacing must be a number of metres between 0 (automatic) and 1000.');
+        return;
+    }
+    saveConfigField({ transect_spacing_m: value }, 'transectSpacingSaved');
+});
+$('transectSpacing').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('transectSpacingSave').click();
 });
 
 $('towOffsetSave').addEventListener('click', () => {

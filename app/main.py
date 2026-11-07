@@ -28,6 +28,7 @@ from gi.repository import Gst  # noqa: E402  (after require_version)
 
 import usb_storage
 import photogrammetry_meta
+import towed_position
 from mavlink_params import (
     BOAT_MAVTYPES,
     LOCAL_MAVLINK2REST_URL,
@@ -221,6 +222,18 @@ VALID_TOW_HEADING_SOURCES = ("towfish", "boat", "average")
 # a fat-fingered entry from throwing fixes a kilometre off.
 TOW_OFFSET_MIN_M = 0.0
 TOW_OFFSET_MAX_M = 300.0
+# How the towfish position is estimated (app/towed_position.py):
+#   "model" -> tether-length layback plus a chain model of the tether that
+#              follows the fish through turns (fit to the simulator: about
+#              3-4x less error in hairpins). Needs ``tether_length_m``;
+#              falls back to "fixed" until that is set.
+#   "fixed" -> ``tow_offset_m`` astern along ``tow_heading_source``.
+DEFAULT_TOW_POSITION_MODE = "model"
+VALID_TOW_POSITION_MODES = ("model", "fixed")
+# Transect line spacing. 0 = automatic: read from the tow boat's mission,
+# else derived from the waypoints it flies. Set it to override both.
+DEFAULT_TRANSECT_SPACING_M = 0.0
+TRANSECT_SPACING_MAX_M = 1000.0
 
 # ── Altitude above the seabed ────────────────────────────────────────────
 # The towfish carries no altimeter, so its height above the bottom is
@@ -1010,6 +1023,23 @@ def _sanitize_altitude_offset_m(raw, fallback=DEFAULT_ALTITUDE_OFFSET_M):
     return max(ALTITUDE_OFFSET_MIN_M, min(ALTITUDE_OFFSET_MAX_M, num))
 
 
+def _sanitize_tow_position_mode(raw, fallback=DEFAULT_TOW_POSITION_MODE):
+    if not isinstance(raw, str):
+        return fallback
+    value = raw.strip().lower()
+    return value if value in VALID_TOW_POSITION_MODES else fallback
+
+
+def _sanitize_transect_spacing_m(raw, fallback=DEFAULT_TRANSECT_SPACING_M):
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if num != num or num in (float("inf"), float("-inf")):
+        return fallback
+    return max(0.0, min(TRANSECT_SPACING_MAX_M, num))
+
+
 def _sanitize_tow_heading_source(raw, fallback=DEFAULT_TOW_HEADING_SOURCE):
     """Coerce a saved/posted heading-source name to a known mode."""
     if not isinstance(raw, str):
@@ -1236,6 +1266,8 @@ def load_config():
         "param_target_defaults": dict(DEFAULT_PARAM_TARGETS),
         "tow_offset_m": DEFAULT_TOW_OFFSET_M,
         "tow_heading_source": DEFAULT_TOW_HEADING_SOURCE,
+        "tow_position_mode": DEFAULT_TOW_POSITION_MODE,
+        "transect_spacing_m": DEFAULT_TRANSECT_SPACING_M,
         "altitude_offset_m": DEFAULT_ALTITUDE_OFFSET_M,
         "jog_up_pwm": DEFAULT_JOG_UP_PWM,
         "jog_down_pwm": DEFAULT_JOG_DOWN_PWM,
@@ -1282,6 +1314,10 @@ def load_config():
         defaults.get("tow_offset_m"))
     defaults["tow_heading_source"] = _sanitize_tow_heading_source(
         defaults.get("tow_heading_source"))
+    defaults["tow_position_mode"] = _sanitize_tow_position_mode(
+        defaults.get("tow_position_mode"))
+    defaults["transect_spacing_m"] = _sanitize_transect_spacing_m(
+        defaults.get("transect_spacing_m"))
     defaults["altitude_offset_m"] = _sanitize_altitude_offset_m(
         defaults.get("altitude_offset_m"))
     defaults["jog_up_pwm"] = _sanitize_jog_up_pwm(defaults.get("jog_up_pwm"))
@@ -1824,6 +1860,12 @@ class SonarHistory:
         """
         with self._lock:
             speed = self._speed_ms
+        if tow_position_mode == "model":
+            along = _towfish_position.along_path_m()
+            if along is not None:
+                if speed is None or speed < _TOW_DELAY_MIN_SPEED_MS:
+                    return None
+                return min(_TOW_DELAY_MAX_S, along / speed)
         if tow_offset_m <= 0:
             return 0.0
         if speed is None or speed < _TOW_DELAY_MIN_SPEED_MS:
@@ -2000,6 +2042,8 @@ awb_loop_enabled = _cfg["awb_loop_enabled"]
 param_targets = _cfg["param_targets"]
 tow_offset_m = _cfg["tow_offset_m"]
 tow_heading_source = _cfg["tow_heading_source"]
+tow_position_mode = _cfg["tow_position_mode"]
+transect_spacing_m = _cfg["transect_spacing_m"]
 altitude_offset_m = _cfg["altitude_offset_m"]
 jog_up_pwm = _cfg["jog_up_pwm"]
 jog_down_pwm = _cfg["jog_down_pwm"]
@@ -2038,6 +2082,8 @@ def _persist_config():
         "param_target_defaults": dict(DEFAULT_PARAM_TARGETS),
         "tow_offset_m": tow_offset_m,
         "tow_heading_source": tow_heading_source,
+        "tow_position_mode": tow_position_mode,
+        "transect_spacing_m": transect_spacing_m,
         "altitude_offset_m": altitude_offset_m,
         "jog_up_pwm": jog_up_pwm,
         "jog_down_pwm": jog_down_pwm,
@@ -2371,11 +2417,19 @@ def resolve_tow_heading(towfish_heading=None):
 def offset_towed_position(lat, lon, towfish_heading=None):
     """Push a tow-point fix back to where the towfish is estimated to be.
 
-    Returns the input position unchanged when the offset is disabled or
-    no heading is available from either vehicle.
+    In ``model`` mode the towfish position tracker's latest estimate is
+    used (its boat-to-fish displacement applied to this fix); it falls back
+    to the fixed offset when the tracker has nothing fresh -- no tether
+    length set, or no recent boat fix. Returns the input position unchanged
+    when the offset is disabled or no heading is available from either
+    vehicle.
     """
     if lat is None or lon is None:
         return (None, None)
+    if tow_position_mode == "model":
+        modelled = _towfish_position.apply(lat, lon)
+        if modelled is not None:
+            return modelled
     if tow_offset_m <= 0:
         return (lat, lon)
     heading = resolve_tow_heading(towfish_heading)
@@ -2391,6 +2445,276 @@ def get_towing_gps_position():
     """
     lat, lon, _alt = get_blueboat_gps_position()
     return offset_towed_position(lat, lon)
+
+
+def get_blueboat_fix():
+    """Boat fix with course and speed over ground (GLOBAL_POSITION_INT).
+
+    Returns ``{"lat", "lon", "course", "speed"}`` or None. Course is None
+    below 0.1 m/s, where the velocity vector says nothing about direction.
+    """
+    try:
+        response = _HTTP.get(_blueboat_gps_url(), timeout=1)
+        if response.status_code != 200:
+            return None
+        m = response.json().get('message', {})
+        lat, lon = m.get('lat'), m.get('lon')
+        if lat is None or lon is None:
+            return None
+        vx = (m.get('vx') or 0) / 100.0        # north, cm/s -> m/s
+        vy = (m.get('vy') or 0) / 100.0        # east
+        speed = math.hypot(vx, vy)
+        course = (math.degrees(math.atan2(vy, vx)) % 360) if speed > 0.1 else None
+        return {"lat": lat / 1e7, "lon": lon / 1e7, "course": course, "speed": speed}
+    except Exception as e:
+        logger.debug(f"Error fetching BlueBoat fix: {e}")
+        return None
+
+
+# ── Towfish position tracker ─────────────────────────────────────────────
+# Runs app/towed_position.py's chain model at 5 Hz from the boat fix, the
+# fish's depth and compass heading, and the operator's tether length. The
+# geotag paths read its latest estimate through offset_towed_position();
+# SURF TRACK's look-ahead reads the along-path distance. Scored against
+# the simulator in Simulator/analysis/position_eval.py.
+_TOWFISH_POSITION_PERIOD_S = 0.2
+_TOWFISH_POSITION_STALE_S = 2.0
+
+
+class TowfishPositionSampler:
+    def __init__(self):
+        self.tracker = towed_position.TowedPositionTracker(0.0, method="chain")
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop = threading.Event()
+        self._last = None          # (monotonic, boat_lat, boat_lon, estimate dict)
+        self._last_error = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="towfish-position")
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                self.tick(t0)
+                self._last_error = None
+            except Exception as e:  # never let the sampler die
+                self._last_error = str(e)
+                logger.debug("Towfish position tick failed: %s", e)
+            self._stop.wait(max(0.0, _TOWFISH_POSITION_PERIOD_S - (time.monotonic() - t0)))
+
+    def tick(self, now):
+        fix = get_blueboat_fix()
+        if fix is None:
+            return
+        att = get_towfish_attitude()
+        depth = _get_towfish_depth_m()
+        L = float(tether_length_m or 0.0)
+        self.tracker.set_tether_length(L)
+        est = self.tracker.update(now, fix["lat"], fix["lon"], fix["course"],
+                                  fix["speed"], depth, att.get("yaw"))
+        est["speed"] = fix["speed"]
+        with self._lock:
+            self._last = (now, fix["lat"], fix["lon"], est)
+        _transect_spacing.observe_fix(fix["lat"], fix["lon"])
+
+    def estimate(self):
+        """Latest estimate if fresh and the tether length is set, else None."""
+        if not tether_length_m or tether_length_m <= 0:
+            return None
+        with self._lock:
+            last = self._last
+        if last is None or time.monotonic() - last[0] > _TOWFISH_POSITION_STALE_S:
+            return None
+        return last
+
+    def apply(self, lat, lon):
+        """The tracker's boat-to-fish displacement applied to this fix."""
+        last = self.estimate()
+        if last is None:
+            return None
+        _, blat, blon, est = last
+        dlat, dlon = est["lat"] - blat, est["lon"] - blon
+        return (lat + dlat, lon + dlon)
+
+    def uncertainty_m(self):
+        last = self.estimate()
+        return None if last is None else last[3].get("uncertainty_m")
+
+    def along_path_m(self):
+        last = self.estimate()
+        if last is None:
+            return None
+        est = last[3]
+        return est.get("along_path_m") or est.get("layback_m")
+
+    def snapshot(self):
+        last = self.estimate()
+        base = {"mode": tow_position_mode, "tether_length_m": tether_length_m,
+                "active": last is not None and tow_position_mode == "model",
+                "error": self._last_error}
+        if last is None:
+            base["reason"] = ("tether length not set" if not tether_length_m
+                              else "no recent boat fix")
+            return base
+        est = last[3]
+        base.update({
+            "layback_m": round(est["layback_m"], 2),
+            "along_path_m": (round(est["along_path_m"], 2)
+                             if est.get("along_path_m") is not None else None),
+            "slack": est["slack"], "turning": est["turning"],
+            "uncertainty_m": est["uncertainty_m"],
+            "lat": round(est["lat"], 7), "lon": round(est["lon"], 7),
+            "age_s": round(time.monotonic() - last[0], 2),
+        })
+        return base
+
+
+# ── Transect line spacing ────────────────────────────────────────────────
+# Resolution order: the operator's transect_spacing_m when set; the tow
+# boat's loaded mission (downloaded over its mavlink2rest); the waypoints
+# the boat has actually flown (each target taken from NAV_CONTROLLER_OUTPUT
+# as wp_dist along target_bearing from the boat fix). Used for the turn
+# warning against the simulated minimum for the tether.
+_MISSION_READ_PERIOD_S = 120.0
+_MISSION_ITEM_TIMEOUT_S = 1.5
+MAV_CMD_NAV_WAYPOINT = 16
+
+
+class TransectSpacing:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._mission = None          # spacing from the downloaded mission
+        self._mission_at = None
+        self._mission_total = None
+        self._flown = {}              # mission seq -> (lat, lon) of the target waypoint
+        self._last_seq = None
+        self._read_at = None
+        self._last_error = None
+
+    # -- live derivation from the waypoints flown --------------------------
+    def observe_fix(self, lat, lon):
+        try:
+            mc = _mav_get_message(_tow_mavlink_url('MISSION_CURRENT')) or {}
+            nav = _mav_get_message(_tow_mavlink_url('NAV_CONTROLLER_OUTPUT')) or {}
+        except Exception:
+            return
+        seq = mc.get('seq')
+        dist, bearing = nav.get('wp_dist'), nav.get('target_bearing')
+        if isinstance(seq, int) and isinstance(dist, (int, float)) and isinstance(bearing, (int, float)):
+            lat2, lon2 = calculate_offset_position(lat, lon, (bearing + 180.0) % 360, float(dist))
+            with self._lock:
+                self._flown[seq] = (lat2, lon2)
+                if len(self._flown) > 200:
+                    self._flown.pop(min(self._flown))
+        total = mc.get('total')
+        if isinstance(total, int) and total != self._mission_total:
+            self._mission_total = total
+            self._read_at = None           # mission changed: read it again
+        now = time.monotonic()
+        if self._read_at is None or now - self._read_at > _MISSION_READ_PERIOD_S:
+            self._read_at = now
+            threading.Thread(target=self.read_mission, daemon=True,
+                             name="mission-spacing").start()
+
+    def flown_spacing_m(self):
+        with self._lock:
+            pts = [self._flown[k] for k in sorted(self._flown)]
+        return towed_position.spacing_from_waypoints(pts)
+
+    # -- mission download --------------------------------------------------
+    def _writer(self):
+        sysid, comp = _boat_vehicle_ids()
+        # Its own GCS id so the transfer never interleaves with Cockpit's.
+        return MavlinkWriter(base_url=f"http://{tow_vehicle_ip}/mavlink2rest",
+                             target_system=sysid, target_component=comp,
+                             gcs_system_id=250, gcs_component_id=191, timeout_s=1.0)
+
+    def _wait_for(self, name, pred, timeout_s):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            msg = _mav_get_message(_tow_mavlink_url(name)) or {}
+            if msg and pred(msg):
+                return msg
+            time.sleep(0.05)
+        return None
+
+    def read_mission(self):
+        """Download the boat's mission and compute the line spacing."""
+        try:
+            w = self._writer()
+            mt = {"type": "MAV_MISSION_TYPE_MISSION"}
+            if not w.send_message({"type": "MISSION_REQUEST_LIST",
+                                   "target_system": w.target_system,
+                                   "target_component": w.target_component,
+                                   "mission_type": mt}):
+                raise RuntimeError("MISSION_REQUEST_LIST not accepted")
+            cnt = self._wait_for('MISSION_COUNT', lambda m: isinstance(m.get('count'), int),
+                                 _MISSION_ITEM_TIMEOUT_S)
+            if cnt is None:
+                raise RuntimeError("no MISSION_COUNT")
+            pts = []
+            for seq in range(int(cnt['count'])):
+                item = None
+                for _ in range(3):
+                    w.send_message({"type": "MISSION_REQUEST_INT",
+                                    "target_system": w.target_system,
+                                    "target_component": w.target_component,
+                                    "seq": seq, "mission_type": mt})
+                    item = self._wait_for('MISSION_ITEM_INT', lambda m, s=seq: m.get('seq') == s,
+                                          _MISSION_ITEM_TIMEOUT_S)
+                    if item is not None:
+                        break
+                if item is None:
+                    raise RuntimeError(f"no MISSION_ITEM_INT {seq}")
+                cmd = item.get('command')
+                cmd = cmd.get('type') if isinstance(cmd, dict) else cmd
+                if cmd in (MAV_CMD_NAV_WAYPOINT, "MAV_CMD_NAV_WAYPOINT") and item.get('x'):
+                    pts.append((item['x'] / 1e7, item['y'] / 1e7))
+            w.send_message({"type": "MISSION_ACK", "target_system": w.target_system,
+                            "target_component": w.target_component,
+                            "mavtype": {"type": "MAV_MISSION_ACCEPTED"}, "mission_type": mt})
+            spacing = towed_position.spacing_from_waypoints(pts)
+            with self._lock:
+                self._mission, self._mission_at = spacing, time.monotonic()
+            self._last_error = None
+        except Exception as e:
+            self._last_error = str(e)
+            logger.debug("Mission spacing read failed: %s", e)
+
+    # -- resolution --------------------------------------------------------
+    def resolve(self):
+        """(spacing_m, source) with source operator | mission | flown | None."""
+        if transect_spacing_m and transect_spacing_m > 0:
+            return float(transect_spacing_m), "operator"
+        with self._lock:
+            mission = self._mission
+        if mission:
+            return mission, "mission"
+        flown = self.flown_spacing_m()
+        if flown:
+            return flown, "flown"
+        return None, None
+
+    def snapshot(self):
+        spacing, source = self.resolve()
+        L = float(tether_length_m or 0.0)
+        out = {"spacing_m": spacing, "source": source, "error": self._last_error}
+        if L > 0:
+            rec = towed_position.recommended_min_spacing_m(L)
+            out["recommended_min_m"] = rec
+            out["below_minimum"] = bool(spacing is not None and spacing < rec)
+        return out
+
+
+_towfish_position = TowfishPositionSampler()
+_transect_spacing = TransectSpacing()
 
 def get_isp_info():
     """Get camera ISP info from the camera endpoint.
@@ -4571,6 +4895,10 @@ class TimelapseSession:
                 surf_error = telemetry.get('surf_error_m')
             xy_acc, z_acc = photogrammetry_meta.reference_accuracy_m(
                 tow_offset_m, tow_alt)
+            if tow_position_mode == "model":
+                modelled_acc = _towfish_position.uncertainty_m()
+                if modelled_acc is not None:
+                    xy_acc = modelled_acc
 
             # Embed GPS+heading+tilt+timestamp into EXIF and the camera
             # orientation into Pix4D-namespace XMP before writing, so the
@@ -4733,6 +5061,7 @@ def config():
     global tow_vehicle_ip, container_format, stream_protocol, snapshot_url
     global transect_capture_type, storage_preference, awb_loop_enabled
     global tow_offset_m, tow_heading_source, altitude_offset_m
+    global tow_position_mode, transect_spacing_m
     global jog_up_pwm, jog_down_pwm
     global surf_target_altitude_m, surf_deadband_m, surf_full_scale_error_m
     global surf_max_depth_m, tether_length_m
@@ -4868,6 +5197,28 @@ def config():
                 return jsonify({"success": False,
                                 "message": f"tow_heading_source must be one of {VALID_TOW_HEADING_SOURCES}"}), 400
             tow_heading_source = new_heading_src
+            changed = True
+
+        new_pos_mode = data.get('tow_position_mode')
+        if new_pos_mode is not None:
+            new_pos_mode = str(new_pos_mode).strip().lower()
+            if new_pos_mode not in VALID_TOW_POSITION_MODES:
+                return jsonify({"success": False,
+                                "message": f"tow_position_mode must be one of {VALID_TOW_POSITION_MODES}"}), 400
+            tow_position_mode = new_pos_mode
+            changed = True
+
+        new_spacing = data.get('transect_spacing_m')
+        if new_spacing is not None:
+            try:
+                spacing_val = float(new_spacing)
+            except (TypeError, ValueError):
+                return jsonify({"success": False,
+                                "message": "transect_spacing_m must be a number"}), 400
+            if not (0.0 <= spacing_val <= TRANSECT_SPACING_MAX_M):
+                return jsonify({"success": False,
+                                "message": f"transect_spacing_m must be between 0 (automatic) and {TRANSECT_SPACING_MAX_M} m"}), 400
+            transect_spacing_m = _sanitize_transect_spacing_m(spacing_val)
             changed = True
 
         # Jog PWM authority: persisted so the arrows *and* the surf-track
@@ -5010,6 +5361,8 @@ def config():
                         "awb_loop_enabled": awb_loop_enabled,
                         "tow_offset_m": tow_offset_m,
                         "tow_heading_source": tow_heading_source,
+                        "tow_position_mode": tow_position_mode,
+                        "transect_spacing_m": transect_spacing_m,
                         "altitude_offset_m": altitude_offset_m,
                         "jog_up_pwm": jog_up_pwm,
                         "jog_down_pwm": jog_down_pwm,
@@ -5034,6 +5387,9 @@ def config():
         "tow_offset_m": tow_offset_m,
         "tow_heading_source": tow_heading_source,
         "tow_heading_sources": list(VALID_TOW_HEADING_SOURCES),
+        "tow_position_mode": tow_position_mode,
+        "tow_position_modes": list(VALID_TOW_POSITION_MODES),
+        "transect_spacing_m": transect_spacing_m,
         "tow_offset_min_m": TOW_OFFSET_MIN_M,
         "tow_offset_max_m": TOW_OFFSET_MAX_M,
         "altitude_offset_m": altitude_offset_m,
@@ -8733,6 +9089,8 @@ def get_status():
             # wing collective so the passively diving fish cannot strike
             # bottom while the boat drives away.
             "launch_lift": _launch_lift_guard.snapshot(),
+            "towed_position": _towfish_position.snapshot(),
+            "transect_spacing": _transect_spacing.snapshot(),
             # Surf-track altitude-hold controller state. Always present
             # (populated by the module singleton) so the widget can
             # render the state machine without null checks.
@@ -9812,6 +10170,13 @@ if __name__ == '__main__':
         _sonar_history.start()
     except Exception as e:
         logger.warning(f"Sonar history sampler failed to start: {e}")
+
+    # Towfish position model: always running, so the first geotag of a
+    # leg already has the chain settled behind the boat.
+    try:
+        _towfish_position.start()
+    except Exception as e:
+        logger.warning(f"Towfish position tracker failed to start: {e}")
 
     # Re-assert the towfish parameter targets. ArduSub's stock values
     # describe a thruster ROV, and mission 241 proved that leaving the

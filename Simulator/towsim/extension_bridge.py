@@ -151,6 +151,7 @@ class ExtensionBridge:
         self.attitude: dict = {}
         self.vehicle: dict = {}
         self.servo: dict = {}
+        self.track = track
         self.sonar = BoatSonar(track, tow_offset_m, bottom_depth_m)
         self.nav = BoatNav(track)
         self.t_boat = 0.0
@@ -165,6 +166,11 @@ class ExtensionBridge:
         main.get_default_writer = lambda: self
         main._persist_config = lambda: None
         main._tow_mission_seq = lambda: self.nav.seq(self.t_boat)
+        # The towfish position tracker, ticked on the sim clock from the
+        # boat track (as a GPS fix) and the fish's depth and heading.
+        main.get_blueboat_fix = self._boat_fix
+        main._towfish_position = main.TowfishPositionSampler()
+        main._transect_spacing.observe_fix = lambda *a, **k: None
         main.tether_twist_turns = 0.0
         # The values the fish flew on 4 Nov where the log shows them (jog
         # PWMs from RCIN); everything else at the extension's defaults.
@@ -213,6 +219,29 @@ class ExtensionBridge:
             self.rc2 = 1500
         return True
 
+    def _boat_fix(self):
+        import towed_position as tp
+        (n, e, _), (vn, ve, _) = self.track.state(self.t_boat)
+        lat0, lon0 = self.track.lat0, self.track.lon0
+        lat = lat0 + math.degrees(n / tp.EARTH_R)
+        lon = lon0 + math.degrees(e / (tp.EARTH_R * math.cos(math.radians(lat0))))
+        speed = math.hypot(vn, ve)
+        course = math.degrees(math.atan2(ve, vn)) % 360 if speed > 0.1 else None
+        return {"lat": lat, "lon": lon, "course": course, "speed": speed}
+
+    def position_estimate(self):
+        """(north, east, uncertainty) of the extension's towfish estimate in
+        the sim frame, or blanks while it has none (truth.csv est_*)."""
+        import towed_position as tp
+        last = self.main._towfish_position.estimate()
+        if last is None:
+            return ("", "", "")
+        est = last[3]
+        lat0, lon0 = self.track.lat0, self.track.lon0
+        n = math.radians(est["lat"] - lat0) * tp.EARTH_R
+        e = math.radians(est["lon"] - lon0) * tp.EARTH_R * math.cos(math.radians(lat0))
+        return (f"{n:.3f}", f"{e:.3f}", f"{est['uncertainty_m']:.2f}")
+
     def set_mode(self, mode):
         self.mav.set_mode(int(mode))
         return True
@@ -246,6 +275,7 @@ class ExtensionBridge:
         # The shore-launch guard ships running: full up in any armed MANUAL
         # that is not an auto-righting rescue.
         self.main._launch_lift_guard._tick()
+        self.main._towfish_position.tick(t_sim)
         # The extension's own NVAL worker may drain the same queue, so an
         # empty() check can go stale before get_nowait().
         q = self.ctrl._bin_queue

@@ -186,6 +186,15 @@ class MavlinkWriter:
             "time_boot_ms": int(boot_ms),
         })
 
+    def send_message(self, message: dict) -> bool:
+        """POST any message dict (``{"type": ..., fields}``) as this GCS.
+
+        For protocols with no dedicated helper here, such as reading the
+        tow boat's mission (MISSION_REQUEST_LIST / MISSION_REQUEST_INT).
+        Enums go in mavlink2rest's ``{"type": "ENUM_NAME"}`` form.
+        """
+        return self._post(message)
+
     def named_value_float(self, name: str, value: float) -> bool:
         """POST a NAMED_VALUE_FLOAT so the autopilot logs it as ``NVAL``.
 
