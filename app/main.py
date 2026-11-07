@@ -15,6 +15,7 @@ import time
 import requests
 import threading
 import math
+import queue
 import websockets
 import csv
 import re
@@ -247,7 +248,10 @@ ALTITUDE_OFFSET_MAX_M = 5.0
 # would push the stick with different force. Persisting them here makes
 # one number govern both. Bounds match the widget's existing clampJog().
 DEFAULT_JOG_UP_PWM = Z_PWM_ASCEND
-DEFAULT_JOG_DOWN_PWM = Z_PWM_DESCEND
+# 1300, as flown on 4 Nov, not Z_PWM_DESCEND (1400): ArduSub ignores the
+# THR_DZ = 100 us either side of 1500, so a 1400 jog -- and every SURF
+# TRACK down command scaled toward it -- never left the deadzone.
+DEFAULT_JOG_DOWN_PWM = 1300
 JOG_UP_PWM_MIN = Z_PWM_NEUTRAL + 1  # 1501: never let "up" cross neutral
 JOG_UP_PWM_MAX = Z_PWM_MAX
 JOG_DOWN_PWM_MIN = Z_PWM_MIN
@@ -373,33 +377,124 @@ SURF_MIN_TOW_SPEED_MS = _TOW_DELAY_MIN_SPEED_MS
 # recover without the fish diving through the surface.
 SURF_MIN_DOWN_SPEED_MS = 0.7
 
-# --- Recovery state ---------------------------------------------------
-# Roll excursion outside the ArduSub STABILIZE_ROLL_LIMIT (which this
-# vehicle runs at 30 deg) is a clear sign the fish is not in the
-# attitude it thinks it is. We enter recovery well before that limit
-# so ALT_HOLD does not get to hunt itself into a full tumble the way
-# it did at 13:48 in mission 241.
-SURF_ROLL_ABORT_DEG = 20.0
-SURF_ROLL_CLEAR_DEG = 10.0  # exit hysteresis (half the entry limit)
-SURF_PITCH_ABORT_DEG = 25.0
-SURF_PITCH_CLEAR_DEG = 12.5
-
-# Attitude has to sit inside the clear window for this long before
-# we consider leaving recovery.
-SURF_RECOVERY_CLEAR_S = 3.0
+# --- Dive gates ---------------------------------------------------------
+# There is deliberately no "recovery" state that commands up on an
+# attitude excursion. The 4 Nov 2026 tow showed one doing harm: it
+# tripped on attitudes the fish flies routinely, commanded full up with
+# no depth limit and drove the fish to the surface every time. What the
+# logs support instead is refusing to make things worse -- each gate
+# below only blocks *down* commands (and pins the commanded depth to
+# where the fish is), it never climbs. Pitch feeds no decision anywhere
+# in this controller: the fish tows ~14 deg nose-down and full-power
+# dives reach -25..-38 deg, so no pitch limit separates trouble from
+# normal flight.
+#
 # Continuous down-command with less than this many metres of gain
-# counts as a stall (thruster fighting drag it cannot win).
+# counts as a stall (the wings fighting drag they cannot win).
 SURF_STALL_WINDOW_S = 8.0
 SURF_STALL_MIN_GAIN_M = 0.2
-# After exiting recovery the loop clamps down-slew to the down-slew /
-# this factor for a soft cooldown, so re-descending is done gently.
-SURF_RECOVERY_COOLDOWN_S = 10.0
-SURF_RECOVERY_COOLDOWN_SLEW_FRAC = 0.5
-# Fraction of RC3 authority to use while actively commanding *up*
-# out of a recovery. Full up beats "release RC3": releasing leaves
-# ALT_HOLD trying to hold the depth the fish stalled reaching, which
-# is what turned the 13:48 dive into a 176 deg tumble.
-SURF_RECOVERY_UP_FRAC = 1.0
+# After a stall, refuse down commands for this long so the loop does not
+# immediately ask for the depth that just stalled it.
+SURF_DOWN_HOLDOFF_S = 10.0
+# Above this roll, refuse down. ALT_HOLD's "down" wing collective is what
+# turned every 4 Nov turn into a climb: once the fish rolls, that force
+# points sideways and then up.
+SURF_DIVE_BLOCK_ROLL_DEG = 35.0
+# Wing collective, in us from neutral, at which we stop asking for more
+# depth. The wings are the vectored frame's vertical motors on SERVO5/6
+# (MOT_5_DIRECTION -1), so collective is ((s5-1500) + (1500-s6)) / 2 and
+# positive is down; full-up throttle in MANUAL reads -500. At 5.5 m and
+# ~1 m/s on 4 Nov ALT_HOLD pinned it at the ~450-500 us limit and the
+# fish rolled out on a straight line.
+SURF_WING_SERVO_A = 5
+SURF_WING_SERVO_B = 6
+SURF_WING_SAT_US = 400.0
+
+# --- Auto-righting ------------------------------------------------------
+# A simulated pilot for an inverted fish, run by AutoRightController
+# whether or not SURF TRACK is enabled. Only fires from ALT_HOLD, the
+# mode that holds an inverted fish at the surface; an operator already in
+# MANUAL/STABILIZE is flying it.
+#
+# Trigger: |roll| past 60 deg for 0.5 s, in the corner, without waiting
+# for the tow boat to straighten up. Waiting cost the fish its depth: an
+# inverted fish in ALT_HOLD has its wings at full "down", which flies it
+# to the surface (simulator study, 6 Nov: 41 s inverted on average when
+# waiting for the boat + 3 s, 1.7 s acting at 60 deg).
+SURF_INVERT_ROLL_DEG = 60.0
+SURF_INVERT_DWELL_S = 0.5
+# The boat's mission item is polled only to capture the turn-entry depth.
+AUTORIGHT_NAV_POLL_S = 1.0
+# The drill, in MANUAL: vertical stick (RC3) at the configured PWM and
+# roll stick (RC2, ArduSub's roll input) toward upright the short way,
+# centred once the fish is within AUTORIGHT_ROLL_STICK_CUTOFF_DEG so it
+# does not overshoot. A neutral vertical stick takes the wings off their
+# stops, leaving their full differential for the roll snap; full up kept
+# the fish inverted for longer and let it reach the surface.
+AUTORIGHT_ROLL_CHANNEL = 2
+AUTORIGHT_ROLL_FULL_THROW_US = 400
+AUTORIGHT_ROLL_STICK_CUTOFF_DEG = 20.0
+DEFAULT_AUTORIGHT_ENABLED = True
+DEFAULT_AUTORIGHT_VERTICAL_PWM = 1500
+AUTORIGHT_VERTICAL_PWM_MIN = 1100
+AUTORIGHT_VERTICAL_PWM_MAX = 1900
+DEFAULT_AUTORIGHT_ROLL_FRAC = 1.0
+# Optionally hold the roll stick until the vertical stick has pulled the
+# inverted fish down to this depth, so it rights with its wings well
+# under the surface (never longer than AUTORIGHT_ROLL_WAIT_MAX_S), and
+# start the descent after righting at this fraction of full down instead
+# of from neutral. Both 0 = roll at once, ramp from neutral.
+DEFAULT_AUTORIGHT_ROLL_MIN_DEPTH_M = 0.0
+AUTORIGHT_ROLL_WAIT_MAX_S = 10.0
+DEFAULT_AUTORIGHT_DESCENT_START_FRAC = 0.0
+# Upright once |roll| stays under this for SURF_RIGHTED_HOLD_S. The
+# operator's MANUAL + full-up righted the fish in a median ~5 s.
+SURF_RIGHTED_ROLL_DEG = 20.0
+SURF_RIGHTED_HOLD_S = 1.0
+SURF_RIGHTING_TIMEOUT_S = 30.0
+# If the MANUAL drill has not righted it, STABILIZE with the sticks
+# centred: the roll controller alone, no collective. Either way the
+# rescue ends in ALT_HOLD.
+SURF_STABILIZE_RIGHTING_TIMEOUT_S = 60.0
+# A mode change is re-sent once a second until HEARTBEAT confirms it,
+# giving up after this long.
+SURF_MODE_CONFIRM_S = 5.0
+# Descent target after righting: the fish's depth when the tow boat
+# reached the first waypoint of the turn (its MISSION_CURRENT advanced).
+# SURF TRACK is terrain-following, so that -- not some recent extreme --
+# is the depth the survey was flying. The second waypoint of a hairpin
+# arrives seconds later and must not overwrite it. Kept between the
+# minimum and the depth ceiling; the default is used without a fresh
+# capture (no mission, or manual driving).
+SURF_RESUME_DEPTH_M = 1.5
+SURF_RESUME_DEPTH_MIN_M = 1.0
+AUTORIGHT_TURN_WP_GROUP_S = 30.0
+AUTORIGHT_TURN_ENTRY_MAX_AGE_S = 180.0
+# ArduRover starts its turn before it logs the waypoint reached, so the
+# fish can already be rolling and climbing by then: the capture uses its
+# last upright depth within this lookback instead.
+AUTORIGHT_TURN_ENTRY_LOOKBACK_S = 30.0
+# The descent ramps its down authority in rather than stepping it: the
+# drag of a diving fish can pull the boat's speed down, and the boat
+# speed is what keeps the wings flying. Below SURF_DESCENT_MIN_BOAT_SPEED_MS
+# the ramp runs backwards toward neutral until the boat recovers.
+SURF_DESCENT_RAMP_FRAC_PER_S = 0.05
+SURF_DESCENT_MAX_FRAC = 1.0
+SURF_DESCENT_MIN_BOAT_SPEED_MS = 0.9
+SURF_DESCENT_TIMEOUT_S = 120.0
+# Tether twist: the net number of full rolls since the operator last
+# reset it, persisted so a reboot keeps it. Written to disk when it has
+# moved this far since the last write.
+AUTORIGHT_TWIST_PERSIST_STEP = 0.25
+AUTORIGHT_BIN_STATE_CODES = {"disabled": 0, "idle": 0, "waiting": 1,
+                             "manual": 2, "stabilize": 3, "descending": 4}
+
+# Controller state mirrored into the fish's dataflash log as
+# NAMED_VALUE_FLOAT (logged as NVAL), so a log review does not depend on
+# the extension's CSV. Codes are stable -- tools read them back.
+SURF_BIN_STATE_CODES = {"disabled": 0, "tracking": 1, "holding": 2}
+SURF_BIN_GATE_CODES = {None: 0, "too_slow_to_dive": 1, "down_stall": 2,
+                       "wings_saturated": 3, "roll_dive_block": 4}
 # Manual UP/DOWN wins outright: on each operator input the surf-track
 # controller stops writing RC3 for this many seconds after the last hit,
 # so a brushed button briefly suspends rather than silently disengages
@@ -525,14 +620,22 @@ PARAM_SPECS = [
     {
         "name": "ATC_ANG_RLL_P",
         "vehicle": "towfish",
-        "default": 0.00,
+        "default": 1.5,
         "unit": "",
         "decimals": 3,
         "min": 0.0,
         "max": 12.0,
-        "desc": "Roll axis angle controller P gain. Converts the error "
-                "between the desired roll angle and actual angle to a "
-                "desired roll rate.",
+        "presets": [0.0, 1.0, 1.5, 3.0],
+        "desc": "Roll axis angle controller P gain: the only thing that "
+                "pushes the fish back toward level. At 0 the roll loop "
+                "only damps roll rate, on the theory that the tow cable "
+                "sets the attitude. That holds on a straight line, but on "
+                "the 4 Nov 2026 tow every hairpin turn rolled the fish "
+                "past 90 deg, where ALT_HOLD's down command lifts it "
+                "and pins it inverted at the surface. Mission 241 flew "
+                "3.0 and still departed in roll, but alongside thrust "
+                "expo and pilot-speed values fixed since; 1.5 is a "
+                "softer start. Re-check on the first tow.",
     },
     {
         "name": "ATC_RAT_RLL_D",
@@ -622,6 +725,26 @@ PARAM_SPECS = [
                 "wing is most linear, softest where it is about to stall, "
                 "and the stall knee arrives at 23% of demand instead of "
                 "38%. 0 makes demand and deflection proportional.",
+    },
+    {
+        "name": "THR_DZ",
+        "vehicle": "towfish",
+        "default": 100.0,
+        "unit": "us",
+        "decimals": 0,
+        "min": 0.0,
+        "max": 300.0,
+        "presets": [0.0, 25.0, 50.0, 100.0],
+        "desc": "Vertical stick deadzone around 1500 us in the depth-hold "
+                "modes. Held at the flown 100 on purpose. Below it, depth "
+                "hold answers every small depth change in a hairpin and "
+                "spends wing the roll controller needs: in simulation the "
+                "8 m tether at 12 m lines flew clean at 100 and upset at "
+                "0, 25 and 50 alike. The cost is that SURF TRACK's "
+                "corrections under about 1 m of error do nothing, so the "
+                "fish settles ~0.1 m further from target than at 0. Keep "
+                "jog down at 1300 or below, or SURF TRACK's down command "
+                "never leaves this deadzone.",
     },
     # Deliberately not managed here, and worth recording why.
     #
@@ -741,10 +864,11 @@ PARAM_AS_FLOWN = {
     "ATC_RAT_RLL_D": 0.0004,
     "ATC_RAT_RLL_FLTE": 5.0,
     "ATC_RAT_RLL_FLTD": 2.0,
-    # These two the survey arrived at and we are preserving rather than
+    # These the survey arrived at and we are preserving rather than
     # changing, so target == as-flown and the console shows no arrow.
     "ATC_RAT_RLL_P": 0.04,
     "RNGFND1_MAX": 100.0,
+    "THR_DZ": 100.0,
 }
 
 for _spec in PARAM_SPECS:
@@ -954,6 +1078,19 @@ def _sanitize_tether_length_m(raw, fallback=DEFAULT_TETHER_LENGTH_M):
                            TETHER_LENGTH_MAX_M, fallback)
 
 
+def _sanitize_autoright_vertical_pwm(raw, fallback=DEFAULT_AUTORIGHT_VERTICAL_PWM):
+    return int(round(_sanitize_float(raw, AUTORIGHT_VERTICAL_PWM_MIN,
+                                     AUTORIGHT_VERTICAL_PWM_MAX, fallback)))
+
+
+def _sanitize_autoright_roll_frac(raw, fallback=DEFAULT_AUTORIGHT_ROLL_FRAC):
+    return _sanitize_float(raw, 0.0, 1.0, fallback)
+
+
+def _sanitize_twist_turns(raw):
+    return _sanitize_float(raw, -1000.0, 1000.0, 0.0)
+
+
 def _effective_depth_ceiling_m():
     """Return the effective ceiling depth in metres.
 
@@ -1086,6 +1223,10 @@ def load_config():
         "surf_full_scale_error_m": DEFAULT_SURF_FULL_SCALE_ERROR_M,
         "surf_max_depth_m": DEFAULT_SURF_MAX_DEPTH_M,
         "tether_length_m": DEFAULT_TETHER_LENGTH_M,
+        "autoright_enabled": DEFAULT_AUTORIGHT_ENABLED,
+        "autoright_vertical_pwm": DEFAULT_AUTORIGHT_VERTICAL_PWM,
+        "autoright_roll_frac": DEFAULT_AUTORIGHT_ROLL_FRAC,
+        "tether_twist_turns": 0.0,
         "optics_default": dict(DEFAULT_OPTICS_DEFAULT),
         "optics_presets": [dict(p) for p in DEFAULT_OPTICS_PRESETS],
     }
@@ -1131,6 +1272,13 @@ def load_config():
         defaults.get("surf_max_depth_m"))
     defaults["tether_length_m"] = _sanitize_tether_length_m(
         defaults.get("tether_length_m"))
+    defaults["autoright_enabled"] = bool(defaults.get("autoright_enabled", True))
+    defaults["autoright_vertical_pwm"] = _sanitize_autoright_vertical_pwm(
+        defaults.get("autoright_vertical_pwm"))
+    defaults["autoright_roll_frac"] = _sanitize_autoright_roll_frac(
+        defaults.get("autoright_roll_frac"))
+    defaults["tether_twist_turns"] = _sanitize_twist_turns(
+        defaults.get("tether_twist_turns"))
     defaults["optics_default"] = _sanitize_optics_default(defaults.get("optics_default"))
     defaults["optics_presets"] = _sanitize_optics_presets(defaults.get("optics_presets"))
     return defaults
@@ -1816,6 +1964,12 @@ surf_deadband_m = _cfg["surf_deadband_m"]
 surf_full_scale_error_m = _cfg["surf_full_scale_error_m"]
 surf_max_depth_m = _cfg["surf_max_depth_m"]
 tether_length_m = _cfg["tether_length_m"]
+autoright_enabled = _cfg["autoright_enabled"]
+autoright_vertical_pwm = _cfg["autoright_vertical_pwm"]
+autoright_roll_frac = _cfg["autoright_roll_frac"]
+tether_twist_turns = _cfg["tether_twist_turns"]
+autoright_roll_min_depth_m = DEFAULT_AUTORIGHT_ROLL_MIN_DEPTH_M
+autoright_descent_start_frac = DEFAULT_AUTORIGHT_DESCENT_START_FRAC
 optics_default = _cfg["optics_default"]
 optics_presets = _cfg["optics_presets"]
 
@@ -1841,6 +1995,10 @@ def _persist_config():
         "surf_full_scale_error_m": surf_full_scale_error_m,
         "surf_max_depth_m": surf_max_depth_m,
         "tether_length_m": tether_length_m,
+        "autoright_enabled": autoright_enabled,
+        "autoright_vertical_pwm": autoright_vertical_pwm,
+        "autoright_roll_frac": autoright_roll_frac,
+        "tether_twist_turns": tether_twist_turns,
         "optics_default": optics_default,
         "optics_presets": optics_presets,
     })
@@ -2288,7 +2446,7 @@ _VIDEO_CSV_HEADER = [
     'camera_mount_pitch_body_deg', 'sonar_bottom_depth_m', 'tow_delay_s',
     'camera_zoom_pct',
     # Surf-track loop side of the frame. ``surf_state`` is the current
-    # controller mode (disabled/tracking/holding/recovering);
+    # controller mode (disabled/tracking/holding);
     # ``surf_target_altitude_m`` is the operator's setpoint at that
     # instant; ``surf_commanded_depth_m`` is what the loop was asking
     # ALT_HOLD to hold; ``surf_error_m`` is the current miss. Appended
@@ -6014,7 +6172,10 @@ _thrust_stop_event = threading.Event()
 _thrust_direction: str | None = None
 _thrust_deadline: float | None = None
 _thrust_pwm: int = Z_PWM_NEUTRAL
-_thrust_source: str | None = None  # 'operator' | 'surftrack' | None
+_thrust_source: str | None = None  # 'operator' | 'surftrack' | 'autoright' | None
+# RC2 (roll stick) override held alongside RC3, or None to leave RC2
+# alone. Only the auto-righting drill sets it.
+_thrust_roll_pwm: int | None = None
 # Monotonic timestamp of the last operator hit. Surf-track refuses to
 # write for ``SURF_OPERATOR_COOLDOWN_S`` after this, so an operator
 # UP/DOWN gets a clean handoff back to ALT_HOLD before the controller
@@ -6046,14 +6207,16 @@ _THRUST_NEUTRAL_GAP_S = 0.1
 
 def _thrust_worker() -> None:
     """Push RC3 override at ~5 Hz until the deadline lapses or stop is set."""
-    global _thrust_direction, _thrust_deadline, _thrust_source
+    global _thrust_direction, _thrust_deadline, _thrust_source, _thrust_roll_pwm
     writer = get_default_writer()
     period = 1.0 / _THRUST_REFRESH_HZ
     logger.info("Thrust jog thread started")
+    roll_used = False
     while not _thrust_stop_event.is_set():
         with _thrust_lock:
             deadline = _thrust_deadline
             pwm = _thrust_pwm
+            roll_pwm = _thrust_roll_pwm
         if deadline is None or time.monotonic() >= deadline:
             # Clear the caller-facing state now that the override is
             # about to be released. Without this the /status snapshot
@@ -6063,8 +6226,13 @@ def _thrust_worker() -> None:
                 _thrust_direction = None
                 _thrust_deadline = None
                 _thrust_source = None
+                _thrust_roll_pwm = None
             break
-        writer.rc_channels_override({Z_CHANNEL: pwm})
+        channels = {Z_CHANNEL: pwm}
+        if roll_pwm is not None:
+            channels[AUTORIGHT_ROLL_CHANNEL] = roll_pwm
+            roll_used = True
+        writer.rc_channels_override(channels)
         _thrust_stop_event.wait(period)
     # Centre the stick *before* letting go of it. A bare release asks
     # ArduPilot to fall back to real RC input, but the towfish flies with no
@@ -6077,8 +6245,12 @@ def _thrust_worker() -> None:
     # is a centred stick; the release afterwards keeps us from owning the
     # channel forever.
     try:
+        neutral = {Z_CHANNEL: Z_PWM_NEUTRAL}
+        if roll_used:
+            # Same latch problem on the roll stick the drill used.
+            neutral[AUTORIGHT_ROLL_CHANNEL] = Z_PWM_NEUTRAL
         for _ in range(_THRUST_NEUTRAL_FRAMES):
-            writer.rc_channels_override({Z_CHANNEL: Z_PWM_NEUTRAL})
+            writer.rc_channels_override(neutral)
             time.sleep(_THRUST_NEUTRAL_GAP_S)
         writer.rc_channels_override({})
     except Exception:
@@ -6099,11 +6271,13 @@ def _start_thrust_thread_if_needed() -> None:
 
 def _stop_thrust_thread() -> None:
     global _thrust_thread, _thrust_direction, _thrust_deadline, _thrust_source
+    global _thrust_roll_pwm
     _thrust_stop_event.set()
     with _thrust_lock:
         _thrust_direction = None
         _thrust_deadline = None
         _thrust_source = None
+        _thrust_roll_pwm = None
     if _thrust_thread is not None:
         # Long enough to cover the worker's neutral-then-release tail, so a
         # caller that returns from here knows the stick is actually centred.
@@ -6111,22 +6285,25 @@ def _stop_thrust_thread() -> None:
     _thrust_thread = None
 
 
-def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
+def _set_thrust_command(direction: str | None, pwm: int, source: str,
+                        roll_pwm: int | None = None) -> bool:
     """Extend/refresh the RC3 override, or release it.
 
     ``direction`` is ``"up"``/``"down"``/``None``; ``None`` stops the
     override (short-circuits to ``_stop_thrust_thread``). ``source`` is
-    ``"operator"`` or ``"surftrack"``.
+    ``"operator"``, ``"surftrack"`` or ``"autoright"``. ``roll_pwm``
+    also holds RC2 (the roll stick); only the auto-righting drill uses it.
 
-    Operator writes always win: they replace whatever the surf-track loop
-    was doing and stamp ``_thrust_operator_last_hit`` so the loop stays
+    Operator writes always win: they replace whatever the automatic loops
+    were doing and stamp ``_thrust_operator_last_hit`` so the loops stay
     off the channel for ``SURF_OPERATOR_COOLDOWN_S`` afterwards.
-    Surf-track writes are refused (returned as ``False``) while the
-    operator is either holding or in cooldown, so the two sources cannot
-    fight for the same channel.
+    Automatic writes are refused (returned as ``False``) while the
+    operator is either holding or in cooldown, so the sources cannot
+    fight for the same channel. Auto-righting outranks surf-track the
+    same way.
     """
     global _thrust_direction, _thrust_deadline, _thrust_pwm
-    global _thrust_source, _thrust_operator_last_hit
+    global _thrust_source, _thrust_operator_last_hit, _thrust_roll_pwm
     if direction is None:
         # A source-tagged stop lets the operator's release land without
         # a stale surf-track write immediately reclaiming the channel;
@@ -6137,7 +6314,7 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
             _stop_thrust_thread()
             with _thrust_lock:
                 _thrust_operator_last_hit = time.monotonic()
-        elif active_source == "surftrack":
+        elif active_source == source:
             _stop_thrust_thread()
         return True
     if direction not in ("up", "down"):
@@ -6147,7 +6324,8 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
     with _thrust_lock:
         if source == "operator":
             _thrust_operator_last_hit = now
-        elif source == "surftrack":
+            roll_pwm = None
+        elif source in ("surftrack", "autoright"):
             # An operator hit or cooldown blocks the loop entirely, so
             # it does not have to poll the state before writing -- the
             # write itself checks.
@@ -6159,11 +6337,17 @@ def _set_thrust_command(direction: str | None, pwm: int, source: str) -> bool:
                     and now - _thrust_operator_last_hit
                     < SURF_OPERATOR_COOLDOWN_S):
                 return False
+            if (source == "surftrack" and _thrust_source == "autoright"
+                    and _thrust_deadline is not None
+                    and now < _thrust_deadline):
+                return False
         else:
             return False
         _thrust_direction = direction
         _thrust_pwm = pwm
         _thrust_source = source
+        _thrust_roll_pwm = (None if roll_pwm is None else
+                            int(max(Z_PWM_MIN, min(Z_PWM_MAX, roll_pwm))))
         _thrust_deadline = now + _THRUST_KEEPALIVE_S
     _start_thrust_thread_if_needed()
     return True
@@ -6231,6 +6415,8 @@ _SURF_LOG_HEADER = [
     'rc3_pwm', 'rc3_frac', 'rc3_source',
     'boat_speed_ms', 'roll_deg', 'pitch_deg',
     'mode_label', 'armed',
+    # Appended so positional readers of older files stay valid.
+    'autoright_state', 'down_gate', 'wing_collective_us',
 ]
 
 
@@ -6350,6 +6536,9 @@ class SurfTrackLogger:
             num(extras.get('pitch_deg'), '.1f'),
             extras.get('mode_label') or "",
             "1" if extras.get('armed') else "0",
+            extras.get('autoright_state') or "",
+            snap.get('down_gate') or "",
+            num(snap.get('wing_collective_us'), '.0f'),
         ]
 
     def log_tick(self, snap: dict, extras: dict) -> None:
@@ -6377,6 +6566,13 @@ class SurfTrackController:
     once every condition has been satisfied continuously for
     ``SURF_RESUME_DEBOUNCE_S`` -- flicker on the bottom-lock therefore
     cannot chatter the loop.
+
+    Auto-righting is a separate controller (:class:`AutoRightController`)
+    that runs whether or not this one is enabled. While it is flying the
+    fish this loop holds with reason ``autoright`` and stays off RC3;
+    afterwards it resumes on its own debounce. There is no attitude-
+    triggered climb anywhere; attitude only ever blocks down commands
+    (see the dive gates).
     """
 
     def __init__(self):
@@ -6388,10 +6584,7 @@ class SurfTrackController:
         # file open for the whole survey day.
         self._logger = SurfTrackLogger()
         # Public snapshot fields (all read under _lock).
-        # ``recovering`` is entered on a roll/pitch excursion or a
-        # detected down-stall. See the class docstring for the exit
-        # rules; unlike ``holding`` we still write RC3 in this state.
-        self.state = "disabled"     # 'disabled' | 'tracking' | 'holding' | 'recovering'
+        self.state = "disabled"     # 'disabled' | 'tracking' | 'holding'
         self.hold_reason: str | None = None
         self.last_event: str | None = None
         self.last_event_at: datetime | None = None
@@ -6403,6 +6596,10 @@ class SurfTrackController:
         self._last_altitude_m: float | None = None
         self._last_error_m: float | None = None
         self._last_command: dict | None = None
+        self._last_boat_speed_ms: float | None = None
+        # Wing collective in us from neutral (+ = down), or None when
+        # SERVO_OUTPUT_RAW is unavailable / the outputs read 0 (disarmed).
+        self._last_wing_collective_us: float | None = None
         # Effective ceiling depth and whether the last raw target had
         # to be clamped by it. Exposed via the snapshot so the widget
         # can tell the operator "commanding shallower than the terrain
@@ -6429,27 +6626,25 @@ class SurfTrackController:
         # Monotonic timestamp at which all hold conditions first cleared,
         # or None while any condition still fails. See _tick.
         self._hold_ok_since: float | None = None
-        # Rolling attitude readouts + monotonic timestamps used to
-        # drive the recovery state machine.
         self._last_roll_deg: float | None = None
-        self._last_pitch_deg: float | None = None
-        # ``_recovery_ok_since`` is set the first tick attitude is
-        # inside the clear window; cleared whenever it goes back
-        # outside. Recovery exit compares this to now.
-        self._recovery_ok_since: float | None = None
+        self._last_pitch_deg: float | None = None  # logged only, never acted on
         # Buffer of ``(monotonic_ts, fish_depth_m)`` samples for the
         # down-stall detector -- only populated while the loop is
         # actively commanding down.
         self._stall_track: collections.deque = collections.deque()
         # Monotonic time at which the loop last commanded ``down``;
-        # cleared on any release or up. Reset on entering recovery.
+        # cleared on any release or up.
         self._down_since: float | None = None
-        # After exiting recovery the down-slew is clamped for a soft
-        # cooldown so re-descending is gentle. None outside cooldown.
-        self._recovery_cooldown_until: float | None = None
-        # Cached reason a down-command was refused this tick (widget
-        # surfaces this through ``hold_reason`` when we still track).
+        # After a stall, down commands are refused until this time.
+        self._down_holdoff_until: float | None = None
+        # Which dive gate (if any) refused a down command this tick.
         self._last_down_gate_reason: str | None = None
+        # NAMED_VALUE_FLOAT mirror into the fish BIN. Posted from a
+        # worker thread so a slow mavlink2rest cannot stretch the tick.
+        self._bin_queue: queue.Queue = queue.Queue(maxsize=64)
+        self._bin_thread: threading.Thread | None = None
+        self._bin_tick = 0
+        self._bin_last_state_code: int | None = None
 
     # -- lifecycle -----------------------------------------------------
     def enable(self) -> None:
@@ -6469,9 +6664,8 @@ class SurfTrackController:
             self._last_sounding_id = None
             self._last_tick_ts = None
             self._last_command = None
-            self._recovery_ok_since = None
-            self._recovery_cooldown_until = None
             self._down_since = None
+            self._down_holdoff_until = None
             self._stall_track.clear()
             self._last_down_gate_reason = None
             self._note("enabled")
@@ -6482,6 +6676,11 @@ class SurfTrackController:
             self._logger.log_event("enabled", self._snapshot_locked(), {})
         except Exception:
             logger.debug("Surf-track log event 'enabled' failed", exc_info=True)
+        if self._bin_thread is None or not self._bin_thread.is_alive():
+            self._bin_thread = threading.Thread(
+                target=self._bin_worker, name="surftrack-nval", daemon=True,
+            )
+            self._bin_thread.start()
         self._thread = threading.Thread(
             target=self._run, name="surftrack", daemon=True,
         )
@@ -6508,13 +6707,13 @@ class SurfTrackController:
             self._target_depth_m = None
             self._last_sounding_id = None
             self._last_command = None
-            self._recovery_ok_since = None
-            self._recovery_cooldown_until = None
             self._down_since = None
+            self._down_holdoff_until = None
             self._stall_track.clear()
             self._last_down_gate_reason = None
             self._note("disabled")
             snap_for_log = self._snapshot_locked()
+        self._queue_bin_values(snap_for_log, force=True)
         try:
             self._logger.log_event("disabled", snap_for_log, {})
         except Exception:
@@ -6557,11 +6756,8 @@ class SurfTrackController:
         now = time.monotonic()
 
         fish_depth = _get_towfish_depth_m()
-        # Attitude is read once per tick so the recovery detector
-        # (roll/pitch limits) and the CSV trace share one fetch. The
-        # pooled session makes an extra 10 Hz GET cheap, but only
-        # doing it once keeps the pattern honest as more consumers
-        # (recovery, ceiling) grow off the same tick.
+        # Attitude is read once per tick so the inversion watch, the
+        # roll dive gate and the CSV trace share one fetch.
         attitude = get_towfish_attitude() or {}
         latest = _sonar_history.latest(SURF_SONAR_MAX_AGE_S)
         # Freshness stamp of the newest accepted sounding. Compared
@@ -6583,6 +6779,7 @@ class SurfTrackController:
                                           use_heartbeat_cache=True)
         armed = veh.get("armed")
         custom_mode = veh.get("custom_mode")
+        wing_collective = _wing_collective_us(_servo_output_message())
 
         bottom_ahead: float | None = None
         if latest is not None:
@@ -6599,7 +6796,9 @@ class SurfTrackController:
         # widget shows the most fundamental problem (no depth beats a
         # stale sonar, a disarmed vehicle beats a slow boat, etc).
         reason: str | None = None
-        if fish_depth is None:
+        if _autoright.is_active():
+            reason = "autoright"
+        elif fish_depth is None:
             reason = "no_depth"
         elif fish_depth <= SURF_SURFACE_DEPTH_M:
             reason = "at_surface"
@@ -6624,22 +6823,11 @@ class SurfTrackController:
             self._last_altitude_m = reported_altitude
             self._last_roll_deg = roll_deg
             self._last_pitch_deg = pitch_deg
+            self._last_boat_speed_ms = speed
+            self._last_wing_collective_us = wing_collective
 
-            # Recovery has the highest priority under an armed fish:
-            # a roll/pitch excursion beats every other hold reason
-            # because commanding up is safer than letting ALT_HOLD
-            # continue to hunt a depth that just tumbled the vehicle.
-            # The stall detector piggy-backs on this branch through
-            # ``_check_stall_locked`` -- both take the same recovery
-            # path once tripped.
-            recovery_entry = None
-            if armed and fish_depth is not None:
-                recovery_entry = self._check_attitude_abort_locked(
-                    now, roll_deg, pitch_deg)
-                if recovery_entry is None:
-                    recovery_entry = self._check_stall_locked(
-                        now, fish_depth)
-
+            do_release = False
+            do_command = None
             if reason is not None:
                 # Conditions failing: enter/stay in holding. Reset both
                 # target depths and forget the last sounding id so a
@@ -6657,20 +6845,9 @@ class SurfTrackController:
                 self._last_tick_ts = now
                 self._down_since = None
                 self._stall_track.clear()
+                self._last_down_gate_reason = None
                 # Fall through to release RC3 outside the lock.
                 do_release = True
-                do_command = None
-            elif self.state == "recovering" or recovery_entry is not None:
-                if self.state != "recovering":
-                    # Fresh entry into recovery.
-                    self.state = "recovering"
-                    self.hold_reason = recovery_entry
-                    self._recovery_ok_since = None
-                    self._down_since = None
-                    self._stall_track.clear()
-                    self._note(f"recovering: {recovery_entry}")
-                do_release, do_command = self._plan_recovery(
-                    now, fish_depth, roll_deg, pitch_deg)
             else:
                 # Conditions ok. If we were holding, wait out the
                 # debounce so a flickering bottom lock does not chatter.
@@ -6681,7 +6858,6 @@ class SurfTrackController:
                         self._last_tick_ts = now
                         # Still debouncing; stay released.
                         do_release = True
-                        do_command = None
                     else:
                         self._note("tracking")
                         self.state = "tracking"
@@ -6699,11 +6875,11 @@ class SurfTrackController:
                 else:
                     # Steady state tracking.
                     self._hold_ok_since = None
-                    self.hold_reason = self._last_down_gate_reason
                     do_release, do_command = self._plan_command(
                         now, fish_depth, bottom_ahead, sounding_id, speed)
+                    self.hold_reason = self._last_down_gate_reason
 
-        # Do the RC3 writes outside the state lock so a slow HTTP call
+        # RC3 writes happen outside the state lock so a slow HTTP call
         # cannot block the widget's status poll.
         if do_release:
             _set_thrust_command(None, Z_PWM_NEUTRAL, source="surftrack")
@@ -6713,8 +6889,8 @@ class SurfTrackController:
                                      source="surftrack")
             if not ok:
                 # Operator has the stick (or cooldown active). Not an
-                # error -- record it so the widget can show why the
-                # loop's command is not landing.
+                # error while tracking -- record it so the widget can
+                # show why the loop's command is not landing.
                 with self._lock:
                     self._last_command = None
                     self._note("suspended: operator")
@@ -6722,10 +6898,11 @@ class SurfTrackController:
         # Trace row. Snapshotted after the RC3 write so the row
         # reflects whether that write actually landed (an operator
         # veto has already flipped ``_last_command`` back to None).
+        with self._lock:
+            snap = self._snapshot_locked()
+            last_cmd = self._last_command or {}
+        self._queue_bin_values(snap)
         try:
-            with self._lock:
-                snap = self._snapshot_locked()
-                last_cmd = self._last_command or {}
             extras = {
                 "tow_delay_s": (delayed[1]
                                 if delayed is not None else None),
@@ -6738,6 +6915,7 @@ class SurfTrackController:
                 "pitch_deg": attitude.get('pitch'),
                 "mode_label": veh.get('mode_label'),
                 "armed": armed,
+                "autoright_state": _autoright.snapshot().get("state"),
             }
             self._logger.log_tick(snap, extras)
         except Exception:
@@ -6762,16 +6940,28 @@ class SurfTrackController:
           latest raw target at split up/down rates, computes the
           error against :data:`fish_depth`, and drives RC3. Runs
           every tick because attitude and depth do change at 10 Hz
-          even when the sounding does not. Down commands are gated
-          on ``speed >= SURF_MIN_DOWN_SPEED_MS`` -- diving is what
-          kills boat speed, so the loop refuses to keep digging when
-          the boat has stalled but still allows up commands.
+          even when the sounding does not.
+
+        Down commands pass through the dive gates (:meth:`_dive_gate`):
+        a slow boat, a recent stall, saturated wings or a large roll
+        each refuse *down* and pin the commanded depth to the fish. None
+        of them ever commands up -- they only stop the loop asking for
+        depth the vehicle cannot safely take.
         """
         dt = SURF_TICK_S
         if self._last_tick_ts is not None:
             dt = max(0.0, min(1.0, now - self._last_tick_ts))
         self._last_tick_ts = now
         self._last_down_gate_reason = None
+
+        # Stall detector: a sustained down command that is not gaining
+        # depth arms the down holdoff. It used to trip a climb; now it
+        # only stops further digging.
+        if self._check_stall_locked(now, fish_depth):
+            self._down_holdoff_until = now + SURF_DOWN_HOLDOFF_S
+            self._down_since = None
+            self._stall_track.clear()
+            self._note("dives blocked: down_stall")
 
         # Terrain half: recompute the raw target only when we have a
         # new sounding. ``sounding_id`` is None when the ring buffer
@@ -6807,16 +6997,10 @@ class SurfTrackController:
         # Output half: slew-limit the commanded depth toward the raw
         # target every tick, at different rates for up vs down. Down
         # is the direction that fights drag and stalls the vehicle,
-        # so it moves slower; up is essentially free. In the soft
-        # cooldown that follows a recovery the down-slew is squeezed
-        # further so a re-descent is deliberately gentle.
+        # so it moves slower; up is essentially free.
         delta = self._raw_target_depth_m - self._target_depth_m
         if delta >= 0:
-            down_slew = SURF_TARGET_SLEW_DOWN_MPS
-            if (self._recovery_cooldown_until is not None
-                    and now < self._recovery_cooldown_until):
-                down_slew *= SURF_RECOVERY_COOLDOWN_SLEW_FRAC
-            max_step = down_slew * dt
+            max_step = SURF_TARGET_SLEW_DOWN_MPS * dt
         else:
             max_step = SURF_TARGET_SLEW_UP_MPS * dt
         if abs(delta) > max_step:
@@ -6824,19 +7008,28 @@ class SurfTrackController:
         self._target_depth_m += delta
 
         error = self._target_depth_m - fish_depth  # +ve => go deeper
-        self._last_error_m = error
 
-        # Down-command speed gate: refuse to command deeper when the
-        # boat is not making enough way. This does not force a hold
-        # (the loop keeps tracking so it can command up if terrain
-        # rises); it just clamps the down direction to zero authority.
-        if error > 0 and (speed is None or speed < SURF_MIN_DOWN_SPEED_MS):
-            self._last_command = None
-            self._last_down_gate_reason = "too_slow_to_dive"
-            return True, None
+        if error > 0:
+            gate = self._dive_gate(now, speed)
+            if gate is not None:
+                self._last_down_gate_reason = gate
+                self._down_since = None
+                self._stall_track.clear()
+                if gate != "too_slow_to_dive":
+                    # Pin the commanded depth to the fish so the slew
+                    # restarts from here once the gate clears, rather
+                    # than lunging at a target that ran ahead.
+                    self._target_depth_m = min(self._target_depth_m,
+                                               fish_depth)
+                self._last_error_m = self._target_depth_m - fish_depth
+                self._last_command = None
+                return True, None
+        self._last_error_m = error
 
         if abs(error) <= surf_deadband_m:
             self._last_command = None
+            self._down_since = None
+            self._stall_track.clear()
             return True, None
 
         direction = "down" if error > 0 else "up"
@@ -6869,104 +7062,99 @@ class SurfTrackController:
             self._stall_track.clear()
         return False, cmd
 
-    def _check_attitude_abort_locked(self, now, roll_deg, pitch_deg):
-        """Return a recovery reason if attitude is out of limits.
+    def _dive_gate(self, now, speed):
+        """Return the reason a down command is refused right now, or None.
 
-        Called while holding ``self._lock``. Two cases:
-
-        * Already recovering: keep the reason we entered on; the exit
-          criterion is handled by :meth:`_plan_recovery`.
-        * Not yet recovering: check current roll/pitch against the
-          entry thresholds. Missing/None readings do not trip -- the
-          alternative would be to abort every time attitude polling
-          hiccups, which is a worse failure mode than trusting the
-          last-good reading.
+        Called while holding ``self._lock``. Every gate reads state
+        already gathered this tick (boat speed, roll, wing collective).
+        Pitch is deliberately not consulted.
         """
-        if self.state == "recovering":
-            return None  # already inside; caller keeps state
-        if isinstance(roll_deg, (int, float)) and abs(roll_deg) > SURF_ROLL_ABORT_DEG:
-            return "roll_excursion"
-        if isinstance(pitch_deg, (int, float)) and abs(pitch_deg) > SURF_PITCH_ABORT_DEG:
-            return "pitch_excursion"
+        if speed is None or speed < SURF_MIN_DOWN_SPEED_MS:
+            return "too_slow_to_dive"
+        if (self._down_holdoff_until is not None
+                and now < self._down_holdoff_until):
+            return "down_stall"
+        if (self._last_wing_collective_us is not None
+                and self._last_wing_collective_us >= SURF_WING_SAT_US):
+            return "wings_saturated"
+        roll = self._last_roll_deg
+        if (isinstance(roll, (int, float))
+                and abs(roll) > SURF_DIVE_BLOCK_ROLL_DEG):
+            return "roll_dive_block"
         return None
 
     def _check_stall_locked(self, now, fish_depth):
-        """Return a recovery reason if a down-stall is detected.
+        """True if a down-stall is detected.
 
         Compares the oldest and newest depths in ``_stall_track``: if
         the window covers at least :data:`SURF_STALL_WINDOW_S` and the
         gain across the window is under :data:`SURF_STALL_MIN_GAIN_M`,
-        the vertical thruster is fighting drag it cannot win.
+        the wings are fighting drag they cannot win.
         """
         if self._down_since is None:
-            return None
+            return False
         if now - self._down_since < SURF_STALL_WINDOW_S:
-            return None
+            return False
         if not self._stall_track:
-            return None
+            return False
         oldest_t, oldest_d = self._stall_track[0]
         if now - oldest_t < SURF_STALL_WINDOW_S:
-            return None
-        gain = fish_depth - oldest_d
-        if gain < SURF_STALL_MIN_GAIN_M:
-            return "down_stall"
-        return None
+            return False
+        return fish_depth - oldest_d < SURF_STALL_MIN_GAIN_M
 
-    def _plan_recovery(self, now, fish_depth, roll_deg, pitch_deg):
-        """Command up until attitude clears; then exit with a cooldown.
+    # -- dataflash mirror ----------------------------------------------
+    def _queue_bin_values(self, snap: dict, force: bool = False) -> None:
+        """Queue the NAMED_VALUE_FLOAT mirror: 2 Hz, plus every state change."""
+        code = SURF_BIN_STATE_CODES.get(snap.get("state"), -1)
+        self._bin_tick += 1
+        changed = code != self._bin_last_state_code
+        if not (force or changed
+                or self._bin_tick % _SURF_LOG_DECIMATION == 0):
+            return
+        self._bin_last_state_code = code
+        cmd = snap.get("command") or {}
+        values = [
+            ("ST_STATE", code),
+            ("ST_GATE", SURF_BIN_GATE_CODES.get(snap.get("down_gate"), -1)),
+            ("ST_TGT", snap.get("commanded_depth_m")),
+            ("ST_ALT", snap.get("altitude_m")),
+            ("ST_RC3", cmd.get("pwm", Z_PWM_NEUTRAL)),
+        ]
+        for name, value in values:
+            if not isinstance(value, (int, float)):
+                value = -1.0
+            try:
+                self._bin_queue.put_nowait((name, float(value)))
+            except queue.Full:
+                return
 
-        Runs while holding ``self._lock``. Returns
-        ``(do_release, command)`` in the same shape as
-        :meth:`_plan_command` -- a release is never used here because
-        releasing RC3 in a stalled dive leaves ALT_HOLD trying to hold
-        the depth that stalled us, which is what turned mission 241's
-        13:48 dive into a 176 deg tumble. So we actively command up.
+    def queue_named_values(self, values) -> None:
+        """Queue ``(name, value)`` pairs on the NAMED_VALUE_FLOAT mirror.
+
+        For other controllers (auto-righting) to share this rate-limited
+        path. Starts the worker if this loop has never been enabled.
         """
-        # Attitude-clear tracking. Absent readings do not count as
-        # clear (they might come back showing a still-bad angle).
-        roll_ok = (isinstance(roll_deg, (int, float))
-                   and abs(roll_deg) < SURF_ROLL_CLEAR_DEG)
-        pitch_ok = (isinstance(pitch_deg, (int, float))
-                    and abs(pitch_deg) < SURF_PITCH_CLEAR_DEG)
-        if roll_ok and pitch_ok:
-            if self._recovery_ok_since is None:
-                self._recovery_ok_since = now
-            if now - self._recovery_ok_since >= SURF_RECOVERY_CLEAR_S:
-                # Exit recovery: rebaseline the commanded depth to
-                # where the fish actually is, arm the cooldown, and
-                # let the next tick's normal tracking resume with a
-                # squeezed down-slew.
-                self._recovery_cooldown_until = (
-                    now + SURF_RECOVERY_COOLDOWN_S)
-                self._target_depth_m = fish_depth
-                self._raw_target_depth_m = None
-                self._last_sounding_id = None
-                self._recovery_ok_since = None
-                self._down_since = None
-                self._stall_track.clear()
-                self._last_tick_ts = now
-                self.state = "tracking"
-                self.hold_reason = None
-                self._note("recovered")
-                # Neither release nor command this tick; the next
-                # tick's _plan_command will pick it up. Return a
-                # release so RC3 isn't left biased up while we
-                # transition (ALT_HOLD is what should be holding).
-                self._last_command = None
-                return True, None
-        else:
-            self._recovery_ok_since = None
+        if self._bin_thread is None or not self._bin_thread.is_alive():
+            self._bin_thread = threading.Thread(
+                target=self._bin_worker, name="surftrack-nval", daemon=True,
+            )
+            self._bin_thread.start()
+        for name, value in values:
+            if not isinstance(value, (int, float)):
+                value = -1.0
+            try:
+                self._bin_queue.put_nowait((name, float(value)))
+            except queue.Full:
+                return
 
-        # Still recovering: command up at recovery authority.
-        self._last_tick_ts = now
-        pwm = int(round(Z_PWM_NEUTRAL
-                        + (jog_up_pwm - Z_PWM_NEUTRAL)
-                        * SURF_RECOVERY_UP_FRAC))
-        pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
-        cmd = {"direction": "up", "pwm": pwm,
-               "frac": round(SURF_RECOVERY_UP_FRAC, 3)}
-        self._last_command = cmd
-        return False, cmd
+    def _bin_worker(self) -> None:
+        while True:
+            name, value = self._bin_queue.get()
+            try:
+                if not get_default_writer().named_value_float(name, value):
+                    logger.debug("Surf-track NVAL %s not accepted", name)
+            except Exception:
+                logger.debug("Surf-track NVAL %s failed", name, exc_info=True)
 
     # -- diagnostics ---------------------------------------------------
     def _note(self, event: str) -> None:
@@ -6983,15 +7171,11 @@ class SurfTrackController:
         """
         def _round(v, n=2):
             return round(v, n) if isinstance(v, (int, float)) else None
-        now = time.monotonic()
-        cooldown_remaining = None
-        if (self._recovery_cooldown_until is not None
-                and now < self._recovery_cooldown_until):
-            cooldown_remaining = round(self._recovery_cooldown_until - now, 2)
         return {
             "enabled": self.state != "disabled",
             "state": self.state,
             "hold_reason": self.hold_reason,
+            "down_gate": self._last_down_gate_reason,
             "target_altitude_m": round(surf_target_altitude_m, 2),
             "target_altitude_min_m": SURF_TARGET_ALTITUDE_MIN_M,
             "target_altitude_max_m": SURF_TARGET_ALTITUDE_MAX_M,
@@ -7010,7 +7194,8 @@ class SurfTrackController:
             "command": self._last_command,
             "roll_deg": _round(self._last_roll_deg, 1),
             "pitch_deg": _round(self._last_pitch_deg, 1),
-            "recovery_cooldown_s": cooldown_remaining,
+            "boat_speed_ms": _round(self._last_boat_speed_ms),
+            "wing_collective_us": _round(self._last_wing_collective_us, 0),
             "last_event": self.last_event,
             "last_event_at": (self.last_event_at.isoformat()
                               if self.last_event_at else None),
@@ -7022,7 +7207,529 @@ class SurfTrackController:
             return self._snapshot_locked()
 
 
+def _wing_collective_us(servo_msg: dict) -> float | None:
+    """Wing collective in us from neutral (+ = down) from SERVO_OUTPUT_RAW.
+
+    None when either wing output is missing or 0 -- mavlink2rest reports
+    motor outputs as 0 while disarmed, which is "unknown", not "neutral".
+    """
+    if not servo_msg:
+        return None
+    a = servo_msg.get(f"servo{SURF_WING_SERVO_A}_raw")
+    b = servo_msg.get(f"servo{SURF_WING_SERVO_B}_raw")
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return None
+    if a <= 0 or b <= 0:
+        return None
+    return ((a - Z_PWM_NEUTRAL) + (Z_PWM_NEUTRAL - b)) / 2.0
+
+
 _surftrack = SurfTrackController()
+
+
+def _resume_depth_for(turn_entry_depth_m: float | None) -> float:
+    """Descent target after righting: the turn-entry depth, under the ceiling."""
+    if not isinstance(turn_entry_depth_m, (int, float)):
+        return SURF_RESUME_DEPTH_M
+    return max(SURF_RESUME_DEPTH_MIN_M,
+               min(_effective_depth_ceiling_m(), turn_entry_depth_m))
+
+
+def _tow_mission_seq() -> int | None:
+    """The tow boat's current mission item (MISSION_CURRENT.seq), or None."""
+    mc = _mav_get_message(_tow_mavlink_url('MISSION_CURRENT'))
+    seq = (mc or {}).get('seq')
+    return seq if isinstance(seq, int) else None
+
+
+def _wrap180(deg: float) -> float:
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+class AutoRightController:
+    """Simulated pilot for an inverted fish, independent of SURF TRACK.
+
+    States: ``disabled`` / ``idle`` / ``waiting`` (rolled past
+    :data:`SURF_INVERT_ROLL_DEG`, not yet for :data:`SURF_INVERT_DWELL_S`)
+    / ``manual`` (the drill: vertical stick plus roll stick toward upright)
+    / ``stabilize`` (sticks centred, if the drill has not worked in
+    :data:`SURF_RIGHTING_TIMEOUT_S`) / ``descending`` (ALT_HOLD, a ramped
+    descent back to the depth the fish had when the boat entered the
+    turn). It never enables SURF TRACK: that loop holds while a rescue is
+    active and resumes afterwards only if it was already on.
+
+    It also counts tether twist -- the net full rolls -- whenever the
+    vehicle is armed, whoever is flying.
+    """
+
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.state = "disabled"
+        self.last_event: str | None = None
+        self.last_event_at: datetime | None = None
+        self._inverted_since: float | None = None
+        # False after a cancelled/failed rescue until the fish has been
+        # seen upright again, so the watch does not fight an operator
+        # who has taken over an inverted fish.
+        self._armed_watch = True
+        self._rescue_started_at: float | None = None
+        self._phase_since: float | None = None
+        self._righted_since: float | None = None
+        # Mode the rescue last asked for, when it last sent it, and
+        # whether HEARTBEAT has confirmed it yet. Once confirmed, any
+        # other mode means the operator changed it.
+        self._mode: int | None = None
+        self._mode_first_sent: float | None = None
+        self._mode_last_sent: float | None = None
+        self._mode_confirmed = False
+        self._descent_frac = 0.0
+        self._resume_depth_m: float | None = None
+        self._last_command: dict | None = None
+        self._last_tick_ts: float | None = None
+        self._last_down_gate_reason: str | None = None
+        self._outcome: tuple[str, float] | None = None
+        # Boat navigation, polled at AUTORIGHT_NAV_POLL_S.
+        self._nav_polled_at: float | None = None
+        self._boat_seq: int | None = None
+        # Depth at the first waypoint of the latest turn, from the recent
+        # upright depths (monotonic_ts, depth_m).
+        self._turn_entry_depth_m: float | None = None
+        self._turn_entry_at: float | None = None
+        self._upright_history: collections.deque = collections.deque()
+        # Roll stick direction (+1 right / -1 left), latched for one snap.
+        self._roll_dir: int | None = None
+        # Tether twist.
+        self._last_roll_deg: float | None = None
+        self._twist_persisted = tether_twist_turns
+        self._bin_tick = 0
+        self._bin_last_code: int | None = None
+
+    # -- lifecycle -----------------------------------------------------
+    def enable(self) -> None:
+        with self._lock:
+            if self.state != "disabled":
+                return
+            self._stop_event.clear()
+            self.state = "idle"
+            self._armed_watch = True
+            self._note("enabled")
+        self._thread = threading.Thread(target=self._run, name="autoright",
+                                        daemon=True)
+        self._thread.start()
+
+    def disable(self) -> None:
+        with self._lock:
+            if self.state == "disabled":
+                return
+            self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        # A rescue in progress is simply stopped; the flight mode is
+        # left where it is for the operator.
+        _set_thrust_command(None, Z_PWM_NEUTRAL, source="autoright")
+        with self._lock:
+            self._thread = None
+            self._reset_locked()
+            self.state = "disabled"
+            self._note("disabled")
+
+    def is_active(self) -> bool:
+        """True while the drill or its descent is flying the fish."""
+        with self._lock:
+            return self.state in ("manual", "stabilize", "descending")
+
+    def reset_twist(self) -> None:
+        global tether_twist_turns
+        with self._lock:
+            tether_twist_turns = 0.0
+            self._twist_persisted = 0.0
+            self._note("tether twist reset")
+        _persist_config()
+
+    def _run(self) -> None:
+        logger.info("Auto-righting started")
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                logger.exception("AutoRightController tick failed")
+            self._stop_event.wait(SURF_TICK_S)
+        logger.info("Auto-righting exited")
+
+    def _note(self, event: str) -> None:
+        logger.info("Auto-righting: %s", event)
+        self.last_event = event
+        self.last_event_at = datetime.now()
+
+    def _reset_locked(self) -> None:
+        self._inverted_since = None
+        self._rescue_started_at = None
+        self._phase_since = None
+        self._righted_since = None
+        self._mode = None
+        self._mode_first_sent = None
+        self._mode_last_sent = None
+        self._mode_confirmed = False
+        self._descent_frac = 0.0
+        self._resume_depth_m = None
+        self._last_command = None
+        self._last_down_gate_reason = None
+
+    # -- inputs --------------------------------------------------------
+    def _poll_nav(self, now, fish_depth, abs_roll) -> None:
+        if (self._nav_polled_at is not None
+                and now - self._nav_polled_at < AUTORIGHT_NAV_POLL_S):
+            return
+        self._nav_polled_at = now
+        seq = _tow_mission_seq()
+        with self._lock:
+            if (seq is not None and self._boat_seq is not None
+                    and seq != self._boat_seq):
+                self._on_waypoint_locked(now, fish_depth, abs_roll)
+            if seq is not None:
+                self._boat_seq = seq
+
+    def _on_waypoint_locked(self, now, fish_depth, abs_roll) -> None:
+        """The boat reached a waypoint: remember the depth at turn entry."""
+        if (self._turn_entry_at is not None
+                and now - self._turn_entry_at < AUTORIGHT_TURN_WP_GROUP_S):
+            return  # the hairpin's second corner
+        if not self._upright_history:
+            return
+        self._turn_entry_depth_m = self._upright_history[-1][1]
+        self._turn_entry_at = now
+
+    def _note_upright_locked(self, now, fish_depth, abs_roll) -> None:
+        if (fish_depth is not None and fish_depth > SURF_SURFACE_DEPTH_M
+                and abs_roll is not None and abs_roll < SURF_RIGHTED_ROLL_DEG):
+            self._upright_history.append((now, fish_depth))
+        while (self._upright_history and self._upright_history[0][0]
+                < now - AUTORIGHT_TURN_ENTRY_LOOKBACK_S):
+            self._upright_history.popleft()
+
+    def _update_twist(self, roll_deg, armed) -> None:
+        global tether_twist_turns
+        if armed is not True or not isinstance(roll_deg, (int, float)):
+            self._last_roll_deg = None
+            return
+        if self._last_roll_deg is not None:
+            tether_twist_turns += _wrap180(roll_deg - self._last_roll_deg) / 360.0
+        self._last_roll_deg = roll_deg
+
+    # -- loop ----------------------------------------------------------
+    def _tick(self) -> None:
+        now = time.monotonic()
+        fish_depth = _get_towfish_depth_m()
+        attitude = get_towfish_attitude() or {}
+        roll = attitude.get('roll')
+        abs_roll = abs(roll) if isinstance(roll, (int, float)) else None
+        veh = get_vehicle_status_snapshot(depth_m=fish_depth,
+                                          use_heartbeat_cache=True)
+        armed = veh.get("armed")
+        custom_mode = veh.get("custom_mode")
+        speed = _sonar_history.latest_speed_ms()
+        wing_collective = _wing_collective_us(_servo_output_message())
+        with self._lock:
+            self._note_upright_locked(now, fish_depth, abs_roll)
+        self._poll_nav(now, fish_depth, abs_roll)
+
+        mode_to_send = None
+        send = None   # ('release',) or ('command', cmd)
+        with self._lock:
+            self._update_twist(roll, armed)
+            if abs_roll is not None and abs_roll < SURF_RIGHTED_ROLL_DEG:
+                self._armed_watch = True
+            watching = (armed is True and abs_roll is not None
+                        and abs_roll > SURF_INVERT_ROLL_DEG
+                        and (custom_mode == MODE_ALT_HOLD
+                             or self.state == "descending"))
+            if watching:
+                if self._inverted_since is None:
+                    self._inverted_since = now
+            else:
+                self._inverted_since = None
+
+            if self.state == "disabled":
+                pass
+            elif armed is not True and self.is_rescue_locked():
+                self._end_locked(now, "rescue_cancelled", "disarmed")
+                send = ("release",)
+            elif self.state in ("idle", "waiting", "descending"):
+                fire = self._should_fire_locked(now)
+                if fire and self._armed_watch:
+                    mode_to_send = self._start_locked(now)
+                    send = ("release",)
+                elif self.state == "descending":
+                    mode_to_send, send = self._plan_locked(
+                        now, fish_depth, roll, abs_roll, custom_mode, speed,
+                        wing_collective)
+                else:
+                    self.state = ("waiting" if self._inverted_since is not None
+                                  and self._armed_watch else "idle")
+            else:
+                mode_to_send, send = self._plan_locked(
+                    now, fish_depth, roll, abs_roll, custom_mode, speed,
+                    wing_collective)
+            if abs(tether_twist_turns - self._twist_persisted) >= AUTORIGHT_TWIST_PERSIST_STEP:
+                self._twist_persisted = tether_twist_turns
+                persist = True
+            else:
+                persist = False
+            snap = self._snapshot_locked()
+
+        if mode_to_send is not None:
+            if not get_default_writer().set_mode(mode_to_send):
+                logger.debug("Auto-righting set_mode(%s) failed; will retry",
+                             mode_to_send)
+        if send is not None and send[0] == "release":
+            _set_thrust_command(None, Z_PWM_NEUTRAL, source="autoright")
+        elif send is not None:
+            cmd = send[1]
+            ok = _set_thrust_command(cmd["direction"], cmd["pwm"],
+                                     source="autoright",
+                                     roll_pwm=cmd.get("roll_pwm"))
+            if not ok:
+                with self._lock:
+                    if self.is_rescue_locked():
+                        self._end_locked(time.monotonic(), "rescue_cancelled",
+                                         "operator input")
+        if persist:
+            _persist_config()
+        self._queue_bin_values(snap)
+
+    def is_rescue_locked(self) -> bool:
+        return self.state in ("manual", "stabilize", "descending")
+
+    def _should_fire_locked(self, now) -> bool:
+        if self._inverted_since is None:
+            return False
+        return now - self._inverted_since >= SURF_INVERT_DWELL_S
+
+    def _start_locked(self, now) -> int:
+        """Enter the MANUAL drill and return the mode to request."""
+        restart = self.is_rescue_locked()
+        self.state = "manual"
+        if not restart:
+            self._rescue_started_at = now
+            fresh = (self._turn_entry_at is not None
+                     and now - self._turn_entry_at <= AUTORIGHT_TURN_ENTRY_MAX_AGE_S)
+            self._resume_depth_m = _resume_depth_for(
+                self._turn_entry_depth_m if fresh else None)
+        self._phase_since = now
+        self._righted_since = None
+        self._descent_frac = 0.0
+        self._roll_dir = None
+        self._last_command = None
+        self._last_down_gate_reason = None
+        self._note("rolled over: MANUAL, vertical "
+                   f"{autoright_vertical_pwm} us + roll toward upright")
+        return self._request_mode_locked(now, MODE_MANUAL)
+
+    def _request_mode_locked(self, now, mode) -> int:
+        self._mode = mode
+        self._mode_first_sent = now
+        self._mode_last_sent = now
+        self._mode_confirmed = False
+        return mode
+
+    def _end_locked(self, now, outcome, event) -> None:
+        self._outcome = (outcome, now)
+        self._reset_locked()
+        self.state = "idle"
+        if outcome != "rescued":
+            # Do not re-trigger on the same inversion: the operator owns
+            # it until the fish has been upright again.
+            self._armed_watch = False
+        self._note(f"{outcome}: {event}")
+
+    def _roll_stick(self, now, roll, fish_depth) -> int:
+        """RC2 toward upright the short way; centred near level.
+
+        The direction is latched for the whole snap: at +-180 deg "the
+        short way" flips every tick, and a stick that chatters between
+        the two never gets the fish moving.
+        """
+        if (not isinstance(roll, (int, float))
+                or abs(roll) < AUTORIGHT_ROLL_STICK_CUTOFF_DEG):
+            self._roll_dir = None
+            return Z_PWM_NEUTRAL
+        if (autoright_roll_min_depth_m > 0
+                and (fish_depth is None or fish_depth < autoright_roll_min_depth_m)
+                and now - self._phase_since < AUTORIGHT_ROLL_WAIT_MAX_S):
+            return Z_PWM_NEUTRAL
+        if self._roll_dir is None:
+            self._roll_dir = -1 if roll > 0 else 1
+        throw = AUTORIGHT_ROLL_FULL_THROW_US * autoright_roll_frac
+        return int(round(Z_PWM_NEUTRAL + self._roll_dir * throw))
+
+    def _plan_locked(self, now, fish_depth, roll, abs_roll, custom_mode,
+                     speed, wing_collective):
+        """One rescue tick. Returns ``(mode_to_send, send)``."""
+        mode_to_send = None
+        if custom_mode == self._mode:
+            self._mode_confirmed = True
+        elif self._mode_confirmed:
+            self._end_locked(now, "rescue_cancelled", "operator changed mode")
+            return None, ("release",)
+        else:
+            if now - self._mode_first_sent >= SURF_MODE_CONFIRM_S:
+                self._end_locked(now, "rescue_failed",
+                                 "mode change not confirmed")
+                return None, ("release",)
+            if now - self._mode_last_sent >= 1.0:
+                self._mode_last_sent = now
+                mode_to_send = self._mode
+            # Nothing to drive until the vehicle is in the right mode.
+            return mode_to_send, ("release",)
+
+        if self.state in ("manual", "stabilize"):
+            stabilize = self.state == "stabilize"
+            if (not stabilize
+                    and now - self._phase_since >= SURF_RIGHTING_TIMEOUT_S):
+                self.state = "stabilize"
+                self._phase_since = now
+                self._righted_since = None
+                self._last_command = None
+                self._note("not upright after "
+                           f"{SURF_RIGHTING_TIMEOUT_S:.0f} s in MANUAL, "
+                           "trying STABILIZE")
+                return self._request_mode_locked(now, MODE_STABILIZE), \
+                    ("release",)
+            if (stabilize and now - self._phase_since
+                    >= SURF_STABILIZE_RIGHTING_TIMEOUT_S):
+                # Leave the operator a passive vehicle: stay in STABILIZE.
+                self._end_locked(now, "rescue_failed",
+                                 "not upright after "
+                                 f"{SURF_STABILIZE_RIGHTING_TIMEOUT_S:.0f}"
+                                 " s in STABILIZE")
+                return None, ("release",)
+            if abs_roll is not None and abs_roll < SURF_RIGHTED_ROLL_DEG:
+                if self._righted_since is None:
+                    self._righted_since = now
+                if now - self._righted_since >= SURF_RIGHTED_HOLD_S:
+                    self.state = "descending"
+                    self._phase_since = now
+                    self._descent_frac = autoright_descent_start_frac
+                    self._last_tick_ts = now
+                    # Roll stick centred before ALT_HOLD takes over.
+                    cmd = {"direction": "up", "pwm": Z_PWM_NEUTRAL,
+                           "roll_pwm": Z_PWM_NEUTRAL, "frac": 0.0}
+                    self._last_command = cmd
+                    self._note("upright: ALT_HOLD, descending to "
+                               f"{self._resume_depth_m:.1f} m")
+                    return self._request_mode_locked(now, MODE_ALT_HOLD), \
+                        ("command", cmd)
+            else:
+                self._righted_since = None
+            if stabilize:
+                self._last_command = None
+                return None, ("release",)
+            vert = autoright_vertical_pwm
+            cmd = {"direction": "up" if vert >= Z_PWM_NEUTRAL else "down",
+                   "pwm": vert,
+                   "roll_pwm": self._roll_stick(now, roll, fish_depth),
+                   "frac": 1.0}
+            self._last_command = cmd
+            return None, ("command", cmd)
+
+        # descending
+        if now - self._phase_since >= SURF_DESCENT_TIMEOUT_S:
+            self._end_locked(now, "rescue_failed",
+                             "resume depth not reached in "
+                             f"{SURF_DESCENT_TIMEOUT_S:.0f} s")
+            return None, ("release",)
+        if (fish_depth is not None and self._resume_depth_m is not None
+                and fish_depth >= self._resume_depth_m):
+            self._end_locked(now, "rescued", f"back at {fish_depth:.1f} m")
+            return None, ("release",)
+        dt = SURF_TICK_S
+        if self._last_tick_ts is not None:
+            dt = max(0.0, min(1.0, now - self._last_tick_ts))
+        self._last_tick_ts = now
+        # Ramp the down authority in while the boat holds its speed and
+        # no dive gate objects; otherwise ramp it back out. Stepping
+        # straight to full down is what dragged the boat's speed down on
+        # 4 Nov.
+        self._last_down_gate_reason = None
+        if speed is None or speed < SURF_DESCENT_MIN_BOAT_SPEED_MS:
+            self._last_down_gate_reason = "too_slow_to_dive"
+        elif (wing_collective is not None
+                and wing_collective >= SURF_WING_SAT_US):
+            self._last_down_gate_reason = "wings_saturated"
+        elif abs_roll is not None and abs_roll > SURF_DIVE_BLOCK_ROLL_DEG:
+            self._last_down_gate_reason = "roll_dive_block"
+        step = SURF_DESCENT_RAMP_FRAC_PER_S * dt
+        if self._last_down_gate_reason is None:
+            self._descent_frac = min(SURF_DESCENT_MAX_FRAC,
+                                     self._descent_frac + step)
+        else:
+            self._descent_frac = max(0.0, self._descent_frac - step)
+        pwm = int(round(Z_PWM_NEUTRAL
+                        - (Z_PWM_NEUTRAL - jog_down_pwm) * self._descent_frac))
+        pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
+        cmd = {"direction": "down", "pwm": pwm, "roll_pwm": Z_PWM_NEUTRAL,
+               "frac": round(self._descent_frac, 3)}
+        self._last_command = cmd
+        return None, ("command", cmd)
+
+    # -- reporting -----------------------------------------------------
+    def _snapshot_locked(self) -> dict:
+        def _round(v, n=2):
+            return round(v, n) if isinstance(v, (int, float)) else None
+        now = time.monotonic()
+        outcome = None
+        if self._outcome is not None:
+            outcome = {"outcome": self._outcome[0],
+                       "age_s": round(now - self._outcome[1], 1)}
+        entry_age = (round(now - self._turn_entry_at, 0)
+                     if self._turn_entry_at is not None else None)
+        return {
+            "enabled": self.state != "disabled",
+            "state": self.state,
+            "active": self.is_rescue_locked(),
+            "elapsed_s": (round(now - self._rescue_started_at, 1)
+                          if self._rescue_started_at is not None else None),
+            "resume_depth_m": _round(self._resume_depth_m),
+            "turn_entry_depth_m": _round(self._turn_entry_depth_m),
+            "turn_entry_age_s": entry_age,
+            "vertical_pwm": autoright_vertical_pwm,
+            "roll_frac": round(autoright_roll_frac, 2),
+            "command": self._last_command,
+            "down_gate": self._last_down_gate_reason,
+            "tether_twist_turns": round(tether_twist_turns, 2),
+            "last": outcome,
+            "last_event": self.last_event,
+            "last_event_at": (self.last_event_at.isoformat()
+                              if self.last_event_at else None),
+        }
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _queue_bin_values(self, snap: dict) -> None:
+        """NAMED_VALUE_FLOAT mirror at 2 Hz plus every state change.
+
+        Rides on the surf-track mirror's queue and worker so both share
+        one rate-limited path to mavlink2rest.
+        """
+        code = AUTORIGHT_BIN_STATE_CODES.get(snap.get("state"), -1)
+        self._bin_tick += 1
+        if not (code != self._bin_last_code
+                or self._bin_tick % _SURF_LOG_DECIMATION == 0):
+            return
+        self._bin_last_code = code
+        _surftrack.queue_named_values([
+            ("AR_STATE", code),
+            ("AR_TGT", snap.get("resume_depth_m")),
+            ("AR_TWIST", snap.get("tether_twist_turns")),
+        ])
+
+
+_autoright = AutoRightController()
 
 
 # --- UTC clock bridge: boat GPS -> fish autopilot --------------------
@@ -7340,6 +8047,44 @@ def vehicle_thrust():
 def vehicle_thrust_stop():
     _set_thrust_command(None, Z_PWM_NEUTRAL, source="operator")
     return jsonify({"success": True, "direction": "stop"})
+
+
+@app.route('/vehicle/autoright', methods=['POST'])
+def vehicle_autoright():
+    """Auto-righting settings: ``enabled``, ``vertical_pwm``, ``roll_frac``,
+    and ``reset_twist`` (true zeroes the tether twist count)."""
+    global autoright_enabled, autoright_vertical_pwm, autoright_roll_frac
+    data = request.get_json(silent=True) or {}
+    if "vertical_pwm" in data:
+        try:
+            v = float(data["vertical_pwm"])
+        except (TypeError, ValueError):
+            return jsonify({"success": False,
+                            "message": "vertical_pwm must be a number"}), 400
+        if not (AUTORIGHT_VERTICAL_PWM_MIN <= v <= AUTORIGHT_VERTICAL_PWM_MAX):
+            return jsonify({"success": False,
+                            "message": f"vertical_pwm must be between {AUTORIGHT_VERTICAL_PWM_MIN} and {AUTORIGHT_VERTICAL_PWM_MAX} us"}), 400
+        autoright_vertical_pwm = _sanitize_autoright_vertical_pwm(v)
+    if "roll_frac" in data:
+        try:
+            v = float(data["roll_frac"])
+        except (TypeError, ValueError):
+            return jsonify({"success": False,
+                            "message": "roll_frac must be a number"}), 400
+        if not (0.0 <= v <= 1.0):
+            return jsonify({"success": False,
+                            "message": "roll_frac must be between 0 and 1"}), 400
+        autoright_roll_frac = _sanitize_autoright_roll_frac(v)
+    if data.get("reset_twist"):
+        _autoright.reset_twist()
+    if "enabled" in data:
+        autoright_enabled = bool(data["enabled"])
+        if autoright_enabled:
+            _autoright.enable()
+        else:
+            _autoright.disable()
+    _persist_config()
+    return jsonify({"success": True, **_autoright.snapshot()})
 
 
 @app.route('/vehicle/surftrack', methods=['POST'])
@@ -7706,6 +8451,9 @@ def get_status():
             # (populated by the module singleton) so the widget can
             # render the state machine without null checks.
             "surftrack": _surftrack.snapshot(),
+            # Auto-righting: independent of SURF TRACK, plus the tether
+            # twist count.
+            "autoright": _autoright.snapshot(),
             # UTC clock bridge: whether the fish's autopilot has been
             # given a real epoch yet, and what source is behind it.
             # Widget uses this to warn when logs will open with an
@@ -7715,6 +8463,9 @@ def get_status():
             # An operator seeing corrections here after every boot is
             # being told something else keeps resetting the autopilot.
             "param_enforce": _param_enforce_snapshot(),
+            # ATC_ANG_RLL_P = 0 means nothing levels the fish in a turn.
+            # The widget shows ``message`` whenever ``level`` is set.
+            "roll_p_warning": roll_p_warning_snapshot(),
             # BlueBoat Ping sonar (DISTANCE_SENSOR) -- water depth under
             # the surface craft. Null when the boat is unreachable.
             "ping_sonar": get_ping_sonar_snapshot(),
@@ -8199,6 +8950,7 @@ def _param_snapshot():
         "boat_system_id": boat_sys,
         "boat_component_id": boat_comp,
         "towfish_url": LOCAL_MAVLINK2REST_URL,
+        "roll_p_warning": roll_p_warning_snapshot(),
     }
 
 
@@ -8457,6 +9209,88 @@ def _start_param_enforcement():
                      name="param-enforce", daemon=True).start()
 
 
+# --- Roll angle gain watch -------------------------------------------------
+# ATC_ANG_RLL_P = 0 leaves nothing pushing the fish back to level; on the
+# 4 Nov 2026 tow that let every hairpin turn roll it inverted. The widget
+# and the console warn whenever the fish (or the saved target that boot
+# enforcement will write) is at 0. The fish value is re-read on its own
+# slow cadence, kept apart from _param_readings so it never overwrites a
+# card's "deferred: towfish armed" note, so a change made from QGC shows
+# up without anyone pressing Check.
+ROLL_P_PARAM = "ATC_ANG_RLL_P"
+ROLL_P_WATCH_PERIOD_S = 60.0
+_roll_p_reading = {"value": None, "read_at": None}
+ROLL_P_WARNING_TEXT = (
+    "ROLL P = 0: the autopilot will not level the fish. In turns it can "
+    "roll past 90°, and ALT_HOLD will then hold it inverted at the "
+    "surface. Set ATC_ANG_RLL_P in setup."
+)
+ROLL_P_TARGET_WARNING_TEXT = (
+    "ATC_ANG_RLL_P saved target is 0: boot enforcement will write it to "
+    "the fish, leaving nothing to level it in turns. Raise the target in "
+    "setup."
+)
+
+
+def roll_p_warning_snapshot() -> dict:
+    """Is the fish flying (or about to fly) with no roll angle gain?
+
+    ``level`` is ``"danger"`` when the value on the fish, or failing a
+    reading the saved target, is <= 0, and also when the fish is fine but
+    the target is 0 (the next boot would write it); ``None`` otherwise.
+    """
+    with _param_lock:
+        watched = dict(_roll_p_reading)
+        reading = dict(_param_readings.get(ROLL_P_PARAM) or {})
+    target = param_targets.get(ROLL_P_PARAM)
+    value, source, read_at = None, None, None
+    for candidate in (watched, reading):
+        if isinstance(candidate.get("value"), (int, float)):
+            value, source = float(candidate["value"]), "vehicle"
+            read_at = candidate.get("read_at")
+            break
+    if value is None and isinstance(target, (int, float)):
+        value, source = float(target), "target"
+    level, message = None, None
+    if value is None:
+        level, message = "unknown", "ATC_ANG_RLL_P has not been read yet."
+    elif value <= 0:
+        level = "danger"
+        message = (ROLL_P_WARNING_TEXT if source == "vehicle"
+                   else ROLL_P_TARGET_WARNING_TEXT)
+    elif isinstance(target, (int, float)) and target <= 0:
+        level, message = "danger", ROLL_P_TARGET_WARNING_TEXT
+    return {"level": level, "value": value, "source": source,
+            "target": target, "read_at": read_at, "message": message}
+
+
+def _roll_p_watch_worker():
+    time.sleep(PARAM_ENFORCE_SETTLE_S)
+    while True:
+        with _param_lock:
+            busy = bool(_param_job.get("running"))
+        # A running batch owns the PARAM_VALUE mailbox; skip this round.
+        if not busy:
+            try:
+                client = _param_client("towfish")
+                if client.is_reachable():
+                    result = client.read(ROLL_P_PARAM)
+                    with _param_lock:
+                        _roll_p_reading["value"] = result.get("value")
+                        _roll_p_reading["read_at"] = (
+                            datetime.now().isoformat(timespec="seconds"))
+            except ParamReadError as e:
+                logger.debug("Roll P watch read failed: %s", e)
+            except Exception:
+                logger.debug("Roll P watch failed", exc_info=True)
+        time.sleep(ROLL_P_WATCH_PERIOD_S)
+
+
+def _start_roll_p_watch():
+    threading.Thread(target=_roll_p_watch_worker,
+                     name="roll-p-watch", daemon=True).start()
+
+
 def _param_names_from_request(data):
     """Resolve a ``names``/``vehicles`` request body to a spec-name list.
 
@@ -8643,6 +9477,20 @@ if __name__ == '__main__':
         _start_param_enforcement()
     except Exception as e:
         logger.warning(f"Parameter enforcement failed to start: {e}")
+
+    # Keep the no-roll-P warning honest against edits made outside this
+    # extension (QGC, a reflash).
+    try:
+        _start_roll_p_watch()
+    except Exception as e:
+        logger.warning(f"Roll P watch failed to start: {e}")
+
+    # Auto-righting watches whenever it is enabled, SURF TRACK or not.
+    if autoright_enabled:
+        try:
+            _autoright.enable()
+        except Exception as e:
+            logger.warning(f"Auto-righting failed to start: {e}")
 
     start_data_lake_server()
     app.run(host='0.0.0.0', port=5423)

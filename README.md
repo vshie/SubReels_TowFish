@@ -100,6 +100,32 @@ scope, tow speed and depth. Planned work:
   for a full 2 s. Operator UP/DOWN always wins outright: a hold briefly
   suspends the loop rather than disengaging it, so a brushed touchscreen
   button cannot silently kill the mode mid-survey.
+  - **Dive gates, never a climb.** Attitude never makes the loop command up.
+    A slow boat, a stalled dive, wings at their down limit (SERVO5/6
+    collective) or more than 35° of roll each refuse *down* commands and pin
+    the commanded depth to the fish until they clear. Pitch drives no
+    decision: the fish tows nose-down and dives steeper, so no pitch limit
+    separates trouble from normal flight.
+  - **Auto-righting** (its own toggle; runs in ALT_HOLD whether or not
+    SURF TRACK is on). If the fish rolls past 60° for half a second it flies
+    the pilot's drill in MANUAL straight away, in the corner, without waiting
+    for the boat to straighten up: vertical stick at neutral (set in the
+    config) plus roll stick toward upright the short way, centred once the
+    fish is within 20°. Waiting cost depth: inverted in ALT_HOLD, the wings
+    sit at full down, which flies the fish to the surface, and a neutral
+    vertical stick leaves the wings their full differential for the roll
+    snap. Once upright it switches to ALT_HOLD and descends gradually back
+    to the depth the fish had when the boat reached the turn's first
+    waypoint, easing off whenever the boat drops below 0.9 m/s. If the drill
+    has not worked in 30 s it tries STABILIZE for up to 60 s. SURF TRACK
+    holds while this runs and resumes afterwards only if it was already on.
+    Any operator jog or mode change cancels it. It also counts tether twist
+    (net full rolls, whoever is flying) for the widget and the log, with a
+    reset button for after untwisting.
+  - **Logged in the BIN.** Controller state, dive gate, commanded depth,
+    altitude and RC3 are sent to the fish as NAMED_VALUE_FLOAT (`ST_STATE`,
+    `ST_GATE`, `ST_TGT`, `ST_ALT`, `ST_RC3`), so they land in the
+    autopilot's own log as `NVAL` beside the attitude they explain.
 - **Telemetry sidecars for video** — every recording gets a `*_telemetry.csv`
   at 5 Hz carrying the same fields as the stills path, so frames extracted
   later with `extract_geotagged_frames.py` come out with identical metadata.
@@ -156,7 +182,7 @@ state.
 
 | Parameter | Default | Why |
 | --- | --- | --- |
-| `ATC_ANG_RLL_P` | 0.00 | Leaves roll passive so the tow cable sets the fish attitude. |
+| `ATC_ANG_RLL_P` | 1.5 | The only term that pushes the fish back to level. At 0 the cable sets roll on a straight line, but every hairpin turn on the 4 Nov 2026 tow rolled the fish inverted. The widget and setup console warn whenever the fish, or the saved target, is at 0. |
 | `ATC_RAT_RLL_D` | 0.0072 | Damps the roll oscillation the cable induces. |
 | `ATC_RAT_RLL_FLTE` | 3 Hz | Roll rate error filter cutoff. |
 | `ATC_RAT_RLL_FLTD` | 4 Hz | Roll rate derivative filter cutoff. |

@@ -186,6 +186,24 @@ class MavlinkWriter:
             "time_boot_ms": int(boot_ms),
         })
 
+    def named_value_float(self, name: str, value: float) -> bool:
+        """POST a NAMED_VALUE_FLOAT so the autopilot logs it as ``NVAL``.
+
+        ArduSub records every NAMED_VALUE_FLOAT it receives into the
+        dataflash log, which is how values computed off-vehicle (surf
+        track state, the RadCam health counters) end up in the same BIN
+        as the attitude they explain. mavlink2rest wants the ``char[10]``
+        name as a list of single characters, NUL-padded.
+        """
+        chars = list(str(name)[:10])
+        chars += ["\u0000"] * (10 - len(chars))
+        return self._post({
+            "type": "NAMED_VALUE_FLOAT",
+            "time_boot_ms": 0,
+            "name": chars,
+            "value": float(value),
+        })
+
     # -- vehicle --------------------------------------------------------
     def set_mode(self, custom_mode: int) -> bool:
         """DO_SET_MODE with param1=1 (custom mode enabled), param2=mode.

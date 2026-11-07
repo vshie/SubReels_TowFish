@@ -166,7 +166,7 @@ print("\ncontrol-surface corrections are present and point away from stock")
 # differs -- a spec whose target equals the stock value corrects nothing.
 # Values the survey itself arrived at: we hold these rather than change
 # them, so target == as-flown is correct and the console shows no arrow.
-PRESERVED = {"ATC_RAT_RLL_P", "RNGFND1_MAX"}
+PRESERVED = {"ATC_RAT_RLL_P", "RNGFND1_MAX", "THR_DZ"}
 
 for name, flown in main.PARAM_AS_FLOWN.items():
     spec = main.PARAM_SPECS_BY_NAME.get(name)
@@ -535,6 +535,67 @@ try:
           sum(1 for r in drifted_snap["params"] if r["overridden"]) == 1)
 finally:
     main.param_targets = saved_targets
+
+# ---------------------------------------------------------------------------
+print("\nroll angle gain: a softer default and a loud warning at 0")
+# ---------------------------------------------------------------------------
+
+# 0 left nothing levelling the fish; the 4 Nov tow rolled it inverted in
+# every hairpin turn. The shipped value is now 1.5.
+check("ATC_ANG_RLL_P ships at 1.5",
+      SHIPPED["ATC_ANG_RLL_P"] == 1.5, f"got {SHIPPED['ATC_ANG_RLL_P']}")
+
+# THR_DZ 0 let SURF TRACK's small corrections act but cost the roll
+# controller wing in hairpins (sim, 6 Nov): held at the flown 100, enforced
+# so it cannot drift.
+dz = next(s for s in main.PARAM_SPECS if s["name"] == "THR_DZ")
+check("THR_DZ held at the flown 100 and enforced",
+      SHIPPED["THR_DZ"] == 100.0 and dz["enforce"] and dz["as_flown"] == 100.0,
+      f"got {SHIPPED.get('THR_DZ')}, enforce={dz.get('enforce')}")
+
+# An install that saved the old 0 untouched picks up the new default.
+prior = dict(SHIPPED)
+prior["ATC_ANG_RLL_P"] = 0.0
+saved = dict(SHIPPED)
+saved["ATC_ANG_RLL_P"] = 0.0
+got = main._reconcile_saved_targets(saved, prior)
+check("an untouched saved 0 adopts 1.5", got["ATC_ANG_RLL_P"] == 1.5,
+      f"got {got['ATC_ANG_RLL_P']}")
+
+saved_targets = main.param_targets
+saved_watch = dict(main._roll_p_reading)
+saved_reading = main._param_readings.get("ATC_ANG_RLL_P")
+try:
+    main.param_targets = dict(SHIPPED)
+    main._roll_p_reading.update({"value": 0.0, "read_at": "t"})
+    warn = main.roll_p_warning_snapshot()
+    check("fish reading 0 -> danger",
+          warn["level"] == "danger" and warn["source"] == "vehicle", str(warn))
+    check("warning explains the turn/inversion risk",
+          "inverted" in (warn["message"] or ""))
+
+    main._roll_p_reading.update({"value": 1.5})
+    warn = main.roll_p_warning_snapshot()
+    check("fish reading 1.5 with a 1.5 target -> no warning",
+          warn["level"] is None, str(warn))
+
+    main.param_targets = dict(SHIPPED, ATC_ANG_RLL_P=0.0)
+    warn = main.roll_p_warning_snapshot()
+    check("fish fine but saved target 0 -> danger (boot would write it)",
+          warn["level"] == "danger"
+          and "enforcement" in (warn["message"] or ""), str(warn))
+
+    main._roll_p_reading.update({"value": None})
+    main._param_readings.pop("ATC_ANG_RLL_P", None)
+    warn = main.roll_p_warning_snapshot()
+    check("no reading falls back to the saved target",
+          warn["source"] == "target" and warn["level"] == "danger", str(warn))
+finally:
+    main.param_targets = saved_targets
+    main._roll_p_reading.clear()
+    main._roll_p_reading.update(saved_watch)
+    if saved_reading is not None:
+        main._param_readings["ATC_ANG_RLL_P"] = saved_reading
 
 # ---------------------------------------------------------------------------
 print()

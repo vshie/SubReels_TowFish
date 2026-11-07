@@ -156,20 +156,47 @@ def default_vehicle(armed=True, mode=main.MODE_ALT_HOLD):
             "depth_m": 5.0}
 
 
+class FakeWriter:
+    """Captures any mode changes the loop asks for (it should ask none)."""
+
+    def __init__(self):
+        self.modes: list[int] = []
+
+    def set_mode(self, mode):
+        self.modes.append(mode)
+        return True
+
+    def named_value_float(self, name, value):
+        return True
+
+
+WRITER = FakeWriter()
+main.get_default_writer = lambda: WRITER  # type: ignore[assignment]
+
+
+def servo_msg(collective_us):
+    """SERVO_OUTPUT_RAW with the wings at a given collective (+ = down)."""
+    return {f"servo{main.SURF_WING_SERVO_A}_raw": 1500 + collective_us,
+            f"servo{main.SURF_WING_SERVO_B}_raw": 1500 - collective_us}
+
+
 def drive(ctrl, *, fish_depth=5.5, sonar=None, vehicle=None,
-          now=None, dt=0.5, attitude=None):
+          now=None, dt=0.5, attitude=None, servo=None, veto=False):
     """Run one _tick with the given inputs. Returns captured RC3 writes.
 
     ``attitude`` is ``None`` to leave ``get_towfish_attitude`` alone
     (defaults to an empty dict via the requests stub), or a dict like
-    ``{"roll": 25.0, "pitch": 0.0}`` to inject a specific attitude
-    into the recovery detector.
+    ``{"roll": 25.0, "pitch": 0.0}`` to inject a specific attitude.
+    ``servo`` is a SERVO_OUTPUT_RAW dict (see :func:`servo_msg`); the
+    default ``{}`` means the wing collective is unknown. ``veto`` makes
+    surf-track RC3 writes fail as if the operator held the stick.
     """
     if sonar is not None:
         main._sonar_history = sonar
     if vehicle is None:
         vehicle = default_vehicle()
-    calls = install_thrust_capture()
+    calls = (install_thrust_operator_veto() if veto
+             else install_thrust_capture())
     tstart = now if now is not None else 100.0
     patches = [
         mock.patch.object(main.time, "monotonic", return_value=tstart),
@@ -177,16 +204,19 @@ def drive(ctrl, *, fish_depth=5.5, sonar=None, vehicle=None,
                           return_value=fish_depth),
         mock.patch.object(main, "get_vehicle_status_snapshot",
                           return_value=vehicle),
+        mock.patch.object(main, "_servo_output_message",
+                          return_value=servo or {}),
     ]
     if attitude is not None:
         patches.append(mock.patch.object(main, "get_towfish_attitude",
                                          return_value=attitude))
-    with patches[0], patches[1], patches[2]:
-        if len(patches) > 3:
-            with patches[3]:
-                ctrl._tick()
-        else:
-            ctrl._tick()
+    for p in patches:
+        p.start()
+    try:
+        ctrl._tick()
+    finally:
+        for p in patches:
+            p.stop()
     return calls
 
 
@@ -483,78 +513,135 @@ check("snapshot flags ceiling_limited",
 main.tether_length_m = 0.0
 
 # ---------------------------------------------------------------------------
-# Recovery entry on roll excursion, up-command at recovery frac
+# No recovery: attitude excursions never climb, and pitch is ignored
 # ---------------------------------------------------------------------------
-print("\nrecovery: roll excursion drives full up")
+print("\nno recovery: a 25 deg roll does not climb")
 ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
-# Preseed a modest tracking state so the tick actually enters the
-# _tick body at ``elif`` -> recovery rather than being swallowed by
-# the ``hold_reason`` branch.
 ctrl._target_depth_m = 6.0
 ctrl._raw_target_depth_m = 6.0
 calls = drive(ctrl, fish_depth=6.0, now=800.0,
               attitude={"roll": 25.0, "pitch": 0.0})
-check("state transitions to 'recovering'", ctrl.state == "recovering",
+check("still tracking on a 25 deg roll", ctrl.state == "tracking",
       f"got state={ctrl.state}")
-check("hold_reason records 'roll_excursion'",
-      ctrl.hold_reason == "roll_excursion",
-      f"got hold_reason={ctrl.hold_reason}")
-check("recovery commands up",
-      any(c[0] == "up" and c[2] == "surftrack" for c in calls),
-      f"got {calls}")
-# SURF_RECOVERY_UP_FRAC is 1.0 today -- pwm should hit the full up jog.
-check("recovery up command is at recovery authority",
-      any(c[0] == "up" and c[1] == main.jog_up_pwm for c in calls),
-      f"got {calls}")
+check("no up command on a 25 deg roll",
+      not any(c[0] == "up" for c in calls), f"got {calls}")
+check("no recovery attributes remain",
+      not any(k.startswith("_recovery") for k in vars(ctrl)))
+
+print("\npitch never changes a decision")
+
+
+def run_with_pitch(pitch):
+    c = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+    c._target_depth_m = 5.0
+    c._raw_target_depth_m = 5.0
+    out = []
+    for i in range(6):
+        out.append(drive(c, fish_depth=4.0, now=850.0 + i * 0.5,
+                         attitude={"roll": 0.0, "pitch": pitch}))
+    return c.state, c._last_down_gate_reason, out
+
+
+baseline = run_with_pitch(0.0)
+same = all(run_with_pitch(p) == baseline
+           for p in (-60.0, -38.0, -14.0, 25.0, 60.0))
+check("state, gate and RC3 identical across pitch -60..+60", same)
 
 # ---------------------------------------------------------------------------
-# Recovery: attitude clears after SURF_RECOVERY_CLEAR_S -> tracking + cooldown
+# Dive gates: only ever block down
 # ---------------------------------------------------------------------------
-print("\nrecovery: clearance exits with cooldown")
-# Continue from the previous controller. Advance time past
-# SURF_RECOVERY_CLEAR_S with attitude back inside limits.
-t = 800.0
-# Two ticks: one to seed _recovery_ok_since, another after the
-# clearance window elapses.
-drive(ctrl, fish_depth=6.0, now=t + 0.1,
-      attitude={"roll": 0.0, "pitch": 0.0})
-check("still recovering while clear-window unfinished",
-      ctrl.state == "recovering",
-      f"got state={ctrl.state}")
-drive(ctrl, fish_depth=6.0, now=t + 0.1 + main.SURF_RECOVERY_CLEAR_S + 0.5,
-      attitude={"roll": 0.0, "pitch": 0.0})
-check("state returns to 'tracking' after clearance",
-      ctrl.state == "tracking",
-      f"got state={ctrl.state}")
-check("recovery cooldown armed",
-      ctrl._recovery_cooldown_until is not None
-      and ctrl._recovery_cooldown_until > t,
-      f"got cooldown={ctrl._recovery_cooldown_until}")
-# Snapshot the cooldown from the same simulated clock the tick ran
-# under so ``time.monotonic()`` still lies inside the cooldown
-# window; otherwise real wall-clock time trivially clears it.
-with mock.patch.object(main.time, "monotonic",
-                       return_value=t + 0.1 + main.SURF_RECOVERY_CLEAR_S + 0.6):
-    snap = ctrl.snapshot()
-check("snapshot reports recovery_cooldown_s",
-      isinstance(snap.get("recovery_cooldown_s"), (int, float))
-      and snap["recovery_cooldown_s"] > 0,
-      f"got {snap.get('recovery_cooldown_s')}")
-
-# ---------------------------------------------------------------------------
-# Recovery: pitch excursion also enters recovering
-# ---------------------------------------------------------------------------
-print("\nrecovery: pitch excursion also enters recovery")
+print("\ndive gate: roll past 35 deg blocks down only")
 ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
 ctrl._target_depth_m = 6.0
 ctrl._raw_target_depth_m = 6.0
-calls = drive(ctrl, fish_depth=6.0, now=900.0,
-              attitude={"roll": 0.0, "pitch": 30.0})
-check("pitch excursion -> recovering", ctrl.state == "recovering",
-      f"got state={ctrl.state}")
-check("pitch excursion sets hold_reason 'pitch_excursion'",
-      ctrl.hold_reason == "pitch_excursion",
-      f"got hold_reason={ctrl.hold_reason}")
+calls = drive(ctrl, fish_depth=5.0, now=900.0,
+              attitude={"roll": 40.0, "pitch": 0.0})
+check("down refused while rolled",
+      not any(c[0] == "down" for c in calls), f"got {calls}")
+check("gate is roll_dive_block",
+      ctrl._last_down_gate_reason == "roll_dive_block",
+      f"got {ctrl._last_down_gate_reason}")
+check("commanded depth pinned to the fish",
+      ctrl._target_depth_m <= 5.0 + 1e-6, f"got {ctrl._target_depth_m}")
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+ctrl._target_depth_m = 3.0
+ctrl._raw_target_depth_m = 3.0
+calls = drive(ctrl, fish_depth=5.0, now=910.0,
+              attitude={"roll": 40.0, "pitch": 0.0})
+check("up toward a shallower target still allowed while rolled",
+      any(c[0] == "up" for c in calls), f"got {calls}")
+
+print("\ndive gate: saturated wings block down")
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
+calls = drive(ctrl, fish_depth=5.0, now=920.0, servo=servo_msg(420))
+check("down refused at 420 us collective",
+      not any(c[0] == "down" for c in calls), f"got {calls}")
+check("gate is wings_saturated",
+      ctrl._last_down_gate_reason == "wings_saturated",
+      f"got {ctrl._last_down_gate_reason}")
+check("snapshot reports wing_collective_us",
+      ctrl.snapshot().get("wing_collective_us") == 420)
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+ctrl._target_depth_m = 6.0
+ctrl._raw_target_depth_m = 6.0
+calls = drive(ctrl, fish_depth=5.0, now=930.0, servo=servo_msg(200))
+check("down allowed at 200 us collective",
+      any(c[0] == "down" for c in calls), f"got {calls}")
+check("disarmed zero outputs read as unknown, not neutral",
+      main._wing_collective_us({"servo5_raw": 0, "servo6_raw": 0}) is None)
+
+print("\ndive gate: a stall blocks down for the holdoff, never climbs")
+ctrl = fresh_controller(FakeSonar(latest=(20.0, 0.5)))
+ctrl._target_depth_m = 15.0
+ctrl._raw_target_depth_m = 15.0
+t = 1000.0
+calls_all = []
+# Commanding down for longer than the stall window without gaining depth.
+while t <= 1000.0 + main.SURF_STALL_WINDOW_S + 1.0:
+    calls_all += drive(ctrl, fish_depth=5.0, now=t)
+    t += 0.5
+check("stall arms the down holdoff",
+      ctrl._down_holdoff_until is not None
+      and ctrl._down_holdoff_until > t - 0.5,
+      f"got {ctrl._down_holdoff_until}")
+calls = drive(ctrl, fish_depth=5.0, now=t)
+check("gate is down_stall during the holdoff",
+      ctrl._last_down_gate_reason == "down_stall",
+      f"got {ctrl._last_down_gate_reason}")
+check("no up command from a stall",
+      not any(c[0] == "up" for c in calls_all + calls))
+calls = drive(ctrl, fish_depth=5.0, now=t + main.SURF_DOWN_HOLDOFF_S + 1.0)
+check("down allowed again after the holdoff",
+      any(c[0] == "down" for c in calls), f"got {calls}")
+
+# ---------------------------------------------------------------------------
+# Auto-righting hand-off (the drill itself is in test_autoright.py)
+# ---------------------------------------------------------------------------
+print("\nauto-righting active -> surf-track holds and stays off RC3")
+ctrl = fresh_controller(FakeSonar(latest=(10.0, 0.5)))
+with mock.patch.object(main._autoright, "is_active", return_value=True):
+    calls = drive(ctrl, fish_depth=5.0)
+check("holding/autoright", ctrl.state == "holding"
+      and ctrl.hold_reason == "autoright",
+      f"state={ctrl.state} reason={ctrl.hold_reason}")
+check("only a surf-track release (cannot clear the drill's RC3)",
+      calls == [(None, main.Z_PWM_NEUTRAL, "surftrack")], f"got {calls}")
+check("never asks for a mode", not WRITER.modes, f"got {WRITER.modes}")
+drive(ctrl, fish_depth=5.0, now=200.0)
+drive(ctrl, fish_depth=5.0, now=200.0 + main.SURF_RESUME_DEBOUNCE_S + 0.1)
+check("resumes tracking on its own debounce afterwards",
+      ctrl.state == "tracking", f"got {ctrl.state}")
+
+print("\nsnapshot keys")
+snap = fresh_controller().snapshot()
+check("new keys present",
+      all(k in snap for k in ("wing_collective_us", "boat_speed_ms",
+                              "down_gate")), f"got {sorted(snap)}")
+check("rescue keys moved to auto-righting",
+      not any(k.startswith("rescue") for k in snap), f"got {sorted(snap)}")
+check("recovery_cooldown_s gone", "recovery_cooldown_s" not in snap)
 
 # ---------------------------------------------------------------------------
 # Speed gate: down refused when boat is stalled
