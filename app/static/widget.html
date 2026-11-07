@@ -677,6 +677,26 @@
         #surfState { padding: 1px 6px; border-radius: 2px; border: 1px solid transparent; }
         #surfState.tracking { color: var(--phosphor); border-color: var(--stroke); background: rgba(124, 242, 156, 0.06); }
         #surfState.holding  { color: var(--amber);    border-color: rgba(242, 179, 76, 0.4); background: rgba(242, 179, 76, 0.06); }
+        #arState { padding: 1px 6px; border-radius: 2px; border: 1px solid transparent; }
+        #arState.idle    { color: var(--phosphor); border-color: var(--stroke); background: rgba(124, 242, 156, 0.06); }
+        #arState.waiting { color: var(--amber);    border-color: rgba(242, 179, 76, 0.4); background: rgba(242, 179, 76, 0.06); }
+        #arState.rescue  { color: var(--red);      border-color: var(--red-glow); background: rgba(239, 83, 80, 0.08); }
+        /* ATC_ANG_RLL_P = 0 on the fish: nothing levels it in a turn.
+           Persistent while true; it rolled the fish inverted on 4 Nov. */
+        .roll-p-warn {
+            display: none;
+            margin-top: 6px;
+            padding: 4px 6px;
+            border: 1px solid var(--red-glow);
+            border-radius: 2px;
+            background: rgba(239, 83, 80, 0.08);
+            color: var(--red);
+            font-size: var(--lbl);
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            line-height: 1.35;
+        }
+        .roll-p-warn.on { display: block; }
 
         /* Combined OPTICS section: two labelled rows (ZOOM / FOCUS)
            share one card. The left key column keeps the two rows
@@ -898,8 +918,9 @@
             </div>
             <div class="jog-tune">
                 <label>UP &micro;s <input type="number" id="jogUpPwm" min="1501" max="1900" step="10" value="1600"></label>
-                <label>DN &micro;s <input type="number" id="jogDownPwm" min="1100" max="1499" step="10" value="1400"></label>
+                <label>DN &micro;s <input type="number" id="jogDownPwm" min="1100" max="1499" step="10" value="1300"></label>
             </div>
+            <div class="roll-p-warn" id="rollPWarn"></div>
             <div class="jog-divider">
                 <span>SURF TRACK TARGET</span>
                 <span class="aux off" id="surfState">DISABLED</span>
@@ -934,6 +955,20 @@
                  pilot what happens when they release RC3. surfHint is kept
                  (hidden by default) so surf-track can surface its state. -->
             <div class="hint" id="surfHint" style="display:none;"></div>
+            <div class="jog-divider">
+                <span>AUTO-RIGHTING</span>
+                <span class="aux off" id="arState">OFF</span>
+            </div>
+            <div class="row three">
+                <button class="btn small" id="arToggleBtn">AUTO-RIGHT</button>
+                <div class="surf-target-cell">
+                    <span class="surf-target-label">TWIST</span>
+                    <span class="surf-target" id="arTwist">0.0</span>
+                    <span class="surf-target-unit">turns</span>
+                </div>
+                <button class="btn small" id="arTwistResetBtn">RESET</button>
+            </div>
+            <div class="hint" id="arHint" style="display:none;"></div>
         </div>
 
         <div class="section">
@@ -1369,7 +1404,7 @@ bindTiltStep($('tiltDnBtn'), 'down');
 // backend had no copy for the automatic loop to read).
 function clampJog(v, direction) {
     v = Math.round(Number(v));
-    if (!isFinite(v)) return direction === 'up' ? 1600 : 1400;
+    if (!isFinite(v)) return direction === 'up' ? 1600 : 1300;
     if (direction === 'up')   return Math.max(1501, Math.min(1900, v));
     return Math.min(1499, Math.max(1100, v));
 }
@@ -1418,6 +1453,58 @@ const surfCmdEl     = $('surfCmd');
 const surfHintEl    = $('surfHint');
 let surfTrackEnabled = false;
 
+// Auto-righting: independent of SURF TRACK, with the tether twist count.
+let autoRightEnabled = false;
+$('arToggleBtn').addEventListener('click',
+    () => postJson('/vehicle/autoright', { enabled: !autoRightEnabled }));
+$('arTwistResetBtn').addEventListener('click', () => {
+    if (confirm('Reset the tether twist count to 0? Do this after untwisting the tether.')) {
+        postJson('/vehicle/autoright', { reset_twist: true });
+    }
+});
+
+function renderAutoRight(ar) {
+    autoRightEnabled = !!ar.enabled;
+    $('arToggleBtn').classList.toggle('active', autoRightEnabled);
+    const pill = $('arState');
+    pill.className = '';
+    const labels = { idle: 'WATCHING', waiting: 'WAITING', manual: 'RIGHTING',
+                     stabilize: 'STABILIZE', descending: 'DESCENDING' };
+    if (!ar.enabled) {
+        pill.textContent = 'OFF';
+        pill.className = 'aux off';
+    } else {
+        pill.textContent = labels[ar.state] || (ar.state || '--').toUpperCase();
+        pill.classList.add(ar.active ? 'rescue' : ar.state === 'waiting' ? 'waiting' : 'idle');
+    }
+    const twist = typeof ar.tether_twist_turns === 'number' ? ar.tether_twist_turns : 0;
+    $('arTwist').textContent = `${twist > 0 ? '+' : ''}${twist.toFixed(1)}`;
+
+    const hint = $('arHint');
+    const cmd = ar.command || {};
+    const to = typeof ar.resume_depth_m === 'number' ? `${ar.resume_depth_m.toFixed(1)} m` : '--';
+    const last = ar.last && ar.last.age_s < 30 ? AR_OUTCOMES[ar.last.outcome] : null;
+    let text = '';
+    if (ar.state === 'waiting') {
+        text = 'Fish rolled past 60°: righting in a moment unless it levels.';
+    } else if (ar.state === 'manual') {
+        const side = cmd.roll_pwm > 1500 ? 'right' : cmd.roll_pwm < 1500 ? 'left' : 'centred';
+        text = `MANUAL: vertical ${cmd.pwm || ar.vertical_pwm} µs + roll ${side}. Operator input cancels.`;
+    } else if (ar.state === 'stabilize') {
+        text = 'Not upright after 30 s of the drill: trying STABILIZE. Operator input cancels.';
+    } else if (ar.state === 'descending') {
+        const why = ar.down_gate ? ` (easing off: ${SURF_DOWN_GATES[ar.down_gate] || ar.down_gate})` : '';
+        text = `Upright: ALT_HOLD, descending to ${to} (turn-entry depth)${why}. Operator input cancels.`;
+    } else if (last) {
+        text = last;
+    }
+    if (Math.abs(twist) >= 1) {
+        text = `${text ? text + ' ' : ''}Tether has ${Math.abs(twist).toFixed(1)} turns of twist.`;
+    }
+    hint.textContent = text;
+    hint.style.display = text ? '' : 'none';
+}
+
 $('vehSurfTrackBtn').addEventListener('click', () => {
     postJson('/vehicle/surftrack', { enabled: !surfTrackEnabled });
 });
@@ -1449,7 +1536,22 @@ const SURF_HOLD_REASONS = {
     'sonar_stale':       'boat sonar has no bottom lock',
     'not_underway':      'boat not underway',
     'geometry_insane':   'bottom reads above fish (bad lock)',
-    'pitch_limit':       'pitch past 35°, ALT_HOLD in control',
+    'autoright':         'auto-righting is flying the fish',
+};
+
+const AR_OUTCOMES = {
+    'rescued':          'Auto-righting complete.',
+    'rescue_failed':    'Auto-righting gave up; fly it by hand.',
+    'rescue_cancelled': 'Auto-righting cancelled by operator.',
+};
+
+// Why the loop is refusing to dive while it otherwise tracks. These only
+// ever block *down*; nothing in SURF TRACK climbs on attitude.
+const SURF_DOWN_GATES = {
+    'too_slow_to_dive': 'boat too slow',
+    'down_stall':       'dive stalled',
+    'wings_saturated':  'wings at full down',
+    'roll_dive_block':  'fish rolled',
 };
 
 // Attitude indicator. The horizon turns opposite the roll and drops as
@@ -1838,11 +1940,25 @@ async function pollStatus() {
         }
         // Human-readable hint that shows what the loop is doing right
         // now, or why it is not doing anything.
+        // Roll-P warning: persistent, independent of SURF TRACK state.
+        const rollWarn = data.roll_p_warning || {};
+        const rollPWarnEl = $('rollPWarn');
+        const rollDanger = rollWarn.level === 'danger';
+        rollPWarnEl.classList.toggle('on', rollDanger);
+        rollPWarnEl.textContent = rollDanger ? (rollWarn.message || '') : '';
+
+        // The hint stays hidden to save space unless it has something
+        // the pilot must see: a blocked dive or an auto-righting hold.
+        const gate = surf.down_gate ? (SURF_DOWN_GATES[surf.down_gate] || surf.down_gate) : null;
+        let showHint = surf.enabled
+            && (!!gate || surf.hold_reason === 'autoright');
         if (!surf.enabled) {
             surfHintEl.textContent = 'Not engaged. Requires ALT_HOLD and a boat sonar lock while underway.';
         } else if (surf.state === 'holding') {
             const why = SURF_HOLD_REASONS[surf.hold_reason] || surf.hold_reason || 'holding';
-            surfHintEl.textContent = `HOLDING: ${why}. RC3 released; ALT_HOLD keeps depth.`;
+            surfHintEl.textContent = surf.hold_reason === 'autoright'
+                ? `HOLDING: ${why}; tracking resumes afterwards.`
+                : `HOLDING: ${why}. RC3 released; ALT_HOLD keeps depth.`;
         } else if (surf.state === 'tracking' && !surf.command) {
             surfHintEl.textContent = 'On target. Inside the deadband; ALT_HOLD holds depth.';
         } else if (surf.state === 'tracking' && surf.command) {
@@ -1853,6 +1969,11 @@ async function pollStatus() {
         } else {
             surfHintEl.textContent = '';
         }
+        if (surf.enabled && surf.state === 'tracking' && gate) {
+            surfHintEl.textContent = `Dives blocked: ${gate}. ${surfHintEl.textContent}`;
+        }
+        renderAutoRight(data.autoright || {});
+        surfHintEl.style.display = showHint ? '' : 'none';
 
         // Rec lamp
         const recLamp = $('recLamp');

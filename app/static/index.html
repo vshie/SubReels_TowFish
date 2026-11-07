@@ -662,6 +662,18 @@
             padding: 1px 5px;
             cursor: pointer;
         }
+        /* ATC_ANG_RLL_P at 0: nothing levels the fish in a turn. Red, not
+           amber -- this one rolled the fish inverted on the 4 Nov tow. */
+        .pcard-danger {
+            font: 600 11px var(--mono);
+            letter-spacing: 0.04em;
+            color: var(--red);
+            border: 1px solid var(--red-glow);
+            border-radius: 3px;
+            padding: 4px 6px;
+            line-height: 1.4;
+        }
+        .pcard.danger { border-color: var(--red); }
         .pcard-target { display: flex; gap: 5px; align-items: center; }
         .pcard-target .unit {
             font-size: 12.5px;
@@ -1558,7 +1570,11 @@ function buildParamCard(p) {
     });
     override.append(overrideText, overrideBtn);
 
-    card.append(head, desc, ...(conv ? [conv] : []), override, values, actions);
+    const danger = document.createElement('div');
+    danger.className = 'pcard-danger';
+    danger.style.display = 'none';
+
+    card.append(head, desc, ...(conv ? [conv] : []), danger, override, values, actions);
 
     input.addEventListener('input', () => {
         dirtyTargets[p.name] = input.value;
@@ -1570,7 +1586,7 @@ function buildParamCard(p) {
     });
 
     paramEls[p.name] = { card, badge, current, input, applyBtn, presetButtons,
-                         override, overrideText };
+                         override, overrideText, danger };
     return card;
 }
 
@@ -1671,6 +1687,17 @@ function renderParamGroups(params) {
     }
 }
 
+// The backend decides when ATC_ANG_RLL_P is dangerous (fish value, or the
+// saved target boot enforcement will write); the card just says so.
+function updateRollPWarning(warn) {
+    const els = paramEls['ATC_ANG_RLL_P'];
+    if (!els) return;
+    const show = !!(warn && warn.level === 'danger');
+    els.danger.style.display = show ? 'block' : 'none';
+    els.danger.textContent = show ? warn.message : '';
+    els.card.classList.toggle('danger', show);
+}
+
 function renderParamState(state) {
     paramSpecs = state.params;
     paramByName = Object.fromEntries(state.params.map((p) => [p.name, p]));
@@ -1678,6 +1705,7 @@ function renderParamState(state) {
 
     if (!Object.keys(paramEls).length) renderParamGroups(state.params);
     state.params.forEach(updateParamCard);
+    updateRollPWarning(state.roll_p_warning);
 
     for (const vehicle of ['boat', 'towfish']) {
         const el = $(`paramEndpoint_${vehicle}`);
