@@ -1,0 +1,753 @@
+<title>Towfish Hairpin Turn</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Semi+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a subsea console. The 3D scene is the instrument; captions, a
+   rear-view roll gauge and a scrubbable trace strip read it out.
+   Single deliberate dark theme (underwater scene). */
+:root {
+  --abyss: #061218;
+  --deep: #0b1f28;
+  --panel: #10272f;
+  --rule: #23434d;
+  --ink: #dbe8ea;
+  --ink-dim: #8aa4aa;
+  --sim: #ff8a3d;
+  --real: #5fb3ff;
+  --wing: #ffb347;
+  --tether: #f2d14b;
+  --alarm: #ff5d5d;
+  --ok: #57d98f;
+  --display: "Saira Semi Condensed", "Arial Narrow", sans-serif;
+  --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+html, body { background: var(--abyss); color: var(--ink); }
+body { font-family: var(--body); font-size: 15px; line-height: 1.5; }
+.wrap {
+  max-width: 1280px; margin: 0 auto;
+  padding-block: 20px 32px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 16px;
+}
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+h1 {
+  font-family: var(--display); font-weight: 700; font-size: clamp(22px, 3.2vw, 32px);
+  letter-spacing: 0.01em; margin: 0; text-wrap: balance;
+}
+.sub { color: var(--ink-dim); font-size: 14px; max-width: 75ch; }
+.stage { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; }
+@media (max-width: 900px) { .stage { grid-template-columns: minmax(0, 1fr); } }
+.view {
+  position: relative; border-radius: 6px; overflow: hidden;
+  background: var(--deep); aspect-ratio: 16 / 9; max-width: 100%; min-height: 260px;
+  border: 1px solid var(--rule);
+}
+.view canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.hud {
+  position: absolute; left: 12px; top: 10px; display: flex; flex-wrap: wrap; gap: 6px;
+  font-family: var(--mono); font-size: 12px; pointer-events: none;
+  font-variant-numeric: tabular-nums; max-width: calc(100% - 24px);
+}
+.chip {
+  background: rgba(6, 18, 24, 0.78); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 3px 8px; white-space: nowrap;
+}
+.chip b { font-weight: 600; color: var(--ink); }
+.chip span { color: var(--ink-dim); }
+.chip.mode-ALT_HOLD b { color: var(--ok); }
+.chip.mode-MANUAL b { color: var(--alarm); }
+.chip.mode-STABILIZE b { color: var(--real); }
+.chip.warn { border-color: var(--alarm); }
+.chip.warn b { color: var(--alarm); }
+.legend {
+  position: absolute; right: 12px; bottom: 10px; font-size: 12px; color: var(--ink-dim);
+  display: flex; gap: 12px; background: rgba(6, 18, 24, 0.7); padding: 3px 8px; border-radius: 4px;
+  pointer-events: none;
+}
+.legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 5px; }
+.side { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.panel {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 12px;
+  min-width: 0;
+}
+.label {
+  font-family: var(--display); font-weight: 600; font-size: 12px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--ink-dim); margin: 0 0 6px;
+}
+#gauge { width: 100%; aspect-ratio: 1 / 1; display: block; max-width: 100%; }
+.caption {
+  font-size: 15.5px; min-height: 6.5em; display: grid; gap: 6px; align-content: start;
+}
+.caption .when { font-family: var(--mono); font-size: 12px; color: var(--sim); }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; }
+button {
+  font: 600 13px var(--display); letter-spacing: 0.06em; text-transform: uppercase;
+  background: var(--panel); color: var(--ink); border: 0; padding: 7px 11px; cursor: pointer;
+}
+.seg button + button { border-left: 1px solid var(--rule); }
+button[aria-pressed="true"] { background: var(--sim); color: var(--abyss); }
+button:hover { filter: brightness(1.15); }
+button:focus-visible { outline: 2px solid var(--tether); outline-offset: 2px; }
+#play { min-width: 76px; border: 1px solid var(--rule); border-radius: 5px; }
+.clock { font-family: var(--mono); font-size: 13px; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+.strip { position: relative; }
+#strip { width: 100%; height: 380px; display: block; cursor: ew-resize; touch-action: none; }
+.events { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.events li button {
+  width: 100%; text-align: left; text-transform: none; letter-spacing: 0; font: 400 13.5px var(--body);
+  background: transparent; padding: 5px 6px; border-radius: 4px; display: grid;
+  grid-template-columns: 52px minmax(0, 1fr); gap: 8px; color: var(--ink-dim);
+}
+.events li button .t { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); }
+.events li button.active { background: rgba(255, 138, 61, 0.12); color: var(--ink); }
+.events li button.active .t { color: var(--sim); }
+.note p { margin: 0; font-size: 13.5px; color: var(--ink-dim); }
+.caseblock { display: grid; gap: 8px; }
+.caserow { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.caserow .label { margin: 0; }
+.seg.cases { flex-wrap: wrap; }
+.seg.cases button { text-transform: none; letter-spacing: 0.02em; font-size: 14px; }
+.casedesc { margin: 0; color: var(--ink-dim); font-size: 14px; }
+.tablewrap { overflow-x: auto; }
+.outcomes { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+.outcomes th, .outcomes td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+.outcomes thead th { font: 600 11.5px var(--display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); }
+.outcomes tbody th { font-weight: 600; color: var(--ink-dim); }
+.outcomes td { font-family: var(--mono); font-size: 12.5px; color: var(--ink-dim); }
+.outcomes tbody tr { cursor: pointer; }
+.outcomes tbody tr.on th, .outcomes tbody tr.on td { color: var(--ink); }
+.outcomes tbody tr.on th { box-shadow: inset 3px 0 0 var(--sim); padding-left: 8px; }
+.foot { color: var(--ink-dim); font-size: 13px; max-width: 95ch; }
+.foot code { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+#err { color: var(--alarm); font-family: var(--mono); font-size: 13px; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Towfish hairpin turn</h1>
+    <p class="sub" id="sub">ArduSub 4.7.2 in SITL flying a physics model of the towfish behind the
+      boat's logged track from 4 Nov 2026. Nothing about the turn is scripted.</p>
+  </header>
+
+  <div class="panel caseblock" id="caseBlock">
+    <div class="caserow">
+      <p class="label">Case</p>
+      <div class="seg cases" id="caseSeg" role="group" aria-label="Simulation case"></div>
+    </div>
+    <p class="casedesc" id="caseDesc"></p>
+    <div class="tablewrap">
+      <table class="outcomes">
+        <thead><tr><th>After the turn</th><th>Time inverted</th><th>Upright again after</th><th>Depth at end</th></tr></thead>
+        <tbody id="outcomes"></tbody>
+      </table>
+    </div>
+  </div>
+
+
+  <div class="stage">
+    <div class="view" id="view">
+      <canvas id="scene" aria-label="3D view of the boat, tether and towfish"></canvas>
+      <div class="hud" id="hud" aria-live="off"></div>
+      <div class="legend"><span><i style="background:var(--tether)"></i>tether</span><span><i style="background:var(--wing)"></i>wings</span><span><i style="background:var(--alarm)"></i>wing force</span><span><i style="background:var(--sim)"></i>fish path</span></div>
+    </div>
+    <div class="side">
+      <div class="panel">
+        <p class="label">Looking forward from behind the fish</p>
+        <canvas id="gauge" width="560" height="560" aria-label="Rear view of the fish showing roll and wing force"></canvas>
+      </div>
+      <div class="panel caption" aria-live="polite">
+        <span class="when" id="capWhen"></span>
+        <span id="capText"></span>
+      </div>
+      <div class="panel note">
+        <p class="label">Sim vs the real fish</p>
+        <p id="note"></p>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="play" type="button">Pause</button>
+    <div class="seg" role="group" aria-label="Playback speed">
+      <button type="button" data-speed="0.5">0.5×</button>
+      <button type="button" data-speed="1">1×</button>
+      <button type="button" data-speed="2" aria-pressed="true">2×</button>
+      <button type="button" data-speed="4">4×</button>
+    </div>
+    <div class="seg" role="group" aria-label="Camera">
+      <button type="button" data-cam="chase" aria-pressed="true">Behind</button>
+      <button type="button" data-cam="side">Side</button>
+      <button type="button" data-cam="over">Overview</button>
+    </div>
+    <div class="seg" role="group" aria-label="Fish size">
+      <button type="button" data-scale="1">True size</button>
+      <button type="button" data-scale="3" aria-pressed="true">Fish ×3</button>
+    </div>
+    <span class="clock" id="clock"></span>
+  </div>
+
+  <div class="grid2">
+    <div class="panel strip">
+      <p class="label">Sim vs real fish — drag to scrub</p>
+      <canvas id="strip" aria-label="Roll, depth and wing collective over time, simulated and real"></canvas>
+    </div>
+    <div class="panel">
+      <p class="label">What happens</p>
+      <ol class="events" id="events"></ol>
+    </div>
+  </div>
+
+  <p class="foot" id="foot"></p>
+  <p id="err" hidden></p>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const DATA = /*__DATA__*/null;
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = { sim: css("--sim"), real: css("--real"), wing: css("--wing"), tether: css("--tether"),
+            alarm: css("--alarm"), ink: css("--ink"), dim: css("--ink-dim"), rule: css("--rule"),
+            deep: css("--deep"), abyss: css("--abyss"), ok: css("--ok") };
+const F = Object.fromEntries(DATA.fields.map((f, i) => [f, i]));
+let caseIdx = 0;
+let CASE = DATA.cases[0];
+let frames = CASE.frames;
+let T_END = frames[frames.length - 1][F.t];
+const D2R = Math.PI / 180;
+
+// ---- time helpers --------------------------------------------------------
+function hst(t) {
+  const d = new Date((DATA.t0_utc + t) * 1000 - 10 * 3600 * 1000);
+  return d.toISOString().slice(11, 19);
+}
+function frameAt(t) {
+  let lo = 0, hi = frames.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (frames[m][F.t] <= t) lo = m; else hi = m; }
+  const a = frames[lo], b = frames[hi];
+  const span = b[F.t] - a[F.t];
+  return { a, b, i: lo, u: span > 0 ? Math.min(1, Math.max(0, (t - a[F.t]) / span)) : 0 };
+}
+const lerp = (x, y, u) => x + (y - x) * u;
+
+// ---- frames: NED -> three (x = east, y = up, z = south) --------------------
+const M = new THREE.Matrix4().set(0, 1, 0, 0,  0, 0, -1, 0,  -1, 0, 0, 0,  0, 0, 0, 1);
+const ned = (n, e, d) => new THREE.Vector3(e, -d, -n);
+function bodyToNED(rollDeg, pitchDeg, yawDeg) {
+  const r = rollDeg * D2R, p = pitchDeg * D2R, y = yawDeg * D2R;
+  const cr = Math.cos(r), sr = Math.sin(r), cp = Math.cos(p), sp = Math.sin(p), cy = Math.cos(y), sy = Math.sin(y);
+  return new THREE.Matrix4().set(
+    cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr, 0,
+    sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr, 0,
+    -sp, cp * sr, cp * cr, 0,
+    0, 0, 0, 1);
+}
+const quatCache = new Map();
+function frameQuat(i) {
+  if (!quatCache.has(i)) {
+    const f = frames[i];
+    const m = new THREE.Matrix4().multiplyMatrices(M, bodyToNED(f[F.roll], f[F.pitch], f[F.yaw]));
+    quatCache.set(i, new THREE.Quaternion().setFromRotationMatrix(m));
+  }
+  return quatCache.get(i);
+}
+
+// ---- scene ------------------------------------------------------------------
+const canvas = document.getElementById("scene");
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a2230);
+scene.fog = new THREE.Fog(0x0a2230, 18, 70);
+const camera = new THREE.PerspectiveCamera(45, 16 / 9, 0.05, 400);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+
+scene.add(new THREE.HemisphereLight(0xcfe9ff, 0x0b2a33, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+sun.position.set(20, 40, 10);
+scene.add(sun);
+
+// Water surface seen from below and above, plus a 5 m grid on it for motion cues.
+const water = new THREE.Mesh(
+  new THREE.PlaneGeometry(600, 600),
+  new THREE.MeshBasicMaterial({ color: 0x3fa7c4, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false }));
+water.rotation.x = -Math.PI / 2;
+scene.add(water);
+const grid = new THREE.GridHelper(600, 120, 0x2f6f80, 0x1d4c58);
+grid.material.transparent = true; grid.material.opacity = 0.35;
+scene.add(grid);
+// Depth reference: a faint 5 m grid below, so depth reads at a glance.
+const grid5 = new THREE.GridHelper(600, 120, 0x173946, 0x123039);
+grid5.position.y = -5; grid5.material.transparent = true; grid5.material.opacity = 0.35;
+scene.add(grid5);
+
+// ---- fish model (body FRD metres, origin at the CG) -------------------------
+const G = DATA.geo;
+const fishFRD = new THREE.Group();          // children are built in FRD
+const fishRoot = new THREE.Group();         // carries M*R, translation, scale
+fishRoot.matrixAutoUpdate = false;
+fishRoot.add(fishFRD);
+scene.add(fishRoot);
+const mat = (c, o = {}) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.55, metalness: 0.1, ...o });
+
+const tubeLen = G.tube[0] - G.tube[1];
+const hull = new THREE.Mesh(new THREE.CylinderGeometry(0.056, 0.056, tubeLen, 28), mat(0xe8eef0));
+hull.geometry.rotateZ(-Math.PI / 2);
+hull.position.set((G.tube[0] + G.tube[1]) / 2, 0, G.axis_z);
+fishFRD.add(hull);
+const dome = new THREE.Mesh(new THREE.SphereGeometry(0.054, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2),
+  mat(0x9fd6ff, { transparent: true, opacity: 0.55 }));
+dome.geometry.rotateZ(-Math.PI / 2);
+dome.position.set(G.tube[0], 0, G.axis_z);
+fishFRD.add(dome);
+const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, Math.max(0.01, G.tube[1] - G.cap_back), 28), mat(0x3a4a50));
+cap.geometry.rotateZ(-Math.PI / 2);
+cap.position.set((G.tube[1] + G.cap_back) / 2, 0, G.axis_z);
+fishFRD.add(cap);
+const barLen = G.bar[0] - G.bar[1];
+const bar = new THREE.Mesh(new THREE.BoxGeometry(barLen, Math.abs(G.bar[3] - G.bar[2]), 0.0132), mat(0xb9c2c6, { metalness: 0.6 }));
+bar.geometry.rotateX(Math.PI / 2);
+bar.position.set((G.bar[0] + G.bar[1]) / 2, 0, (G.bar[2] + G.bar[3]) / 2);
+fishFRD.add(bar);
+// Tow rod from the bar up to the tow point.
+const rodLen = Math.abs(G.tow[2] - G.bar[3]);
+const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, rodLen, 10), mat(0xb9c2c6, { metalness: 0.6 }));
+rod.geometry.rotateX(Math.PI / 2);
+rod.position.set(G.tow[0], 0, (G.tow[2] + G.bar[3]) / 2);
+fishFRD.add(rod);
+const towBall = new THREE.Mesh(new THREE.SphereGeometry(0.014, 12, 8), mat(0xf2d14b));
+towBall.position.set(G.tow[0], 0, G.tow[2]);
+fishFRD.add(towBall);
+// Cruciform tail.
+const tailC = G.tail_x[0] - G.tail_x[1];
+const tailX = (G.tail_x[0] + G.tail_x[1]) / 2;
+const tailH = new THREE.Mesh(new THREE.BoxGeometry(tailC, 0.006, 2 * G.tail_h), mat(0x5b6b72));
+tailH.geometry.rotateX(Math.PI / 2);
+tailH.position.set(tailX, 0, G.axis_z);
+fishFRD.add(tailH);
+const tailV = new THREE.Mesh(new THREE.BoxGeometry(tailC, Math.abs(G.tail_v[1] - G.tail_v[0]), 0.006), mat(0x5b6b72));
+tailV.geometry.rotateX(Math.PI / 2);
+tailV.position.set(tailX, 0, (G.tail_v[0] + G.tail_v[1]) / 2);
+fishFRD.add(tailV);
+
+// Wings: planform from the measured stations, pivoting about the quarter chord.
+function wingMesh(side) {
+  const st = G.wing_stations;        // [le_x, y, te_x, y] in FRD, stbd (+y)
+  const shape = new THREE.Shape();
+  shape.moveTo(st[0][0] - G.wing_pivot_x, side * st[0][1]);
+  for (const s of st) shape.lineTo(s[0] - G.wing_pivot_x, side * s[1]);
+  for (const s of [...st].reverse()) shape.lineTo(s[2] - G.wing_pivot_x, side * s[3]);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: 0.034, bevelEnabled: false });
+  geo.translate(0, 0, -0.017);
+  const m = new THREE.Mesh(geo, mat(0xffb347, { side: THREE.DoubleSide }));
+  const pivot = new THREE.Group();
+  pivot.position.set(G.wing_pivot_x, 0, G.axis_z);
+  pivot.add(m);
+  fishFRD.add(pivot);
+  return pivot;
+}
+const wingPort = wingMesh(-1), wingStbd = wingMesh(1);
+
+// Wing force arrow (commanded collective; + = down in the fish's own frame).
+const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0.05, 0, G.axis_z), 0.4,
+  new THREE.Color(C.alarm).getHex(), 0.1, 0.06);
+fishFRD.add(arrow);
+
+// ---- boat --------------------------------------------------------------------
+const boat = new THREE.Group();
+for (const s of [-1, 1]) {
+  const hullB = new THREE.Mesh(new THREE.CapsuleGeometry(0.11, 1.0, 6, 14), mat(0xf4f4f0));
+  hullB.rotation.z = Math.PI / 2;
+  hullB.position.set(0, 0.02, s * 0.3);
+  boat.add(hullB);
+}
+const deck = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.05, 0.7), mat(0x1f2a30));
+deck.position.y = 0.16;
+boat.add(deck);
+scene.add(boat);
+
+// ---- tether + trails -------------------------------------------------------------
+const tetherMat = new THREE.MeshStandardMaterial({ color: C.tether, emissive: C.tether, emissiveIntensity: 0.25 });
+let tether = null;
+function nodesAt(fa, fb, u) {
+  const a = fa[F.nodes], b = fb[F.nodes], pts = [];
+  for (let k = 0; k < a.length; k += 3)
+    pts.push(ned(lerp(a[k], b[k], u), lerp(a[k + 1], b[k + 1], u), lerp(a[k + 2], b[k + 2], u)));
+  return pts;
+}
+const boatTrack = new THREE.Line(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({ color: 0x9fc3cc, transparent: true, opacity: 0.45 }));
+scene.add(boatTrack);
+let fishTrailGeo = new THREE.BufferGeometry();
+const fishTrail = new THREE.Line(fishTrailGeo, new THREE.LineBasicMaterial({ color: C.sim, transparent: true, opacity: 0.8 }));
+scene.add(fishTrail);
+function buildTracks() {
+  boatTrack.geometry.dispose();
+  boatTrack.geometry = new THREE.BufferGeometry().setFromPoints(frames.map((f) => { const n = f[F.nodes]; return ned(n[0], n[1], 0); }));
+  fishTrailGeo.dispose();
+  fishTrailGeo = new THREE.BufferGeometry().setFromPoints(frames.map((f) => ned(f[F.n], f[F.e], f[F.d])));
+  fishTrail.geometry = fishTrailGeo;
+}
+buildTracks();
+
+// ---- camera modes -------------------------------------------------------------
+let camMode = "chase";
+let fishScale = 3;
+const lastTarget = new THREE.Vector3();
+let haveTarget = false;
+function courseDir(i) {
+  // Horizontal direction of travel from the fish track (stable while it tumbles).
+  const j = Math.max(0, i - 10), f0 = frames[j], f1 = frames[Math.min(frames.length - 1, i + 1)];
+  const v = new THREE.Vector3(f1[F.e] - f0[F.e], 0, -(f1[F.n] - f0[F.n]));
+  return v.lengthSq() > 1e-6 ? v.normalize() : new THREE.Vector3(1, 0, 0);
+}
+function placeCamera(mode, target, i) {
+  const fwd = courseDir(i);
+  const up = new THREE.Vector3(0, 1, 0);
+  const side = new THREE.Vector3().crossVectors(fwd, up).normalize();
+  let off;
+  if (mode === "chase") off = fwd.clone().multiplyScalar(-5).add(up.clone().multiplyScalar(1.2)).add(side.clone().multiplyScalar(0.8));
+  else if (mode === "side") off = side.clone().multiplyScalar(-7).add(up.clone().multiplyScalar(0.8));
+  else off = fwd.clone().multiplyScalar(-14).add(up.clone().multiplyScalar(26)).add(side.clone().multiplyScalar(-10));
+  const tgt = mode === "over" ? target.clone().add(fwd.clone().multiplyScalar(9)).setY(-1) : target.clone();
+  controls.target.copy(tgt);
+  camera.position.copy(tgt).add(off);
+  lastTarget.copy(tgt);
+  haveTarget = true;
+}
+
+// ---- rear-view gauge -------------------------------------------------------------
+const gauge = document.getElementById("gauge");
+const gx = gauge.getContext("2d");
+function drawGauge(roll, pitch, coll, depth, deflP, deflS) {
+  const W = gauge.width, H = gauge.height, cx = W / 2, cy = H / 2 + 20;
+  gx.clearRect(0, 0, W, H);
+  // World frame: water surface line when shallow, "up" marker.
+  gx.save();
+  gx.strokeStyle = C.rule; gx.lineWidth = 2;
+  gx.beginPath(); gx.arc(cx, cy, 200, 0, Math.PI * 2); gx.stroke();
+  gx.fillStyle = C.dim; gx.font = "600 22px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  gx.textAlign = "center";
+  gx.fillText("UP", cx, cy - 214);
+  for (const a of [-90, -45, 0, 45, 90, 180]) {
+    const r = (a - 90) * D2R;
+    gx.beginPath();
+    gx.moveTo(cx + Math.cos(r) * 192, cy + Math.sin(r) * 192);
+    gx.lineTo(cx + Math.cos(r) * 208, cy + Math.sin(r) * 208);
+    gx.stroke();
+  }
+  if (depth < 1.2) {
+    const y = cy - 200 + Math.max(0, depth) * 160;
+    gx.strokeStyle = "rgba(95,179,255,0.7)"; gx.setLineDash([10, 8]);
+    gx.beginPath(); gx.moveTo(30, y); gx.lineTo(W - 30, y); gx.stroke(); gx.setLineDash([]);
+    gx.fillStyle = C.real; gx.textAlign = "left"; gx.fillText("surface", 34, y - 8);
+  }
+  gx.restore();
+  // Fish, seen from behind: +roll = right (stbd) side down = clockwise on screen.
+  gx.save();
+  gx.translate(cx, cy);
+  gx.rotate(roll * D2R);
+  const k = 600;                          // px per metre
+  const wingIn = 0.076 * k, wingOut = 0.2515 * k;
+  const drawWing = (s, defl) => {
+    gx.save();
+    gx.strokeStyle = C.wing; gx.lineWidth = 16; gx.lineCap = "round";
+    gx.beginPath(); gx.moveTo(s * wingIn, 0); gx.lineTo(s * wingOut, 0); gx.stroke();
+    gx.restore();
+  };
+  drawWing(-1, deflP); drawWing(1, deflS);
+  gx.fillStyle = "#e8eef0";
+  gx.beginPath(); gx.arc(0, 0, 0.056 * k, 0, Math.PI * 2); gx.fill();
+  gx.fillStyle = "#b9c2c6";
+  gx.fillRect(-4, -0.078 * k, 8, 0.013 * k);
+  gx.fillRect(-2.5, -0.174 * k, 5, 0.1 * k);
+  gx.fillStyle = C.tether;
+  gx.beginPath(); gx.arc(0, -0.174 * k, 7, 0, Math.PI * 2); gx.fill();
+  // Wing force (commanded collective) in the fish's own frame.
+  const len = Math.min(1, Math.abs(coll) / 500) * 130;
+  if (len > 6) {
+    const dir = coll > 0 ? 1 : -1;     // + collective = 'down' in the fish frame
+    gx.strokeStyle = C.alarm; gx.fillStyle = C.alarm; gx.lineWidth = 7;
+    for (const s of [-1, 1]) {
+      const x = s * 0.17 * k;
+      gx.beginPath(); gx.moveTo(x, 0); gx.lineTo(x, dir * len); gx.stroke();
+      gx.beginPath(); gx.moveTo(x, dir * (len + 18)); gx.lineTo(x - 12, dir * len); gx.lineTo(x + 12, dir * len); gx.fill();
+    }
+  }
+  gx.restore();
+  gx.fillStyle = C.ink; gx.textAlign = "center";
+  gx.font = "600 30px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  gx.fillText(`roll ${roll >= 0 ? "+" : ""}${roll.toFixed(0)}°`, cx, H - 50);
+  gx.font = "400 22px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  gx.fillStyle = Math.abs(pitch) > 60 ? C.alarm : C.dim;
+  gx.fillText(`pitch ${pitch >= 0 ? "+" : ""}${pitch.toFixed(0)}°${Math.abs(pitch) > 60 ? " · near vertical" : ""}`,
+              cx, H - 18);
+}
+
+// ---- trace strip -------------------------------------------------------------------
+const strip = document.getElementById("strip");
+const sx = strip.getContext("2d");
+const lanes = [
+  { key: "roll", label: "roll °", lo: -180, hi: 180, ticks: [-90, 0, 90], real: "roll", wrap: true },
+  { key: "pitch", label: "pitch ° (+ nose up)", lo: -90, hi: 90, ticks: [-60, 0, 60], real: "pitch" },
+  { key: "d", label: "depth m", lo: 6, hi: 0, ticks: [1, 3, 5], real: "depth" },
+  { key: "collective", label: "wing collective µs (+ down)", lo: -500, hi: 500, ticks: [-400, 0, 400], real: null },
+  { key: "tension", label: "tether tension N (sim)", lo: 0, hi: 15, ticks: [5, 10], real: null },
+];
+let stripW = 0, stripH = 0, plotL = 64, plotR = 12;
+function sizeStrip() {
+  const r = strip.getBoundingClientRect();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  strip.width = Math.round(r.width * dpr); strip.height = Math.round(r.height * dpr);
+  sx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  stripW = r.width; stripH = r.height;
+}
+const tx = (t) => plotL + (t / T_END) * (stripW - plotL - plotR);
+function drawStrip(tNow) {
+  sx.clearRect(0, 0, stripW, stripH);
+  const laneH = (stripH - 24) / lanes.length;
+  sx.font = "11px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  lanes.forEach((ln, li) => {
+    const top = 6 + li * laneH, h = laneH - 12;
+    const ty = (v) => top + ((v - ln.hi) / (ln.lo - ln.hi)) * h;
+    sx.strokeStyle = C.rule; sx.lineWidth = 1;
+    sx.fillStyle = C.dim; sx.textAlign = "right";
+    for (const v of ln.ticks) {
+      sx.beginPath(); sx.moveTo(plotL, ty(v)); sx.lineTo(stripW - plotR, ty(v)); sx.stroke();
+      sx.fillText(String(v), plotL - 6, ty(v) + 4);
+    }
+    sx.textAlign = "left"; sx.fillStyle = C.dim;
+    sx.fillText(ln.label, plotL + 4, top + 10);
+    const lo = Math.min(ln.lo, ln.hi), hi = Math.max(ln.lo, ln.hi);
+    const clampV = (v) => Math.max(lo, Math.min(hi, v));
+    if (ln.real) {
+      sx.strokeStyle = C.real; sx.globalAlpha = 0.85; sx.lineWidth = 1.5; sx.beginPath();
+      const rv = DATA.real[ln.real];
+      DATA.real.t.forEach((t, i) => {
+        const y = ty(clampV(rv[i]));
+        // Break the trace where roll wraps through +/-180.
+        if (i && !(ln.wrap && Math.abs(rv[i] - rv[i - 1]) > 180)) sx.lineTo(tx(t), y); else sx.moveTo(tx(t), y);
+      });
+      sx.stroke(); sx.globalAlpha = 1;
+    }
+    sx.strokeStyle = C.sim; sx.lineWidth = 2; sx.beginPath();
+    let prev = null;
+    frames.forEach((f, i) => {
+      const v = f[F[ln.key]];
+      const y = ty(clampV(v));
+      if (i && !(ln.wrap && prev !== null && Math.abs(v - prev) > 180)) sx.lineTo(tx(f[F.t]), y);
+      else sx.moveTo(tx(f[F.t]), y);
+      prev = v;
+    });
+    sx.stroke();
+  });
+  for (const ev of CASE.events) {
+    sx.strokeStyle = "rgba(242,209,75,0.35)"; sx.lineWidth = 1;
+    sx.beginPath(); sx.moveTo(tx(ev.t), 4); sx.lineTo(tx(ev.t), stripH - 18); sx.stroke();
+  }
+  sx.strokeStyle = C.ink; sx.lineWidth = 2;
+  sx.beginPath(); sx.moveTo(tx(tNow), 2); sx.lineTo(tx(tNow), stripH - 16); sx.stroke();
+  sx.fillStyle = C.dim; sx.textAlign = "left";
+  sx.fillText("sim", plotL, stripH - 4); sx.fillStyle = C.sim; sx.fillRect(plotL + 30, stripH - 9, 16, 3);
+  sx.fillStyle = C.dim; sx.fillText("real fish (log)", plotL + 60, stripH - 4);
+  sx.fillStyle = C.real; sx.fillRect(plotL + 170, stripH - 9, 16, 3);
+}
+
+// ---- events list --------------------------------------------------------------------
+const evList = document.getElementById("events");
+let evButtons = [];
+function buildEvents() {
+  evList.innerHTML = "";
+  evButtons = CASE.events.map((ev) => {
+    const li = document.createElement("li");
+    const b = document.createElement("button");
+    b.type = "button";
+    b.innerHTML = `<span class="t">+${ev.t.toFixed(0)} s</span><span></span>`;
+    b.lastChild.textContent = ev.text;
+    b.addEventListener("click", () => { tNow = Math.max(0, ev.t - 1.5); });
+    li.append(b); evList.append(li);
+    return b;
+  });
+}
+buildEvents();
+
+// ---- playback ---------------------------------------------------------------------------
+const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+let tNow = 0, speed = 2, playing = !reduce;
+const playBtn = document.getElementById("play");
+const setPlay = (p) => { playing = p; playBtn.textContent = p ? "Pause" : "Play"; };
+setPlay(playing);
+playBtn.addEventListener("click", () => { if (!playing && tNow >= T_END) tNow = 0; setPlay(!playing); });
+const pressed = (group, btn) => group.forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+const speedBtns = [...document.querySelectorAll("[data-speed]")];
+speedBtns.forEach((b) => b.addEventListener("click", () => { speed = +b.dataset.speed; pressed(speedBtns, b); }));
+const camBtns = [...document.querySelectorAll("[data-cam]")];
+camBtns.forEach((b) => b.addEventListener("click", () => { camMode = b.dataset.cam; pressed(camBtns, b); haveTarget = false; }));
+const scaleBtns = [...document.querySelectorAll("[data-scale]")];
+scaleBtns.forEach((b) => b.addEventListener("click", () => { fishScale = +b.dataset.scale; pressed(scaleBtns, b); }));
+let scrubbing = false;
+const scrubTo = (ev) => {
+  const r = strip.getBoundingClientRect();
+  tNow = Math.max(0, Math.min(T_END, ((ev.clientX - r.left - plotL) / (r.width - plotL - plotR)) * T_END));
+};
+strip.addEventListener("pointerdown", (ev) => { scrubbing = true; strip.setPointerCapture(ev.pointerId); scrubTo(ev); });
+strip.addEventListener("pointermove", (ev) => { if (scrubbing) scrubTo(ev); });
+strip.addEventListener("pointerup", () => { scrubbing = false; });
+
+// ---- per-frame update ------------------------------------------------------------------
+const hud = document.getElementById("hud");
+const capWhen = document.getElementById("capWhen"), capText = document.getElementById("capText");
+const clock = document.getElementById("clock");
+let lastEv = -2;
+function update(t) {
+  const { a, b, i, u } = frameAt(t);
+  const pos = ned(lerp(a[F.n], b[F.n], u), lerp(a[F.e], b[F.e], u), lerp(a[F.d], b[F.d], u));
+  const q = frameQuat(i).clone().slerp(frameQuat(Math.min(frames.length - 1, i + 1)), u);
+  const m = new THREE.Matrix4().compose(pos, q, new THREE.Vector3(fishScale, fishScale, fishScale));
+  fishRoot.matrix.copy(m);
+  fishRoot.matrixWorldNeedsUpdate = true;
+  const roll = a[F.roll], depth = lerp(a[F.d], b[F.d], u);
+  const coll = lerp(a[F.collective], b[F.collective], u);
+  wingPort.rotation.y = lerp(a[F.defl_port], b[F.defl_port], u) * D2R;
+  wingStbd.rotation.y = lerp(a[F.defl_stbd], b[F.defl_stbd], u) * D2R;
+  const alen = Math.max(0.02, Math.min(1, Math.abs(coll) / 500) * 0.45);
+  arrow.setDirection(new THREE.Vector3(0, 0, coll >= 0 ? 1 : -1));
+  arrow.setLength(alen, 0.09, 0.06);
+  arrow.visible = Math.abs(coll) > 20;
+
+  const nodes = nodesAt(a, b, u);
+  if (tether) { tether.geometry.dispose(); scene.remove(tether); }
+  const curve = new THREE.CatmullRomCurve3(nodes);
+  tether = new THREE.Mesh(new THREE.TubeGeometry(curve, 60, 0.02, 6, false), tetherMat);
+  scene.add(tether);
+  const n0 = nodes[0];
+  boat.position.set(n0.x, 0, n0.z);
+  const nb = frames[Math.min(frames.length - 1, i + 3)][F.nodes], na = frames[Math.max(0, i - 3)][F.nodes];
+  // Pontoons lie along +x; heading (dN, dE) -> rotation about the up axis.
+  boat.rotation.y = Math.atan2(nb[0] - na[0], nb[1] - na[1]);
+  fishTrailGeo.setDrawRange(0, i + 1);
+
+  // Camera follows the fish, keeping any orbit the viewer has applied.
+  if (!haveTarget) placeCamera(camMode, pos, i);
+  else {
+    const tgt = camMode === "over" ? pos.clone().add(courseDir(i).multiplyScalar(9)).setY(-1) : pos.clone();
+    const delta = tgt.clone().sub(lastTarget);
+    camera.position.add(delta); controls.target.add(delta); lastTarget.copy(tgt);
+  }
+
+  const mode = a[F.mode] || "—";
+  const sat = coll >= 400;
+  hud.innerHTML = "";
+  const chip = (cls, k, v) => { const s = document.createElement("span"); s.className = "chip " + cls; s.innerHTML = `<span>${k}</span> <b></b>`; s.lastChild.textContent = v; hud.append(s); };
+  chip("", "HST", hst(t));
+  chip("mode-" + mode, "mode", mode);
+  chip("", "depth", `${Math.max(0, depth).toFixed(2)} m`);
+  chip(Math.abs(roll) > 90 ? "warn" : "", "roll", `${roll >= 0 ? "+" : ""}${roll.toFixed(0)}°`);
+  chip(sat ? "warn" : "", "wings", `${coll >= 0 ? "+" : ""}${coll.toFixed(0)} µs${sat ? " full down" : ""}`);
+  chip("", "pitch", `${a[F.pitch] >= 0 ? "+" : ""}${a[F.pitch].toFixed(0)}°`);
+  chip("", "speed", `${a[F.speed].toFixed(2)} m/s`);
+  if (a[F.surf]) chip(a[F.surf].startsWith("rescue") ? "warn" : "", "SURF TRACK", a[F.surf].replaceAll("_", " "));
+  chip(a[F.tension] < 1 ? "warn" : "", "tether", `${a[F.tension].toFixed(1)} N${a[F.tension] < 1 ? " slack" : ""}`);
+
+  drawGauge(roll, a[F.pitch], coll, depth, a[F.defl_port], a[F.defl_stbd]);
+  drawStrip(t);
+  let k = -1;
+  CASE.events.forEach((ev, j) => { if (ev.t <= t + 0.05) k = j; });
+  if (k !== lastEv) {
+    lastEv = k;
+    evButtons.forEach((bt, j) => bt.classList.toggle("active", j === k));
+    const ev = CASE.events[Math.max(0, k)];
+    capWhen.textContent = `+${ev.t.toFixed(0)} s · ${hst(ev.t)} HST`;
+    capText.textContent = ev.text;
+  }
+  clock.textContent = `${hst(t)} HST · +${t.toFixed(1)} s of ${T_END.toFixed(0)} s`;
+}
+
+function resize() {
+  const r = view.getBoundingClientRect();
+  renderer.setSize(r.width, r.height, false);
+  camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
+  sizeStrip();
+}
+new ResizeObserver(resize).observe(view);
+window.addEventListener("resize", resize);
+resize();
+
+function caseText() {
+document.getElementById("caseDesc").textContent = CASE.desc;
+document.getElementById("foot").innerHTML =
+  `Run <code></code> · config <code></code> · git <code></code>. The fish is drawn from the STEP geometry (wings, cruciform tail, top bar, tow rod); ` +
+  `the tether is the simulator's lumped-mass cable (${DATA.cable_length} m, the owner's measured length). ` +
+  `Wing force shows the autopilot's commanded collective in the fish's own frame: when the fish is upside down, "down" points up. ` +
+  `The real fish's roll and depth are from its own log for comparison; its position was never measured, so only the simulated fish is drawn in 3D.`;
+document.getElementById("note").textContent = CASE.note || "";
+const codes = document.querySelectorAll("#foot code");
+codes[0].textContent = CASE.run; codes[1].textContent = CASE.config_sha; codes[2].textContent = CASE.git_sha;
+}
+
+caseText();
+
+// ---- case switcher + outcomes -------------------------------------------------
+const caseSeg = document.getElementById("caseSeg");
+const outBody = document.getElementById("outcomes");
+const fmtS = (v) => (v === null || v === undefined ? "never" : `${v} s`);
+function selectCase(i) {
+  caseIdx = i; CASE = DATA.cases[i]; frames = CASE.frames;
+  T_END = frames[frames.length - 1][F.t];
+  tNow = Math.min(tNow, T_END);
+  quatCache.clear();
+  buildTracks(); buildEvents(); caseText();
+  lastEv = -2;
+  [...caseSeg.children].forEach((b, j) => b.setAttribute("aria-pressed", String(j === i)));
+  [...outBody.children].forEach((tr, j) => tr.classList.toggle("on", j === i));
+  try { localStorage.setItem("towfishCase", String(i)); } catch (e) { /* storage blocked */ }
+}
+DATA.cases.forEach((c, i) => {
+  const b = document.createElement("button");
+  b.type = "button"; b.textContent = c.label;
+  b.addEventListener("click", () => selectCase(i));
+  caseSeg.append(b);
+  const tr = document.createElement("tr");
+  const o = c.outcome;
+  tr.innerHTML = "<th></th><td></td><td></td><td></td>";
+  tr.children[0].textContent = c.label;
+  tr.children[1].textContent = `${o.inverted_s} s`;
+  tr.children[2].textContent = o.inverted_s > 0 ? fmtS(o.upright_after_s) : "never inverted";
+  tr.children[3].textContent = `${Math.max(0, o.end_depth).toFixed(1)} m`;
+  tr.addEventListener("click", () => selectCase(i));
+  outBody.append(tr);
+});
+document.getElementById("caseBlock").hidden = DATA.cases.length < 2;
+let saved = 0;
+try { saved = +(localStorage.getItem("towfishCase") || 0); } catch (e) { saved = 0; }
+selectCase(saved >= 0 && saved < DATA.cases.length ? saved : 0);
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (playing && !scrubbing) { tNow += dt * speed; if (tNow >= T_END) { tNow = T_END; setPlay(false); } }
+  update(tNow);
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+update(0);
+requestAnimationFrame(loop);
+</script>

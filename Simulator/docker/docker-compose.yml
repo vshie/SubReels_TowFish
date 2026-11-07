@@ -1,0 +1,24 @@
+# One container: ArduSub SITL (spawned by towsim.run, lockstep over JSON on
+# localhost) + the physics. MAVLink for a GCS is on TCP 5762.
+#
+#   docker compose -f Simulator/docker/docker-compose.yml build
+#   docker compose -f Simulator/docker/docker-compose.yml run --rm --service-ports \
+#       towsim --start 10:28 --end 10:31 --pilot none
+#
+# Runs are written to Simulator/runs/ on the host.
+services:
+  towsim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: subreels-towsim:latest
+    volumes:
+      - ..:/sim
+      - "../../Log review:/logs:ro"
+      # The extension's code, read-only, for --extension runs.
+      - "../../app:/extension:ro"
+    environment:
+      - TOWSIM_APP_DIR=/extension
+    ports:
+      - "5762:5762"
+    # Not related to the BlueOS extension's docker-compose.yml at the repo root.

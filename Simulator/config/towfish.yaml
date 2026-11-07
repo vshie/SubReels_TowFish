@@ -1,0 +1,162 @@
+# Towfish RevC physical model.
+#
+# Every constant carries `status` and `source`. The status vocabulary is:
+#   measured      read from towfishRevC.step (towfish_geometry_report.md)
+#   owner         given by the owner from the physical fish
+#   log-inferred  wiring/sign facts read off the 4 Nov logs (never turn behaviour)
+#   literature    standard hydrodynamics values
+#   estimate      computed from other entries, derivation in `source`
+#   ASSUMED       placeholder until the owner measures it -- see README "Open items"
+#
+# Rule (README "Not cheating"): estimate/ASSUMED values may only be moved within
+# their `bounds`, only by owner measurement or straight-leg plausibility checks,
+# never to make a turn look like the log.
+#
+# Geometry is in the STEP model frame, millimetres:
+#   -Y forward (nose), +Y aft; +X up (unconfirmed); Z spanwise (+Z = starboard,
+#   unconfirmed). towsim/frames.py converts to body FRD about the CG.
+
+water:
+  density:        {value: 1025.0, units: kg/m^3, status: ASSUMED, bounds: [998.0, 1026.0],
+                   source: "Kawaihae site, sea water assumed; owner to confirm (open item 6)"}
+  current_ned:    {value: [0.0, 0.0, 0.0], units: m/s, status: ASSUMED,
+                   source: "no current data; open item 6"}
+
+mass:
+  total:          {value: 3.2205, units: kg, status: owner, source: "geometry report 2.1 (7.1 lb in air)"}
+  # Point masses used for the CG height and inertia estimate. Positions are
+  # component centroids from the geometry report; the remainder is spread over
+  # the pressure housing as a solid cylinder about the tube axis.
+  components:
+    value:
+      - {name: wing_stbd,  mass: 0.15657, pos: [-9.2, 67.2,  165.8], shape: point}
+      - {name: wing_port,  mass: 0.15657, pos: [-9.2, 67.2, -165.8], shape: point}
+      - {name: tail_fin,   mass: 0.0444,  pos: [30.6, 630.2, 0.0],   shape: point}
+      - {name: bar,        mass: 0.1972,  pos: [71.7, 130.0, 0.0],   shape: rod_y, length: 1219.2}
+      - {name: housing,    mass: 2.6658,  pos: [0.0, 105.8, 0.0],    shape: cylinder_y, radius: 56.0, length: 267.3}
+    units: kg, mm
+    status: estimate
+    source: "geometry report 2.1 masses; housing remainder placed on the tube axis at the owner's fore/aft CG"
+
+cg:
+  y_mm:           {value: 105.8, units: mm, status: owner, source: "geometry report 2.4 (balanced in air, 76.2 mm fwd of end cap)"}
+  # Height: owner has not measured it. With the housing contents centred on the
+  # tube axis the components above put the CG ~3.9 mm ABOVE the axis, i.e. above
+  # the CB (2.44 mm): statically roll-unstable without the tow. Kept as computed,
+  # loudly flagged -- the hang/roll test (open item 3) replaces it.
+  x_mm:           {value: null, units: mm, status: estimate, bounds: [-20.0, 10.0],
+                   source: "null = compute from mass.components (contents on the tube axis)"}
+  z_mm:           {value: 0.0, units: mm, status: ASSUMED, bounds: [-3.0, 3.0],
+                   source: "lateral CG not measured; open item 3"}
+
+buoyancy:
+  volume:         {value: 3225.5, units: cm^3, status: estimate, source: "geometry report 2.2 (sealed housing, flooded wings)"}
+  extra_volume:   {value: 0.0, units: cm^3, status: ASSUMED, bounds: [0.0, 120.0],
+                   source: "external connectors/penetrators not in the model (owner: fish slightly positive)"}
+  cb:             {value: [2.44, 94.7, -0.08], units: mm, status: estimate, source: "geometry report 2.2"}
+
+tow_point:
+  # Top of the "top rod" 508 mm forward of the end-cap face. The rod height above
+  # the bar is unknown; 100 mm is a placeholder (open item 2).
+  pos:            {value: [178.1, -326.0, 0.0], units: mm, status: ASSUMED,
+                   bounds_x: [78.1, 300.0],
+                   source: "y owner (geometry report 2.4); x = bar top 78.1 + ASSUMED 100 mm rod"}
+  rod:            {value: rigid, status: ASSUMED, source: "rigid vs pivoting unknown; open item 2"}
+
+wings:
+  # Spanwise stations of ONE wing (mirror at -Z). |z| in mm, LE/TE y in mm.
+  stations:
+    value:
+      - {z: 76.2,  le: -20.6, te: 179.5}
+      - {z: 130.0, le: -20.6, te: 179.5}
+      - {z: 160.0, le: -19.1, te: 178.0}
+      - {z: 190.0, le: -13.7, te: 172.7}
+      - {z: 220.0, le: -8.5,  te: 167.4}
+      - {z: 245.0, le: -4.1,  te: 163.0}
+      - {z: 251.5, le: -2.2,  te: 163.3}
+    units: mm
+    status: measured
+    source: "geometry report 4.1 span stations"
+  chord_line_x:   {value: -3.4, units: mm, status: measured, source: "geometry report 4.1 (x -4.1 LE .. -2.7 TE)"}
+  incidence:      {value: 0.4, units: deg, status: measured, source: "geometry report 4.1"}
+  # Pivot of the servo-driven wing about its span axis (quarter chord assumed).
+  pivot_y:        {value: 29.4, units: mm, status: ASSUMED, source: "root quarter chord; actual servo axis unknown"}
+  strips_per_wing: {value: 6, status: literature, source: "strip theory resolution"}
+  # Wiring, from the 4 Nov log (analysis/servo_map.py):
+  #  - MANUAL full-up throttle drives SERVO5 -> 1000 us and SERVO6 -> 2000 us,
+  #    so "more lift" is SERVO5 PWM down and SERVO6 PWM up;
+  #  - a roll-right rate command lowers BOTH PWMs (corr -0.99), so the wing
+  #    that gains lift on roll-right -- the port wing -- is SERVO5.
+  port_servo:     {value: 5, status: log-inferred, source: "analysis/servo_map.py; owner to confirm (open item 4)"}
+  port_sign:      {value: -1.0, status: log-inferred, source: "SERVO5 PWM down -> port nose-up -> more lift"}
+  stbd_servo:     {value: 6, status: log-inferred, source: "analysis/servo_map.py; owner to confirm (open item 4)"}
+  stbd_sign:      {value: 1.0, status: log-inferred, source: "SERVO6 PWM up -> stbd nose-up -> more lift"}
+  deflection_per_us: {value: 0.09, units: deg/us, status: ASSUMED, bounds: [0.04, 0.15],
+                   source: "servo deflection range unknown (open item 4); 0.09 deg/us = +/-45 deg at +/-500 us"}
+  deflection_limit: {value: 45.0, units: deg, status: ASSUMED, bounds: [20.0, 60.0], source: "open item 4"}
+  servo_rate:     {value: 300.0, units: deg/s, status: ASSUMED, bounds: [150.0, 600.0],
+                   source: "typical submersible servo, ~0.2 s/60 deg"}
+
+tail:
+  # Cruciform fin: y 584.8..674.8 (90 mm chord); horizontal |z| <= 107.3,
+  # vertical x -45.0..+78.2. Fixed surfaces.
+  chord:          {value: 90.0, units: mm, status: measured, source: "geometry report 3 (bar and tail)"}
+  y_le:           {value: 584.8, units: mm, status: measured, source: "geometry report 3"}
+  half_span_h:    {value: 107.3, units: mm, status: measured, source: "geometry report 3"}
+  v_top:          {value: 78.2, units: mm, status: measured, source: "geometry report 3"}
+  v_bottom:       {value: -45.0, units: mm, status: measured, source: "geometry report 3"}
+  strips:         {value: 3, status: literature, source: "strips per tail surface half"}
+
+foil:
+  stall_alpha:    {value: 12.0, units: deg, status: literature, bounds: [9.0, 16.0],
+                   source: "18.5 % thick section at Re ~2e5"}
+  cd0:            {value: 0.02, status: literature, bounds: [0.012, 0.04], source: "thick section, low Re"}
+  oswald:         {value: 0.8, status: literature, source: "planar wing"}
+  flat_plate_cd90: {value: 1.98, status: literature, source: "flat plate normal to flow"}
+  stall_blend:    {value: 0.035, units: rad, status: literature, source: "width of attached->separated blend"}
+  # Effective aspect ratios for the finite-span lift slope a = 2*pi*AR/(AR+2).
+  ar_wing:        {value: 3.8, status: estimate, source: "503 mm tip-to-tip span^2 / 666 cm^2 area"}
+  ar_tail_h:      {value: 2.4, status: estimate, source: "214.6 mm span / 90 mm chord"}
+  ar_tail_v:      {value: 1.4, status: estimate, source: "123 mm height / 90 mm chord, hull-blocked"}
+
+body:
+  # Slender elements for cross-flow drag (and axial drag split evenly). Each is a
+  # segment along the tow axis, subdivided so rotation produces damping.
+  elements:
+    value:
+      - {name: housing, x: 0.0,  z: 0.0, y0: -85.3, y1: 182.0,  width_h: 112.0, width_v: 112.0, cd_cross: 1.0, segments: 4}
+      - {name: bar,     x: 71.7, z: 0.0, y0: -479.6, y1: 739.6, width_h: 13.2,  width_v: 12.8,  cd_cross: 1.2, segments: 8}
+      - {name: clamp,   x: -2.4, z: 0.0, y0: 9.0,   y1: 51.0,   width_h: 150.0, width_v: 158.3, cd_cross: 1.2, segments: 1}
+    units: mm
+    status: measured
+    source: "geometry report 3 extents; cd_cross literature (cylinder ~1.0, sharp-edged ~1.2)"
+  # Axial drag not carried by the foils: the report's 5.9 N at 1 m/s total minus
+  # the foils' profile drag at zero lift (~0.6 N).
+  axial_cda:      {value: 0.0103, units: m^2, status: estimate, bounds: [0.007, 0.014],
+                   source: "geometry report 2.5: 5.9 N @1 m/s -> CdA 0.0115, less foil cd0*S"}
+  axial_center_y: {value: 30.0, units: mm, status: estimate, source: "clamp/dome dominated (report 2.5)"}
+
+added_mass:
+  # Slender-body / strip estimates; computed in towsim/fish.py from the geometry
+  # above. Scale factor kept for the bounded straight-leg check.
+  scale:          {value: 1.0, status: estimate, bounds: [0.6, 1.4], source: "strip theory (pi/4 rho c^2 per span)"}
+
+cable:
+  length:         {value: 8.0, units: m, status: owner, bounds: [6.0, 40.0],
+                   source: "owner, 5 Nov 2026: 8 m boat-to-towfish (was 20 m ASSUMED from the ~18 s turn lag)"}
+  diameter:       {value: 7.5, units: mm, status: owner, source: "owner, 5 Nov 2026: Blue Robotics Fathom tether, rough polyurethane jacket"}
+  linear_mass:    {value: 0.044, units: kg/m, status: derived, source: "neutral 7.5 mm cable: rho*pi*d^2/4"}
+  wet_weight:     {value: 0.0, units: N/m, status: literature, bounds: [-0.015, 0.05],
+                   source: "Blue Robotics: Fathom is neutral in fresh water (foam jacket); ~-0.011 N/m in salt"}
+  segments:       {value: 8, status: literature, source: "lumped-mass resolution; 1 m segments keep the 1 ms step stable"}
+  # Numerical axial stiffness: high enough that stretch stays < 0.5 % at survey
+  # tension, low enough for a 1 ms explicit step. Not a physical property claim.
+  ea:             {value: 5000.0, units: N, status: estimate, source: "numerical; stretch < 0.5 % at 20 N"}
+  damping_ratio:  {value: 0.5, status: estimate, source: "numerical axial damping"}
+  cd_normal:      {value: 1.2, status: literature, bounds: [1.2, 1.8],
+                   source: "cylinder cross-flow, Re ~7500 at 1 m/s (subcritical, roughness minor); strumming raises toward 1.5-2 (Blevins)"}
+  cd_tangent:     {value: 0.02, status: literature, source: "skin friction on pi*d, rough jacket"}
+  boat_attach_height: {value: 0.1, units: m, status: ASSUMED, source: "tow point on the BlueBoat above the waterline"}
+
+sim:
+  physics_dt:     {value: 0.001, units: s, status: literature, source: "explicit cable step stability"}

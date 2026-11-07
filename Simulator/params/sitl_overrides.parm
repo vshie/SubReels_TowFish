@@ -1,0 +1,28 @@
+# SITL-only settings layered over towfish_as_flown.parm.
+# Nothing here changes control behaviour; it only replaces hardware the
+# simulator does not have.
+
+# The fish has no GPS; this matches what EKF3 sees on the water.
+GPS1_TYPE,0
+SIM_GPS_DISABLE,1
+SIM_GPS1_ENABLE,0
+
+# Simulated sensors are already in the body frame.
+AHRS_ORIENTATION,0
+
+# Pre-arm checks would fail on uncalibrated simulated sensors.
+ARMING_CHECK,0
+
+# No leak / temperature hardware in the sim.
+FS_LEAK_ENABLE,0
+FS_TEMP_ENABLE,0
+FS_PILOT_INPUT,0
+FS_GCS_ENABLE,0
+
+# Lua scripting is off in SITL unless a scenario enables it.
+SCR_ENABLE,0
+
+# Log everything while armed into the run directory.
+LOG_BACKEND_TYPE,1
+LOG_DISARMED,0
+LOG_FILE_DSRMROT,1
