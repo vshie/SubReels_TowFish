@@ -98,6 +98,14 @@ length) at 5 Hz. Options add drifting boat-GPS error, compass noise and bias. Ru
 `--extension` also log the extension's live estimate as `est_n`, `est_e`, `est_unc` in
 `truth.csv`.
 
+The tether (`towsim/cable.py`) has a Kevlar strength member, so it is modelled as fixed-length
+links that carry tension only: drag and wet weight move the nodes, then one exact
+tridiagonal solve per physics step finds the link tensions that stop any taut link lengthening,
+with an active-set pass for slack links. The fish end uses the fish's effective mass at its tow
+point (rigid body plus added mass), so a slack-to-taut snap hits the fish at full strength.
+`--set cable.model=spring` restores the original numerical spring (EA 5000 N) for comparison.
+SITL's physics frames are shorter than `sim.physics_dt`, so they set the step.
+
 `analysis/tether_statics.py` is a steady towed-cable solver. It takes the fish-end force
 from the max-depth runs and gives depth for any tether length, with C_n, salt-water and
 speed bands. `tests/test_physics.py` checks it against the lumped cable.
@@ -110,7 +118,8 @@ towsim.run ── spawns ──> ardusub (SITL, JSON model, lockstep)
    │  ── IMU/pose/velocity ──>   │     one clock: the physics drives SITL time
    │  ── MAVLink tcp:5760 ──>    │     arm, DO_SET_MODE, RC3 override (as GCS 255/240)
    ├─ boat_track:   boat GPS from towboat_00000110.BIN -> tow point (NED)
-   ├─ cable:        lumped-mass tether, drag, wet weight
+   ├─ cable:        inextensible lumped-mass tether (Kevlar: fixed-length links,
+   │                tension only), normal + tangential drag, wet weight
    ├─ fish:         6-DOF rigid body + added mass, buoyancy at CB, gravity at CG
    ├─ hydro:        strip-theory wings/tail (servo PWM -> deflection), body drag
    └─ pilot_replay: operator's mode commands + RC3 from towfish_00000103.BIN

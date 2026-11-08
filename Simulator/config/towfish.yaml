@@ -149,10 +149,12 @@ cable:
   wet_weight:     {value: 0.0, units: N/m, status: literature, bounds: [-0.015, 0.05],
                    source: "Blue Robotics: Fathom is neutral in fresh water (foam jacket); ~-0.011 N/m in salt"}
   segments:       {value: 8, status: literature, source: "lumped-mass resolution; 1 m segments keep the 1 ms step stable"}
-  # Numerical axial stiffness: high enough that stretch stays < 0.5 % at survey
-  # tension, low enough for a 1 ms explicit step. Not a physical property claim.
-  ea:             {value: 5000.0, units: N, status: estimate, source: "numerical; stretch < 0.5 % at 20 N"}
-  damping_ratio:  {value: 0.5, status: estimate, source: "numerical axial damping"}
+  # Kevlar strength member: the tether does not stretch. Fixed-length links
+  # carrying tension only, solved exactly each step (towsim/cable.py).
+  model:          {value: inextensible, status: owner, source: "owner, 7 Nov 2026: Kevlar, no stretch; reacts to tension and drag only, neutrally buoyant"}
+  # Only for model: spring (the original numerical model, kept for A/B runs).
+  ea:             {value: 5000.0, units: N, status: estimate, source: "numerical; spring model only"}
+  damping_ratio:  {value: 0.5, status: estimate, source: "numerical axial damping; spring model only"}
   cd_normal:      {value: 1.2, status: literature, bounds: [1.2, 1.8],
                    source: "cylinder cross-flow, Re ~7500 at 1 m/s (subcritical, roughness minor); strumming raises toward 1.5-2 (Blevins)"}
   cd_tangent:     {value: 0.02, status: literature, source: "skin friction on pi*d, rough jacket"}

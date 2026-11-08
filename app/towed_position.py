@@ -32,7 +32,16 @@ import math
 SAG = 0.985
 TOW_POINT_TO_BODY_M = 0.43
 EARTH_R = 6371000.0
-METHODS = ("fixed", "geometric", "path", "pursuit", "chain")
+METHODS = ("fixed", "geometric", "path", "pursuit", "chain", "drag")
+
+# Drag model constants (Blue Robotics Fathom tether, towfish geometry report).
+RHO_WATER = 1025.0
+TETHER_D_M = 0.0075
+TETHER_CN = 1.2
+TETHER_CT = 0.02
+TETHER_NODE_KG_PER_M = 0.044 + RHO_WATER * math.pi * TETHER_D_M ** 2 / 4.0   # + added mass
+FISH_CDA_M2 = 0.0115          # ~5.9 N at 1 m/s (geometry report 2.5)
+FISH_MASS_KG = 3.6            # fish + surge added mass
 
 
 def layback_m(tether_length_m, depth_m):
@@ -45,8 +54,14 @@ def layback_m(tether_length_m, depth_m):
 # 1-sigma horizontal error, from Simulator/analysis/position_eval.py with
 # 1 m drifting boat GPS and a 5 deg noisy, 3 deg biased fish compass:
 # straight legs ~1.5-2 m on any tether; turns (and slack) grow with tether.
-def uncertainty_m(tether_length_m, turning):
+#
+# The drag model was scored on the inextensible-tether runs (8 and 25 m,
+# 4 m and max depth, 8 m and wide lines): its turn error barely grows with
+# tether length (p95 ~2.7-2.8 m on both), so its band is nearly flat.
+def uncertainty_m(tether_length_m, turning, method="drag"):
     L = float(tether_length_m or 0.0)
+    if method == "drag":
+        return round((1.8 + 0.02 * L) if turning else (1.5 + 0.01 * L), 2)
     return round((1.8 + 0.08 * L) if turning else (1.5 + 0.02 * L), 2)
 
 
@@ -206,6 +221,8 @@ class TowedPositionEstimator:
             self.fish = (boat_n - h * hn, boat_e - h * he)
         elif self.method == "path":
             self.fish = self._along_trail(h, boat_n, boat_e, hn, he)
+        elif self.method == "drag":
+            self._drag_model(dt, boat_n, boat_e, boat_course, boat_speed, fish_depth, hn, he)
         else:
             self._chain(dt, boat_n, boat_e, boat_speed, h, hn, he)
         return self._result(t, boat_course, h)
@@ -231,7 +248,7 @@ class TowedPositionEstimator:
         return {"north": self.fish[0], "east": self.fish[1], "layback_m": h,
                 "along_path_m": self._path_length_to_fish(),
                 "slack": self.slack, "turning": turning,
-                "uncertainty_m": uncertainty_m(self.L or self.fixed_offset_m, turning)}
+                "uncertainty_m": uncertainty_m(self.L or self.fixed_offset_m, turning, self.method)}
 
     # Same turn definition as the evaluation: the boat's course changed by
     # more than TURN_DEG within the last TURN_WINDOW_S (turn + aftermath).
@@ -302,6 +319,163 @@ class TowedPositionEstimator:
         tn, te = self.towpt
         self.fish = (tn - TOW_POINT_TO_BODY_M * hn, te - TOW_POINT_TO_BODY_M * he)
 
+    # -- drag model ---------------------------------------------------------
+    DRAG_STEP_S = 0.1
+    BOAT_ATTACH_M = 0.1          # tow point height above the water
+
+    def _drag_model(self, dt, bn, be, course, speed, depth, hn, he):
+        """The tether as 1 m inextensible links with water drag, in still water.
+
+        Node 0 follows the boat; the last node is the fish's tow point, held
+        at the measured depth (so wing lift never needs modelling) and pulled
+        back by the fish's drag. Between updates the tether is stepped at
+        DRAG_STEP_S: drag on every node (implicit, so it is stable at this
+        step), then the links are projected back to their length -- tension
+        only, so a link shorter than its length is simply slack.
+        """
+        L = self.L if self.L > 0 else self.fixed_offset_m
+        N = max(1, int(round(L)))
+        seg = L / N
+        z_fish = max(0.0, float(depth or 0.0))
+        if self.nodes is None or len(self.nodes) != N + 1:
+            reach = math.sqrt(max(0.0, L * L - (z_fish + self.BOAT_ATTACH_M) ** 2))
+            v0 = float(speed or 0.0)
+            vn0, ve0 = (v0 * math.cos(math.radians(course)), v0 * math.sin(math.radians(course))) \
+                if course is not None else (v0 * hn, v0 * he)
+            self.nodes = []
+            self.node_v = []
+            for k in range(N + 1):
+                f = k / N
+                self.nodes.append([bn - reach * f * hn, be - reach * f * he,
+                                   -self.BOAT_ATTACH_M + (z_fish + self.BOAT_ATTACH_M) * f])
+                self.node_v.append([vn0, ve0, 0.0])
+            self._drag_boat = (bn, be)
+        x, v = self.nodes, self.node_v
+        if dt <= 0:
+            self._drag_finish(seg, hn, he)
+            return
+        steps = max(1, int(math.ceil(dt / self.DRAG_STEP_S)))
+        h = dt / steps
+        b0n, b0e = self._drag_boat
+        m_node = TETHER_NODE_KG_PER_M * seg
+        kn = 0.5 * RHO_WATER * TETHER_D_M * TETHER_CN * seg / m_node
+        kt = 0.5 * RHO_WATER * math.pi * TETHER_D_M * TETHER_CT * seg / m_node
+        kf = 0.5 * RHO_WATER * FISH_CDA_M2 / FISH_MASS_KG
+        w_node, w_fish = 1.0 / m_node, 1.0 / FISH_MASS_KG
+        z_prev_fish = x[N][2]
+        bvn, bve = (bn - b0n) / dt, (be - b0e) / dt
+        for s_ in range(1, steps + 1):
+            f0, f = (s_ - 1) / steps, s_ / steps
+            # Boat node at the start of the step, moving with the boat; it is
+            # advanced to the end of the step after the solve.
+            x[0] = [b0n + (bn - b0n) * f0, b0e + (be - b0e) * f0, -self.BOAT_ATTACH_M]
+            v[0] = [bvn, bve, 0.0]
+            # Drag, implicit per node (still water: drag opposes node velocity).
+            for k in range(1, N + 1):
+                vx, vy, vz = v[k]
+                if k < N:
+                    tx = x[k - 1][0] - x[k + 1][0]
+                    ty = x[k - 1][1] - x[k + 1][1]
+                    tz = x[k - 1][2] - x[k + 1][2]
+                    tl = math.sqrt(tx * tx + ty * ty + tz * tz) or 1.0
+                    tx, ty, tz = tx / tl, ty / tl, tz / tl
+                    vt = vx * tx + vy * ty + vz * tz
+                    nx, ny, nz = vx - vt * tx, vy - vt * ty, vz - vt * tz
+                    vnm = math.sqrt(nx * nx + ny * ny + nz * nz)
+                    nfac = 1.0 / (1.0 + h * kn * vnm)
+                    tfac = 1.0 / (1.0 + h * kt * abs(vt))
+                    v[k] = [nx * nfac + vt * tfac * tx, ny * nfac + vt * tfac * ty,
+                            nz * nfac + vt * tfac * tz]
+                else:
+                    sp = math.hypot(vx, vy)
+                    fac = 1.0 / (1.0 + h * kf * sp)
+                    v[k] = [vx * fac, vy * fac, 0.0]
+            # Link tensions: one exact tridiagonal solve per step (as in the
+            # simulator), tension only -- links that would push are slack.
+            self._drag_tension(x, v, seg, h, w_node, w_fish)
+            for k in range(1, N + 1):
+                x[k][0] += v[k][0] * h
+                x[k][1] += v[k][1] * h
+                x[k][2] += v[k][2] * h
+            x[N][2] = z_prev_fish + (z_fish - z_prev_fish) * f     # measured depth
+            v[N][2] = 0.0
+            x[0] = [b0n + (bn - b0n) * f, b0e + (be - b0e) * f, -self.BOAT_ATTACH_M]
+        self._drag_boat = (bn, be)
+        self._drag_finish(seg, hn, he)
+
+    def _drag_tension(self, x, v, seg, h, w_node, w_fish):
+        N = len(x) - 1
+        u, vs, vt = [], [], []
+        for k in range(N):
+            a, b = x[k], x[k + 1]
+            d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+            ln = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) or 1e-9
+            uk = [d[0] / ln, d[1] / ln, d[2] / ln]
+            u.append(uk)
+            vs.append(sum((v[k + 1][i] - v[k][i]) * uk[i] for i in range(3)))
+            C = ln - seg
+            vt.append(-0.2 * C / h if C > 0 else -C / h)
+        # Inverse masses along each link. The fish only moves level (its
+        # depth is measured), so it answers only the level part of a pull.
+        uz = u[-1][2]
+        wf = w_fish * (1.0 - uz * uz)
+        winv = [0.0] + [w_node] * (N - 1) + [wf]
+        cosn = [sum(u[k][i] * u[k + 1][i] for i in range(3)) for k in range(N - 1)]
+        # Full coefficients: how each link's separation answers its own and
+        # its neighbours' tensions (used to re-check links left inactive).
+        Af = [0.0] + [winv[k] * cosn[k - 1] for k in range(1, N)]
+        Bf = [-(winv[k] + winv[k + 1]) for k in range(N)]
+        Cf = [winv[k + 1] * cosn[k] for k in range(N - 1)] + [0.0]
+        active = [vs[k] > vt[k] for k in range(N)]
+        lam = [0.0] * N
+        for _ in range(12):
+            A = [0.0] * N; B = [0.0] * N; Cc = [0.0] * N; R = [0.0] * N
+            for k in range(N):
+                if not active[k]:
+                    B[k] = 1.0
+                    continue
+                B[k] = -(winv[k] + winv[k + 1])
+                if k > 0 and active[k - 1]:
+                    A[k] = winv[k] * cosn[k - 1]
+                if k < N - 1 and active[k + 1]:
+                    Cc[k] = winv[k + 1] * cosn[k]
+                R[k] = vt[k] - vs[k]
+            lam = _thomas(A, B, Cc, R)
+            neg = [active[k] and lam[k] < 0.0 for k in range(N)]
+            if any(neg):
+                active = [active[k] and not neg[k] for k in range(N)]
+                continue
+            newly = []
+            for k in range(N):
+                if active[k]:
+                    continue
+                dvs = (Af[k] * lam[k - 1] if k > 0 else 0.0) + (Cf[k] * lam[k + 1] if k < N - 1 else 0.0)
+                if vs[k] + dvs > vt[k] + 1e-9:
+                    newly.append(k)
+            if not newly:
+                break
+            for k in newly:
+                active[k] = True
+        for k in range(N):
+            if not active[k] or lam[k] <= 0.0:
+                continue
+            ix, iy, iz = lam[k] * u[k][0], lam[k] * u[k][1], lam[k] * u[k][2]
+            if k > 0:
+                v[k][0] += ix * w_node; v[k][1] += iy * w_node; v[k][2] += iz * w_node
+            if k + 1 == N:
+                v[N][0] -= ix * w_fish; v[N][1] -= iy * w_fish
+            else:
+                v[k + 1][0] -= ix * w_node; v[k + 1][1] -= iy * w_node; v[k + 1][2] -= iz * w_node
+
+    def _drag_finish(self, seg, hn, he):
+        x = self.nodes
+        N = len(x) - 1
+        self.slack = any(
+            math.dist(x[k], x[k + 1]) < 0.98 * seg for k in range(N))
+        tn, te = x[N][0], x[N][1]
+        self.towpt = (tn, te)
+        self.fish = (tn - TOW_POINT_TO_BODY_M * hn, te - TOW_POINT_TO_BODY_M * he)
+
     # -- boat trail (path method, along-path distance) ---------------------
     def _remember(self, t, n, e):
         if self.trail:
@@ -344,6 +518,22 @@ class TowedPositionEstimator:
             if best is None or d < best:
                 best, best_s = d, s
         return self.trail[-1][3] - best_s
+
+
+def _thomas(a, b, c, r):
+    """Tridiagonal solve (a: sub, b: main, c: super diagonals); plain lists."""
+    n = len(b)
+    cp = [0.0] * n; rp = [0.0] * n
+    cp[0] = c[0] / b[0]; rp[0] = r[0] / b[0]
+    for i in range(1, n):
+        m = b[i] - a[i] * cp[i - 1]
+        cp[i] = c[i] / m if i < n - 1 else 0.0
+        rp[i] = (r[i] - a[i] * rp[i - 1]) / m
+    out = [0.0] * n
+    out[-1] = rp[-1]
+    for i in range(n - 2, -1, -1):
+        out[i] = rp[i] - cp[i] * out[i + 1]
+    return out
 
 
 class TowedPositionTracker:

@@ -68,6 +68,12 @@ class TowfishPhysics:
         M[3:, 3:] = self.J
         self.M = M + A
         self.Minv = np.linalg.inv(self.M)
+        # Effective inverse mass at the tow point (body frame): how the tow
+        # point's velocity answers an impulse there, rotation included.
+        r = self.r_tow
+        skew = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]])
+        Jt = np.hstack([np.eye(3), -skew])
+        self.K_tow_body = Jt @ self.Minv @ Jt.T
 
         self.k_defl = math.radians(float(cfg["wings.deflection_per_us"]))
         self.defl_lim = math.radians(float(cfg["wings.deflection_limit"]))
@@ -142,6 +148,8 @@ class TowfishPhysics:
         return F, Mo
 
     def step(self, dt: float, top_pos: np.ndarray, top_vel: np.ndarray):
+        if self.cable.model != "spring":
+            return self._step_inextensible(dt, top_pos, top_vel)
         R = quat_to_dcm(self.q)
         tow_pos = self.pos + R @ self.r_tow
         tow_vel = R @ (self.v + np.cross(self.w, self.r_tow))
@@ -168,6 +176,46 @@ class TowfishPhysics:
         # Specific force at the CG for the IMU: inertial accel minus gravity.
         inertial = vdot + np.cross(self.w, self.v)
         self.accel_body = inertial - R.T @ np.array([0.0, 0.0, G])
+
+    def _step_inextensible(self, dt, top_pos, top_vel):
+        """Predict the fish without the tether, solve the tether's link
+        tensions against the fish's effective mass, apply the impulse."""
+        R = quat_to_dcm(self.q)
+        tow_pos = self.pos + R @ self.r_tow
+        tow_vel = R @ (self.v + np.cross(self.w, self.r_tow))
+        drag_end = self.cable.predict(dt, top_pos, top_vel, tow_pos, tow_vel, self.current)
+
+        dmax = self.servo_rate * dt
+        self.defl += np.clip(self.defl_cmd - self.defl, -dmax, dmax)
+
+        if self.jig:
+            imp = self.cable.solve(dt, tow_vel, None)
+            self.cable.advance(dt, tow_pos, tow_vel)
+            self.last_tow_force = imp / dt + drag_end
+            return
+        F, Mo = self.forces(R, drag_end)
+        rhs = np.concatenate([F - self.mass * np.cross(self.w, self.v),
+                              Mo - np.cross(self.w, self.J @ self.w)])
+        acc = self.Minv @ rhs
+        v_pred = self.v + acc[:3] * dt
+        w_pred = self.w + acc[3:] * dt
+        tow_vel_pred = R @ (v_pred + np.cross(w_pred, self.r_tow))
+        K_ned = R @ self.K_tow_body @ R.T
+        imp = self.cable.solve(dt, tow_vel_pred, K_ned)       # NED impulse on the fish
+        ib = R.T @ imp
+        dgen = self.Minv @ np.concatenate([ib, np.cross(self.r_tow, ib)])
+        v_new = v_pred + dgen[:3]
+        w_new = w_pred + dgen[3:]
+        vdot = (v_new - self.v) / dt
+        self.v, self.w = v_new, w_new
+        self.q = quat_integrate(self.q, self.w, dt)
+        R = quat_to_dcm(self.q)
+        self.pos = self.pos + R @ self.v * dt
+        inertial = vdot + np.cross(self.w, self.v)
+        self.accel_body = inertial - R.T @ np.array([0.0, 0.0, G])
+        self.last_tow_force = imp / dt + drag_end
+        self.cable.advance(dt, self.pos + R @ self.r_tow,
+                           R @ (self.v + np.cross(self.w, self.r_tow)))
 
     # -- jig (initial settle) ------------------------------------------
     def place(self, pos, q, vel_ned):

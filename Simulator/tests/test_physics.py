@@ -130,6 +130,66 @@ check("lumped cable tension within one segment of the statics curve (up)",
       _within(-pull[2], F_[0, 1], F_[k1, 1]),
       f"{-pull[2]:.2f} vs {F_[0, 1]:.2f}..{F_[k1, 1]:.2f}")
 
+seg_len = np.linalg.norm(np.diff(c.x, axis=0), axis=1)
+check("inextensible: no link stretches more than 0.05 % under tow load",
+      float(np.max(np.abs(seg_len - c.l0)) / c.l0) < 5e-4,
+      f"max {float(np.max(np.abs(seg_len - c.l0)) / c.l0) * 100:.3f} %")
+
+print("\ninextensible tether")
+c = Cable(Config(overrides={"cable.wet_weight": 0.0, "cable.segments": 10,
+                            "cable.length": 10.0}), 1025.0)
+c.lay_straight(np.zeros(3), np.array([3.0, 0.0, 0.0]), np.zeros(3))
+for _ in range(200):
+    c.step(0.001, np.zeros(3), np.zeros(3), np.array([3.0, 0.0, 0.0]), np.zeros(3), np.zeros(3))
+check("slack links (ends 3 m apart on 10 m of tether) carry exactly zero",
+      np.all(c.tension == 0.0), f"max {c.tension.max():.3g}")
+
+
+def _snap_peak(model):
+    sc = Config(overrides={"cable.length": 5.0, "cable.segments": 5, "cable.model": model})
+    f = TowfishPhysics(sc)
+    f.place([-4.0, 0.0, 2.0], quat_from_euler(0, 0, 0), np.array([-1.0, 0.0, 0.0]))
+    f.cable.lay_straight(np.array([0.0, 0.0, -0.1]), f.tow_point_ned(), np.zeros(3))
+    f.set_servos([0, 0, 0, 0, 1500, 1500])
+    peak, stretch = 0.0, 0.0
+    for _ in range(4000):
+        f.step(0.001, np.array([0.0, 0.0, -0.1]), np.zeros(3))
+        peak = max(peak, f.cable.fish_end_tension)
+        sl = np.linalg.norm(np.diff(f.cable.x, axis=0), axis=1)
+        stretch = max(stretch, float(np.max(sl - f.cable.l0)) / f.cable.l0)
+    return peak, stretch
+
+
+pk_i, st_i = _snap_peak("inextensible")
+pk_s, st_s = _snap_peak("spring")
+check("slack-to-taut snap: a sharper tension spike than the old spring",
+      pk_i > 1.5 * pk_s, f"inextensible {pk_i:.0f} N vs spring {pk_s:.0f} N")
+check("the snap does not stretch the tether (< 0.5 %)", st_i < 5e-3, f"{st_i * 100:.2f} %")
+
+
+def _straight_tow(segments, dt, seconds=40.0):
+    sc = Config(overrides={"cable.length": 8.0, "cable.segments": segments})
+    f = TowfishPhysics(sc)
+    top = np.array([0.0, 0.0, -0.1])
+    f.place([-7.0, 0.0, 3.5], quat_from_euler(0, 0, 0), np.array([1.0, 0.0, 0.0]))
+    f.cable.lay_straight(top, f.tow_point_ned(), np.array([1.0, 0.0, 0.0]))
+    f.set_servos([0, 0, 0, 0, 1650, 1350])          # wings part-way down
+    for _ in range(int(seconds / dt)):
+        top = top + np.array([1.0, 0.0, 0.0]) * dt
+        f.step(dt, top, np.array([1.0, 0.0, 0.0]))
+    lay = float(np.hypot(*(top[:2] - f.pos[:2])))
+    return lay, float(f.pos[2]), bool(np.all(np.isfinite(f.pos)))
+
+
+lay1, z1, ok1 = _straight_tow(8, 0.001)
+lay2, z2, ok2 = _straight_tow(16, 0.001)
+check("straight tow stays bounded", ok1 and ok2 and 1.0 < z1 < 7.9, f"depth {z1:.2f}")
+check("1 m and 0.5 m links give the same layback (within 0.1 m)", abs(lay1 - lay2) < 0.1,
+      f"{lay1:.2f} vs {lay2:.2f}")
+lay3, z3, ok3 = _straight_tow(8, 0.0025)
+check("2.5 ms physics step matches 1 ms (layback within 0.1 m)", ok3 and abs(lay3 - lay1) < 0.1,
+      f"{lay3:.2f} vs {lay1:.2f}")
+
 print("\nrigid body")
 check("total mass matches owner weighing", math.isclose(phys.mass, 3.2205))
 check("CG height computed (contents on axis) ~3.9 mm", abs(phys.cg_mm[0] - 3.92) < 0.1)

@@ -2472,18 +2472,23 @@ def get_blueboat_fix():
 
 
 # ── Towfish position tracker ─────────────────────────────────────────────
-# Runs app/towed_position.py's chain model at 5 Hz from the boat fix, the
+# Runs app/towed_position.py's drag model at 5 Hz from the boat fix, the
 # fish's depth and compass heading, and the operator's tether length. The
 # geotag paths read its latest estimate through offset_towed_position();
 # SURF TRACK's look-ahead reads the along-path distance. Scored against
 # the simulator in Simulator/analysis/position_eval.py.
 _TOWFISH_POSITION_PERIOD_S = 0.2
 _TOWFISH_POSITION_STALE_S = 2.0
+# Which towed_position model the tracker runs. "drag" (inextensible 1 m
+# links with water drag, fish held at its measured depth) beat "chain" on
+# the inextensible-tether simulator runs: turn p95 2.7 vs 3.0 m on 8 m of
+# tether and 2.8 vs 5.7 m on 25 m, with realistic GPS and compass error.
+TOW_POSITION_METHOD = "drag"
 
 
 class TowfishPositionSampler:
     def __init__(self):
-        self.tracker = towed_position.TowedPositionTracker(0.0, method="chain")
+        self.tracker = towed_position.TowedPositionTracker(0.0, method=TOW_POSITION_METHOD)
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
@@ -2520,6 +2525,12 @@ class TowfishPositionSampler:
         est = self.tracker.update(now, fix["lat"], fix["lon"], fix["course"],
                                   fix["speed"], depth, att.get("yaw"))
         est["speed"] = fix["speed"]
+        # Fish heading minus boat course: a steady offset hints at a cross-
+        # current (or cross-wind on the boat). Diagnostic only -- the model
+        # assumes still water.
+        yaw, course = att.get("yaw"), fix["course"]
+        est["crab_deg"] = (None if yaw is None or course is None
+                           else round((yaw - course + 180.0) % 360.0 - 180.0, 1))
         with self._lock:
             self._last = (now, fix["lat"], fix["lon"], est)
         _transect_spacing.observe_fix(fix["lat"], fix["lon"])
@@ -2569,6 +2580,7 @@ class TowfishPositionSampler:
             "along_path_m": (round(est["along_path_m"], 2)
                              if est.get("along_path_m") is not None else None),
             "slack": est["slack"], "turning": est["turning"],
+            "method": TOW_POSITION_METHOD, "crab_deg": est.get("crab_deg"),
             "uncertainty_m": est["uncertainty_m"],
             "lat": round(est["lat"], 7), "lon": round(est["lon"], 7),
             "age_s": round(time.monotonic() - last[0], 2),

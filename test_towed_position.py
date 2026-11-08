@@ -96,6 +96,49 @@ out = est.update_ne(40.4, bn + 0.4, be, 0.0, 1.0, 3.6, 0.0)
 moved = math.hypot(out["north"] - (bn + 0.4 - tp.layback_m(8, 3.6)), out["east"])
 check("one bad fix is ignored", moved < 0.6, f"moved {moved:.2f}")
 
+print("\ndrag model (inextensible links with water drag, fish held at its depth)")
+for L, dep in ((8, 3.6), (25, 7.4)):
+    est = tp.TowedPositionEstimator(L, method="drag")
+    out, bn, be = straight(est, 120, depth=dep)
+    lay = math.hypot(bn - out["north"], be - out["east"])
+    check(f"{L} m: straight leg settles at the simulator's layback ({tp.layback_m(L, dep):.2f} m)",
+          abs(lay - tp.layback_m(L, dep)) < 0.15 and abs(out["east"]) < 0.05, f"got {lay:.2f}")
+    seg = L / (len(est.nodes) - 1)
+    worst = max(abs(math.dist(est.nodes[i], est.nodes[i + 1]) / seg - 1) for i in range(len(est.nodes) - 1))
+    check(f"{L} m: links do not stretch", worst < 1e-3, f"{worst * 100:.3f} %")
+    check(f"{L} m: fish held at the measured depth", abs(est.nodes[-1][2] - dep) < 1e-9)
+check("1 m links: 26 nodes on a 25 m tether", len(est.nodes) == 26, f"got {len(est.nodes)}")
+
+est = tp.TowedPositionEstimator(8, method="drag")
+out, bn, be = straight(est, 40)
+t, R, v = 40.0, 3.5, 1.0
+worst, inside = 0.0, False
+for k in range(int(math.pi * R / v * 5)):
+    t += 0.2
+    a = v * (k * 0.2) / R
+    n, e = bn + R * math.sin(a), be + R * (1 - math.cos(a))
+    course = math.degrees(a) % 360
+    out = est.update_ne(t, n, e, course, v, 3.6, course)
+    worst = max(worst, math.hypot(n - out["north"], e - out["east"]))
+    inside = inside or out["east"] > 0.5
+check("drag hairpin: fish moves toward the inside", inside)
+check("drag hairpin: never beyond the tether's reach", worst <= 8.0 + 0.5, f"worst {worst:.2f}")
+
+est = tp.TowedPositionEstimator(8, method="drag")
+out, bn, be = straight(est, 40)
+went_slack = False
+for k in range(10):
+    out = est.update_ne(40.2 + k * 0.2, bn - 0.3 * (k + 1), be, 180.0, 1.5, 3.6, 0.0)
+    went_slack = went_slack or out["slack"]
+check("drag: backing toward the fish slackens the tether", went_slack)
+
+est = tp.TowedPositionEstimator(8, method="drag")
+out, bn, be = straight(est, 40)
+out = est.update_ne(40.2, bn + 30.0, be + 30.0, 0.0, 1.0, 3.6, 0.0)
+out = est.update_ne(40.4, bn + 0.4, be, 0.0, 1.0, 3.6, 0.0)
+moved = math.hypot(out["north"] - (bn + 0.4 - tp.layback_m(8, 3.6)), out["east"])
+check("drag: one bad GPS fix is ignored", moved < 0.6, f"moved {moved:.2f}")
+
 print("\nlat/lon front end")
 tr = tp.TowedPositionTracker(8)
 lat0, lon0 = 19.98, -155.83
@@ -183,7 +226,9 @@ back = math.radians(lat[0] - pos[0]) * tp.EARTH_R
 check("geotag uses the modelled layback (~7.5 m), not 7 m",
       abs(back - tp.layback_m(8, 3.6)) < 0.3, f"back {back:.2f}")
 check("snapshot active with layback", snap["active"] and abs(snap["layback_m"] - 7.47) < 0.1, f"{snap}")
-check("EXIF accuracy from the model", acc is not None and abs(acc - 1.66) < 0.05, f"got {acc}")
+check("EXIF accuracy from the model", acc is not None
+      and abs(acc - tp.uncertainty_m(8, False, main.TOW_POSITION_METHOD)) < 0.05, f"got {acc}")
+check("the extension ships the drag model", main.TOW_POSITION_METHOD == "drag")
 check("along-path distance for the sonar look-ahead ~ layback",
       along is not None and abs(along - tp.layback_m(8, 3.6)) < 0.6, f"got {along}")
 with mock.patch.object(main.time, "monotonic", return_value=clock[0] + 5.0):

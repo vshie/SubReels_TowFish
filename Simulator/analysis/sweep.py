@@ -852,10 +852,75 @@ def study_recipe_spacing(args) -> None:
                for S in sorted(GRID_SPACINGS + GRID_WIDE.get(L, []))])
 
 
+# -- INX: the inextensible (Kevlar) tether (owner, 7 Nov) ------------------
+# Re-run the owner's cases on the fixed-length, tension-only tether, with
+# the recommended layout (weight under the front of the tube), the shipped
+# extension settings, and the tether length set so the extension's own
+# position estimate is logged (est_n/est_e/est_unc).
+INX_HOLD_TARGETS = {8: (4.0, 4.5, 5.0, 5.5), 25: (7.0, 7.5, 8.0, 8.5, 9.0)}
+INX_WIDE = {8: 16, 25: 35}
+INX_TIGHT = 8
+
+
+def _with_tether(argv, L):
+    argv = list(argv)
+    if "tether_length_m=0.0" in argv:
+        argv[argv.index("tether_length_m=0.0")] = f"tether_length_m={float(L)}"
+    return argv
+
+
+def _inx(job, L, prefix, study, extra=(), rep=1, cable="inextensible"):
+    rid, argv, score, info = _recipe_job(job, "under", 1)
+    rid = rid.replace("_Runder", "").replace("sw_H_", prefix).replace("sw_B4_", prefix)
+    if rep > 1:
+        rid += f"_r{rep}"
+    argv = _with_tether(argv, L) + ["--set", f"cable.model={cable}"] + list(extra)
+    return (rid, argv, score, {**info, "study": study, "cable": cable, "rep": rep, "L": L})
+
+
+def inx_hold_job(L, D):
+    return _inx(hold_job(L, D), L, "sw_IA_", "inx_hold")
+
+
+def study_inx_hold(args) -> None:
+    run_batch([inx_hold_job(L, D) for L, ts in INX_HOLD_TARGETS.items() for D in ts])
+    print(inx_max_depths())
+
+
+def inx_max_depths():
+    """Deepest target each tether held steady and level: roll < 20 deg, no
+    rescues, depth within +-0.3 m, over the last 3 min of the hold test."""
+    res = load_results()
+    best = {}
+    for e in res.values():
+        if e.get("study") != "inx_hold" or "score" not in e:
+            continue
+        s = e["score"]
+        ok = s["max_roll"] < 20 and s["rescues"] == 0 and s["depth_max"] - s["depth_min"] <= 0.6
+        if ok and e["D"] > best.get(e["L"], (0, None))[0]:
+            best[e["L"]] = (e["D"], s["depth_med"])
+    return best
+
+
+def study_inx_turns(args) -> None:
+    maxd = inx_max_depths()
+    jobs = []
+    for L in (8, 25):
+        if L not in maxd:
+            print(f"no steady max depth for {L} m yet; run inx-hold first")
+            continue
+        for D in sorted({4.0, maxd[L][0]}):
+            for S in (INX_TIGHT, INX_WIDE[L]):
+                for r in (1, 2):
+                    jobs.append(_inx(steady_job(L, D, S), L, "sw_IB_", "inx_turns", rep=r))
+                jobs.append(_inx(steady_job(L, D, S), L, "sw_IC_", "inx_turns_spring", cable="spring"))
+    run_batch(jobs)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("study", choices=["righting", "early", "maxdepth", "fixed", "spacing", "grid", "rescore-grid", "steady", "dz0", "jog", "dt", "dzsel", "towpt", "ballast", "geometry", "recipe", "recipe-spacing", "rank"])
+    ap.add_argument("study", choices=["righting", "early", "maxdepth", "fixed", "spacing", "grid", "rescore-grid", "steady", "dz0", "jog", "dt", "dzsel", "towpt", "ballast", "geometry", "recipe", "recipe-spacing", "inx-hold", "inx-turns", "rank"])
     ap.add_argument("--vertical-pwm", type=int, default=1900)
     ap.add_argument("--roll-min-depth", type=float, default=0.0)
     ap.add_argument("--descent-start", type=float, default=0.0)
@@ -868,7 +933,8 @@ def main(argv=None) -> int:
     global WORKERS
     WORKERS = args.workers
     {"righting": study_righting, "early": study_early, "grid": study_grid, "rescore-grid": rescore_grid, "steady": study_steady, "dz0": study_dz0, "jog": study_jog, "dt": study_dt, "dzsel": study_dzsel, "towpt": study_towpt, "ballast": study_ballast, "geometry": study_geometry, "recipe": study_recipe,
-     "recipe-spacing": study_recipe_spacing, "fixed": study_fixed,
+     "recipe-spacing": study_recipe_spacing, "inx-hold": study_inx_hold,
+     "inx-turns": study_inx_turns, "fixed": study_fixed,
      "maxdepth": study_maxdepth,
      "spacing": study_spacing, "rank": lambda a: print(rank_righting())}[args.study](args)
     return 0
