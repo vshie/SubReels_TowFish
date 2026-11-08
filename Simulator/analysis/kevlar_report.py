@@ -262,6 +262,9 @@ def build(viewer_url):
     snap = snap_peaks()
     hold, turns = study_tables()
     ev, evn = eval_table("position_eval_inx.json"), eval_table("position_eval_inx_noisy.json")
+    evr = eval_table("position_eval_inx_rtk.json")
+    def p95(tab, L):
+        return next((r["turn"]["p95"] for r in tab if r["L"] == L and r["method"] == "drag"), None)
     cl = closed_loop("sw_IB_L25_D8_S35_cl")
     real = real_hairpin()
     maxd = sweep.inx_max_depths()
@@ -273,7 +276,7 @@ def build(viewer_url):
 <div class="answers">
 <div class="answer"><span class="k">Max steady depth</span><span class="v">{maxd.get(8, (0, 0))[1]:.1f} m · {maxd.get(25, (0, 0))[1]:.2f} m</span><span class="d">8 m and 25 m tether, level, no rescues</span></div>
 <div class="answer"><span class="k">Snap when the tether goes taut</span><span class="v">{snap['inextensible'][0]:.0f} N vs {snap['spring'][0]:.0f} N</span><span class="d">peak tension, Kevlar vs old spring model; stretch {snap['inextensible'][1] * 100:.2f}%</span></div>
-<div class="answer"><span class="k">Fish position in turns, p95</span><span class="v">2.7 m · 2.8 m</span><span class="d">drag model, 8 m and 25 m tether, realistic GPS and compass error</span></div>
+<div class="answer"><span class="k">Fish position in turns, p95</span><span class="v">{fmt(p95(evr, 8.0))} m · {fmt(p95(evr, 25.0))} m</span><span class="d">drag model, 8 m and 25 m tether, RTK boat GPS and a 5° noisy, 3° biased compass ({fmt(p95(evn, 8.0))} / {fmt(p95(evn, 25.0))} m with 1 m GPS error)</span></div>
 <div class="answer"><span class="k">3D replays</span><span class="v"><a href="{viewer_url}">Open viewer</a></span><span class="d">new-tether turns, and the spring tether for comparison</span></div>
 </div></header>""")
 
@@ -314,9 +317,9 @@ def build(viewer_url):
                        f'<td>{fmt(s["median"], 2)} / {fmt(s["p95"], 2)}</td><td>{fmt(t["median"], 2)} / {fmt(t["p95"], 2)} / {fmt(t["max"], 2)}</td></tr>')
         return "".join(out)
     b.append(f"""<section><div class="eyebrow">Fish position</div><h2>Error against the simulated fish's true position (m)</h2>
-<p>The new-tether runs above, fed to each estimator at the extension's 5 Hz. "Perfect inputs" isolates the model; "realistic" adds 1 m of drifting boat-GPS error and a fish compass with 5° noise and 3° bias. The drag model and the simulator share the same tether drag physics, so real water may be less kind.</p>
+<p>The new-tether runs above, fed to each estimator at the extension's 5 Hz. "Perfect inputs" isolates the model. "RTK" adds 5 cm of boat-GPS error (Friday's boat logged an RTK fix) and a fish compass with 5° noise and 3° bias; "1 m GPS" uses a drifting 1 m boat error instead. Every estimate is clamped to the tether's physical reach from the boat's fix, so a GPS error of a metre also limits it. The drag model and the simulator share the same tether drag physics, so real water may be less kind.</p>
 <div class="tablewrap"><table><tr><th>Inputs</th><th>Tether</th><th>Estimate</th><th>Straight, median / p95</th><th>Turns, median / p95 / worst</th></tr>
-{ev_rows(ev, "perfect")}{ev_rows(evn, "realistic")}</table></div></section>""")
+{ev_rows(ev, "perfect")}{ev_rows(evr, "RTK GPS")}{ev_rows(evn, "1 m GPS")}</table></div></section>""")
 
     # Closed loop + real hairpin
     cl_dots = [(cl[i]["f"], cl[i]["m"]) for i in range(0, len(cl), 100)]
@@ -346,7 +349,7 @@ def build(viewer_url):
     b.append(f"""<section><div class="eyebrow">Real data · 4 Nov 2026</div><h2>Friday's first hairpin from the logs, through the extension's position model</h2>
 <p>The boat's logged GPS (10 Hz, RTK fixed) and the fish's logged depth and compass heading, run through the extension's drag model at 5 Hz with an 8 m tether, exactly as the extension would on the water. There is no ground truth for the real fish; the green dashed line is a simulation of the same hairpin on the Kevlar tether (Friday's layout, weight on the nose), shown for plausibility, not as truth.</p>
 <div class="legend"><span><i style="background:var(--boat)"></i>boat GPS</span><span><i style="background:var(--model)"></i>drag model (ships)</span><span><i style="background:var(--fixed)"></i>static 7 m offset (before)</span><span><i style="background:var(--ref)"></i>simulated fish, same hairpin</span></div>
-<div class="pair"><figure>{real_svg}<figcaption>North up, 5 minutes from 10:30:30 HST. The model puts the fish inside the boat's turn and lets it coast; the static offset swings the fish around behind the boat's heading.</figcaption></figure>
+<div class="pair"><figure>{real_svg}<figcaption>North up, 5 minutes from 10:30:30 HST. The model puts the fish inside the boat's turn and lets it coast, never further from the boat's fix than the 8 m tether can reach; the static offset swings the fish around behind the boat's heading.</figcaption></figure>
 <div style="display:grid;gap:16px;min-width:0"><figure>{depth_svg}<figcaption>Depth: logged fish (black) and the simulated fish (green). The model holds the fish at the logged depth.</figcaption></figure>
 <figure>{unc_svg}<figcaption>Blue: the model's own ±2σ (it writes σ into each photo's GPSXYAccuracy). Orange: how far the model's fish is from where the old static offset put it, up to {max(gap):.1f} m in the turn.</figcaption></figure></div></div></section>""")
 

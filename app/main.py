@@ -2480,9 +2480,10 @@ def get_blueboat_fix():
 _TOWFISH_POSITION_PERIOD_S = 0.2
 _TOWFISH_POSITION_STALE_S = 2.0
 # Which towed_position model the tracker runs. "drag" (inextensible 1 m
-# links with water drag, fish held at its measured depth) beat "chain" on
-# the inextensible-tether simulator runs: turn p95 2.7 vs 3.0 m on 8 m of
-# tether and 2.8 vs 5.7 m on 25 m, with realistic GPS and compass error.
+# links with water drag, fish held at its measured depth, clamped to the
+# tether's reach) on the inextensible-tether simulator runs, RTK boat GPS
+# and a noisy, biased compass: turn p95 1.7 m on 8 m of tether (chain 1.55)
+# and 1.6 m on 25 m (chain 6.3).
 TOW_POSITION_METHOD = "drag"
 
 

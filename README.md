@@ -52,10 +52,13 @@ inferred from the boat's. Two models, chosen in the setup console:
   3.6 m depth, 23.9 m on 25 m at 7.4 m). Through a turn the fish cuts inside
   the boat's track, and coasts when the tether goes slack.
   (`app/towed_position.py`, method `drag`; about 1% of a Pi 4 core on 25 m of
-  tether.) Scored against the simulator's fixed-length tether, with
-  realistic boat-GPS and compass error, the p95 error through hairpins is
-  about 2.7 m on 8 m of tether and 2.8 m on 25 m. A static 7 m offset was 6–23
-  m off there. Every photo's `GPSXYAccuracy` carries the model's own 1-sigma
+  tether.) The estimate is clamped so it is never further from the boat's
+  GPS fix than the tether can physically reach (√(L² − vertical drop²), plus
+  the fish's 0.43 m body). Scored against the simulator's fixed-length
+  tether, with RTK boat GPS and a 5° noisy, 3° biased fish compass, the p95
+  error through hairpins is about 1.7 m on 8 m of tether and 1.6 m on 25 m
+  (3.1 m and 2.6 m if the boat fix wanders by 1 m). A static 7 m offset was
+  6–22 m off there. Every photo's `GPSXYAccuracy` carries the model's own 1-sigma
   estimate, larger in turns, so photogrammetry down-weights turn frames. The
   model needs **tether length**; until that is set, or if the boat fix drops
   out, the static offset is used. SURF TRACK's sonar look-ahead uses the

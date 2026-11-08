@@ -31,6 +31,10 @@ import math
 
 SAG = 0.985
 TOW_POINT_TO_BODY_M = 0.43
+# Geometry for the reach limit: the boat's tow point sits this far above the
+# water, the fish's tow point this far above its depth sensor (the CG).
+BOAT_TOW_POINT_HEIGHT_M = 0.1
+FISH_TOW_POINT_ABOVE_CG_M = 0.17
 EARTH_R = 6371000.0
 METHODS = ("fixed", "geometric", "path", "pursuit", "chain", "drag")
 
@@ -117,6 +121,15 @@ def spacing_from_waypoints(waypoints):
     return round(out[len(out) // 2], 2)
 
 
+def max_reach_m(tether_length_m, depth_m):
+    """Furthest the fish's tow point can be, horizontally, from the boat's
+    tow point: the tether can never be longer than it is, and the vertical
+    drop uses some of it."""
+    L = float(tether_length_m)
+    drop = max(0.0, float(depth_m or 0.0) - FISH_TOW_POINT_ABOVE_CG_M + BOAT_TOW_POINT_HEIGHT_M)
+    return math.sqrt(max(0.0, L * L - drop * drop))
+
+
 def _unit(deg):
     r = math.radians(deg)
     return math.cos(r), math.sin(r)   # (north, east)
@@ -195,6 +208,7 @@ class TowedPositionEstimator:
             heading = 0.0
         h = (layback_m(self.L, fish_depth) if self.L > 0 else self.fixed_offset_m)
         hn, he = _unit(heading)
+        raw_n, raw_e = boat_n, boat_e
         if self._glitch(t, boat_n, boat_e, boat_speed):
             if self.fish is not None:
                 return self._result(t, boat_course, h)
@@ -225,7 +239,36 @@ class TowedPositionEstimator:
             self._drag_model(dt, boat_n, boat_e, boat_course, boat_speed, fish_depth, hn, he)
         else:
             self._chain(dt, boat_n, boat_e, boat_speed, h, hn, he)
+        self._clamp_to_reach(raw_n, raw_e, fish_depth, hn, he)
         return self._result(t, boat_course, h)
+
+    def _clamp_to_reach(self, bn, be, depth, hn, he):
+        """Hard limit: never further from the boat's actual fix than the
+        tether can reach. Smoothing and lead on the boat fix (and any model
+        error) must not put the fish where the tether cannot."""
+        self.clamped = False
+        if self.L <= 0 or self.fish is None:
+            return
+        tn, te = self.towpt if self.towpt is not None else (
+            self.fish[0] + TOW_POINT_TO_BODY_M * hn, self.fish[1] + TOW_POINT_TO_BODY_M * he)
+        reach = max_reach_m(self.L, depth)
+        d = math.hypot(tn - bn, te - be)
+        if d <= reach or d < 1e-9:
+            return
+        k = reach / d
+        sn, se = bn + (tn - bn) * k - tn, be + (te - be) * k - te
+        self.clamped = True
+        self.towpt = (tn + sn, te + se)
+        self.fish = (self.fish[0] + sn, self.fish[1] + se)
+        # Keep the model's own tether end inside the limit too, so the next
+        # update starts from a reachable state.
+        if self.nodes:
+            last = self.nodes[-1]
+            if len(last) == 3:
+                last[0] += sn
+                last[1] += se
+            else:
+                self.nodes[-1] = (last[0] + sn, last[1] + se)
 
     def _glitch(self, t, n, e, speed):
         if self.raw is None:
@@ -246,6 +289,7 @@ class TowedPositionEstimator:
     def _result(self, t, boat_course, h):
         turning = self._turning(t, boat_course) or self.slack
         return {"north": self.fish[0], "east": self.fish[1], "layback_m": h,
+                "clamped": getattr(self, "clamped", False),
                 "along_path_m": self._path_length_to_fish(),
                 "slack": self.slack, "turning": turning,
                 "uncertainty_m": uncertainty_m(self.L or self.fixed_offset_m, turning, self.method)}

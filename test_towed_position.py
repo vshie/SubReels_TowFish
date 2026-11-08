@@ -139,6 +139,27 @@ out = est.update_ne(40.4, bn + 0.4, be, 0.0, 1.0, 3.6, 0.0)
 moved = math.hypot(out["north"] - (bn + 0.4 - tp.layback_m(8, 3.6)), out["east"])
 check("drag: one bad GPS fix is ignored", moved < 0.6, f"moved {moved:.2f}")
 
+print("\nhard limit: never beyond the tether's reach from the raw boat fix")
+check("reach geometry: 8 m tether at 3.6 m ~7.18 m",
+      abs(tp.max_reach_m(8, 3.6) - math.sqrt(64 - 3.53 ** 2)) < 1e-9)
+for method in ("drag", "chain", "path", "geometric"):
+    est = tp.TowedPositionEstimator(8, method=method)
+    worst_excess, t = -1e9, 0.0
+    n = e = 0.0
+    course = 0.0
+    for k in range(900):                         # 3 min: fast boat, tight S-turns, noisy speed
+        t = k * 0.2
+        course = (course + (25.0 if (k // 40) % 2 == 0 else -25.0)) % 360
+        sp = 2.0 + 0.5 * math.sin(k / 7.0)
+        n += sp * 0.2 * math.cos(math.radians(course))
+        e += sp * 0.2 * math.sin(math.radians(course))
+        dep = 3.0 + 1.5 * math.sin(k / 30.0)
+        o = est.update_ne(t, n, e, course, sp, dep, (course + 40) % 360)
+        excess = math.hypot(o["north"] - n, o["east"] - e) - (tp.max_reach_m(8, dep) + tp.TOW_POINT_TO_BODY_M)
+        worst_excess = max(worst_excess, excess)
+    check(f"{method}: fish always within tether reach + body offset", worst_excess <= 1e-6,
+          f"exceeded by {worst_excess:.3f} m")
+
 print("\nlat/lon front end")
 tr = tp.TowedPositionTracker(8)
 lat0, lon0 = 19.98, -155.83
