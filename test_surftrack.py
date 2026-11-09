@@ -54,6 +54,13 @@ stub("usb_storage", get_base_dir=lambda: None, start_probe=lambda: None)
 
 import main  # noqa: E402
 
+# The bottom-following switches as shipped. The proportional-command
+# tests below were written for a stick that scales from 1500, so they
+# run with that mapping; the bottom-following section restores these.
+SHIPPED_SWITCHES = (main.surf_resume_from_surface, main.surf_lookahead,
+                    main.surf_stick_skip_deadzone)
+main.surf_stick_skip_deadzone = False
+
 # ---------------------------------------------------------------------------
 # Fake sonar and command-capture harness
 # ---------------------------------------------------------------------------
@@ -87,6 +94,10 @@ class FakeSonar:
 
     def latest_speed_ms(self):
         return self._speed
+
+    def shallowest_ahead(self, pad_s=0.0):
+        # Nothing shallower ahead than the newest sounding.
+        return None
 
     def depth_at_tow_delay(self):
         return self._delayed
@@ -444,6 +455,8 @@ check("jog down 100 clamped up to 1100",
 check("NaN falls back to the default (up)",
       main._sanitize_jog_up_pwm(float("nan"))
       == main.DEFAULT_JOG_UP_PWM)
+check("default jog up is 1800, clear of the THR_DZ deadzone",
+      main.DEFAULT_JOG_UP_PWM == 1800)
 
 # ---------------------------------------------------------------------------
 # Operator veto: surf-track write refused, snapshot records suspension
@@ -679,6 +692,127 @@ calls = drive(ctrl, fish_depth=5.0, sonar=sonar, now=1100.0)
 check("up command still issued despite low speed",
       any(c[0] == "up" and c[2] == "surftrack" for c in calls),
       f"got {calls}")
+
+# ---------------------------------------------------------------------------
+# Bottom following (8 Nov): diving back from the surface, look-ahead,
+# stick mapping past ArduSub's dead zone
+# ---------------------------------------------------------------------------
+DEFAULT_SWITCHES = SHIPPED_SWITCHES
+check("shipped: resume from surface, shallowest look-ahead, stick past the dead zone",
+      SHIPPED_SWITCHES == (True, "shallowest", True), f"got {SHIPPED_SWITCHES}")
+
+
+def restore_switches():
+    (main.surf_resume_from_surface, main.surf_lookahead,
+     main.surf_stick_skip_deadzone) = DEFAULT_SWITCHES
+
+
+def park_at_surface(ctrl, sonar):
+    """Track over a 3 m bottom (target 4 m above it: above the surface),
+    then let the fish reach the surface."""
+    sonar._latest = (3.0, 0.2)
+    drive(ctrl, fish_depth=1.5, sonar=sonar, now=3000.0)
+    drive(ctrl, fish_depth=0.4, sonar=sonar, now=3001.0)
+
+
+print("\nresume from the surface")
+main.surf_resume_from_surface = True
+sonar = FakeSonar(latest=(3.0, 0.2))
+ctrl = fresh_controller(sonar)
+park_at_surface(ctrl, sonar)
+check("parked by a too-shallow bottom", ctrl._parked_at_surface)
+check("holds at the surface while the bottom stays shallow",
+      ctrl.state == "holding" and ctrl.hold_reason == "at_surface",
+      f"got {ctrl.state}/{ctrl.hold_reason}")
+sonar._latest = (4.6, 0.2)        # wants 0.6 m: not enough margin yet
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3002.0)
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3005.0)
+check("still holds when the bottom allows only a marginal depth",
+      ctrl.hold_reason == "at_surface", f"got {ctrl.hold_reason}")
+sonar._latest = (6.0, 0.2)        # wants 2 m
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3006.0)
+calls = drive(ctrl, fish_depth=0.4, sonar=sonar,
+              now=3006.0 + main.SURF_RESUME_DEBOUNCE_S + 0.1)
+check("resumes tracking once the bottom deepens",
+      ctrl.state == "tracking", f"got {ctrl.state}/{ctrl.hold_reason}")
+check("and commands down", any(c[0] == "down" for c in calls), f"got {calls}")
+
+sonar = FakeSonar(latest=(6.0, 0.2))
+ctrl = fresh_controller(sonar)
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3100.0)
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3105.0)
+check("a fish SURF TRACK did not park still holds at the surface",
+      ctrl.hold_reason == "at_surface", f"got {ctrl.hold_reason}")
+
+main.surf_resume_from_surface = False
+sonar = FakeSonar(latest=(3.0, 0.2))
+ctrl = fresh_controller(sonar)
+park_at_surface(ctrl, sonar)
+sonar._latest = (6.0, 0.2)
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3006.0)
+drive(ctrl, fish_depth=0.4, sonar=sonar, now=3010.0)
+check("switch off: holds at the surface as before",
+      ctrl.hold_reason == "at_surface", f"got {ctrl.hold_reason}")
+restore_switches()
+
+
+class AheadSonar(FakeSonar):
+    def __init__(self, ahead, **kw):
+        super().__init__(**kw)
+        self._ahead = ahead
+
+    def shallowest_ahead(self, pad_s=0.0):
+        return self._ahead
+
+
+print("\nlook-ahead: newest vs shallowest between fish and boat")
+for mode, want in (("newest", 3.0), ("shallowest", main.SURF_SURFACE_DEPTH_M)):
+    main.surf_lookahead = mode
+    sonar = AheadSonar(4.0, latest=(7.0, 0.2))
+    ctrl = fresh_controller(sonar)
+    drive(ctrl, fish_depth=3.0, sonar=sonar, now=3200.0)
+    check(f"{mode}: raw target {want} m", abs(ctrl._raw_target_depth_m - want) < 1e-6,
+          f"got {ctrl._raw_target_depth_m}")
+restore_switches()
+
+hist = main.SonarHistory()
+with mock.patch.object(main.time, "monotonic", side_effect=[100.0, 104.0, 108.0, 110.0]):
+    hist.sample_once({"distance_m": 4.0, "in_range": True, "signal_quality": 100,
+                      "last_update": 1}, 1.0)
+    hist.sample_once({"distance_m": 7.0, "in_range": True, "signal_quality": 100,
+                      "last_update": 2}, 1.0)
+    hist.sample_once({"distance_m": 7.1, "in_range": True, "signal_quality": 100,
+                      "last_update": 3}, 1.0)
+    with mock.patch.object(hist, "tow_delay_s", return_value=6.0):
+        got = hist.shallowest_ahead(pad_s=2.0)     # window from 102 s
+check("shallowest_ahead covers the fish-to-boat window only",
+      got == 7.0, f"got {got}")
+with mock.patch.object(main.time, "monotonic", return_value=110.0), \
+        mock.patch.object(hist, "tow_delay_s", return_value=8.0):
+    got = hist.shallowest_ahead(pad_s=2.0)         # window from 100 s
+check("and includes a coral head the fish has not passed", got == 4.0, f"got {got}")
+hist.sample_once({"distance_m": 85.0, "in_range": True, "signal_quality": 40,
+                  "last_update": 4}, 1.0)
+check("low-quality packets never reach the buffer",
+      all(d < 30 for _, d in hist._samples), f"got {list(hist._samples)}")
+
+print("\nstick mapping past the dead zone")
+for skip, up_want, dn_want in ((False, 1650, 1400), (True, 1700, 1350)):
+    main.surf_stick_skip_deadzone = skip
+    sonar = FakeSonar(latest=(10.0, 0.2))
+    ctrl = fresh_controller(sonar)
+    main.jog_up_pwm, main.jog_down_pwm = 1800, 1300
+    ctrl._target_depth_m = ctrl._raw_target_depth_m = 6.0
+    calls = drive(ctrl, fish_depth=6.5, sonar=sonar, now=3300.0)   # 0.5 m too deep
+    up = [c[1] for c in calls if c[0] == "up"]
+    check(f"skip={skip}: half error up -> {up_want}", up == [up_want], f"got {calls}")
+    ctrl = fresh_controller(sonar)
+    main.jog_up_pwm, main.jog_down_pwm = 1800, 1300
+    ctrl._target_depth_m = ctrl._raw_target_depth_m = 6.0
+    calls = drive(ctrl, fish_depth=5.5, sonar=sonar, now=3400.0)   # 0.5 m too shallow
+    dn = [c[1] for c in calls if c[0] == "down"]
+    check(f"skip={skip}: half error down -> {dn_want}", dn == [dn_want], f"got {calls}")
+restore_switches()
 
 print()
 if FAILURES:

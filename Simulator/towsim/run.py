@@ -152,6 +152,28 @@ def spawn_sitl(args, run_dir: Path, track, scenario_parm: Path | None) -> subpro
     return subprocess.Popen(cmd, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT)
 
 
+def terrain_cols(terrain, pos, top, ext):
+    """bottom_fish, alt_true, sonar_depth, sonar_q, surf_target, surf_raw,
+    s_fish, s_boat (distance along the terrain)."""
+    out = ["", "", "", "", "", "", "", ""]
+    if terrain is not None:
+        b = terrain.depth_at(pos[0], pos[1])
+        out[0], out[1] = f"{b:.3f}", f"{b - pos[2]:.3f}"
+        out[6] = f"{terrain.along_cross(pos[0], pos[1])[0]:.2f}"
+        out[7] = f"{terrain.along_cross(top[0], top[1])[0]:.2f}"
+    if ext is not None:
+        pk = ext.packet or {}
+        if pk.get("distance_m") is not None:
+            out[2] = f"{pk['distance_m']:.3f}"
+            out[3] = f"{pk.get('signal_quality', '')}"
+        c = ext.ctrl
+        if c._target_depth_m is not None:
+            out[4] = f"{c._target_depth_m:.3f}"
+        if c._raw_target_depth_m is not None:
+            out[5] = f"{c._raw_target_depth_m:.3f}"
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--start", required=True, help="HH:MM[:SS] HST on 4 Nov, or boat log seconds")
@@ -194,9 +216,20 @@ def main(argv=None) -> int:
     ap.add_argument("--bottom-depth", type=float,
                     help="with --extension: a flat bottom at this depth instead of the logged "
                          "sounding")
+    ap.add_argument("--terrain", metavar="SPEC",
+                    help="seabed along the tow, seen by a Ping model (towsim/terrain.py): "
+                         "slope, coral or flat:<depth>; distance is measured from the boat "
+                         "at --start")
+    ap.add_argument("--ping-seed", type=int, default=0,
+                    help="with --terrain: where in the logged Ping packet schedule to start")
     ap.add_argument("--fixed-stick", type=int, metavar="PWM",
                     help="STABILIZE with RC3 held at PWM after release (e.g. 1300 = half "
                          "down): the wings' collective is set by hand, roll stays stabilised")
+    ap.add_argument("--stick-steps", metavar="PWM@S,...",
+                    help="scripted vertical stick: RC3 PWM from S seconds after --start, e.g. "
+                         "1500@0,1900@30,1500@40 (rate step tests; implies --pilot none)")
+    ap.add_argument("--stick-mode", choices=["alt_hold", "stabilize"], default="alt_hold",
+                    help="with --stick-steps: the mode the steps are flown in")
     ap.add_argument("--log-cable", action="store_true",
                     help="also write cable.csv (every node's NED position at 10 Hz) for visualisation")
     args = ap.parse_args(argv)
@@ -233,16 +266,28 @@ def main(argv=None) -> int:
     ext_set = {}
     for kv in args.ext_set:
         k, v = kv.split("=", 1)
-        ext_set[k] = json.loads(v) if v[:1] in "[{tf" or v in ("null",) else (
-            float(v) if "." in v or "e" in v.lower() else int(v))
+        try:
+            ext_set[k] = json.loads(v)
+        except ValueError:
+            ext_set[k] = v      # a bare string, e.g. surf_lookahead=shallowest
     if args.fixed_stick is not None:
+        args.pilot = "none"
+    if args.stick_steps:
         args.pilot = "none"
     sched = load_schedule() if args.pilot == "replay" else no_pilot()
     if args.fixed_stick is not None:
         sched = no_pilot(MODE_STABILIZE)
         sched.rc3_t = np.array([-1e9])
         sched.rc3_v = np.array([float(args.fixed_stick)])
-    start_mode = (sched.mode_at(t_start) if args.pilot == "replay" or args.fixed_stick is not None
+    if args.stick_steps:
+        steps = [(float(s.split("@")[1]), float(s.split("@")[0]))
+                 for s in args.stick_steps.split(",")]
+        steps.sort()
+        sched = no_pilot(MODE_STABILIZE if args.stick_mode == "stabilize" else MODE_ALT_HOLD)
+        sched.rc3_t = np.array([t_start + t for t, _ in steps])
+        sched.rc3_v = np.array([v for _, v in steps])
+    start_mode = (sched.mode_at(t_start)
+                  if args.pilot == "replay" or args.fixed_stick is not None or args.stick_steps
                   else MODE_ALT_HOLD)
     if start_mode is None:
         start_mode = MODE_ALT_HOLD
@@ -283,6 +328,15 @@ def main(argv=None) -> int:
         sitl_proc = spawn_sitl(args, run_dir, track,
                                args.param_file.resolve() if args.param_file else None)
     mav = Mav(args.mavlink) if args.sitl != "none" else None
+    terrain = None
+    if args.bottom_depth is not None and not args.terrain:
+        args.terrain = f"flat:{args.bottom_depth}"
+    if args.terrain:
+        from towsim.terrain import Terrain
+        p_s, v_s = track.state(t_start)
+        h_s = (math.atan2(v_s[1], v_s[0]) if np.hypot(*v_s[:2]) > 0.2
+               else math.radians(track.heading0_deg))
+        terrain = Terrain.from_spec(args.terrain, p_s, h_s)
     ext = None
     if args.extension and mav is not None:
         from towsim.extension_bridge import ExtensionBridge
@@ -290,8 +344,8 @@ def main(argv=None) -> int:
         L = phys.cable.length
         ext = ExtensionBridge(mav, track, tether_length_m=L,
                               tow_offset_m=math.sqrt(max(1.0, L ** 2 - args.init_depth ** 2)),
-                              bottom_depth_m=args.bottom_depth, ext_set=ext_set,
-                              surftrack=not args.autoright_only)
+                              terrain=terrain, ext_set=ext_set,
+                              surftrack=not args.autoright_only, ping_seed=args.ping_seed)
         # The trigger the extension actually flew (after any --ext-set), so
         # a later viewer labels the run by its code, not by today's defaults.
         m = ext.main
@@ -312,7 +366,9 @@ def main(argv=None) -> int:
                  "u", "v", "w", "p", "q", "r", "defl_port_deg", "defl_stbd_deg",
                  "servo5", "servo6", "tension_n", "boat_speed", "water_speed",
                  "layback_m", "sitl_mode", "armed", "rc3", "jig", "surf", "rc2", "ar_twist",
-                 "est_n", "est_e", "est_unc"])
+                 "est_n", "est_e", "est_unc",
+                 "bottom_fish", "alt_true", "sonar_depth", "sonar_q", "surf_target", "surf_raw",
+                 "s_fish", "s_boat"])
 
     t_sim = 0.0
     next_truth = 0.0
@@ -421,7 +477,8 @@ def main(argv=None) -> int:
                              ext.label() if ext is not None else "",
                              rc2_now if rc2_now is not None else "",
                              f"{ext.twist():.3f}" if ext is not None else "",
-                             *(ext.position_estimate() if ext is not None else ("", "", ""))])
+                             *(ext.position_estimate() if ext is not None else ("", "", "")),
+                             *terrain_cols(terrain, phys.pos, top, ext)])
             if time.time() - last_print > 10:
                 last_print = time.time()
                 r, p, _ = (math.degrees(a) for a in euler_from_quat(phys.q))

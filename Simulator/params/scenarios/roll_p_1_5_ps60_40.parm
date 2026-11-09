@@ -1,0 +1,4 @@
+# Roll angle gain the extension ships, plus a raised vertical speed cap (rates study).
+ATC_ANG_RLL_P,1.5
+PILOT_SPEED_UP,60
+PILOT_SPEED_DN,40

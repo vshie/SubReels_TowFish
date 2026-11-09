@@ -8,8 +8,10 @@ their I/O is redirected:
   fish attitude   <- SITL ATTITUDE
   armed / mode    <- SITL HEARTBEAT
   wing outputs    <- the servo PWMs SITL sends the physics (SERVO_OUTPUT_RAW)
-  boat sonar      <- the boat's logged DPTH and speed, on the sim clock
-                     (or a flat bottom at --bottom-depth)
+  boat sonar      <- the extension's own SonarHistory, sampled at its 4 Hz
+                     from the boat's logged RFND packets (quality gate and
+                     all) or a terrain/flat bottom seen by a Ping model;
+                     boat speed from the track
   boat navigation <- mission seq, heading and bearing to the next waypoint,
                      from the boat track (see BoatNav)
   RC2/RC3         -> RC_CHANNELS_OVERRIDE on SITL
@@ -82,42 +84,46 @@ class _Clock:
         return getattr(self._real, name)
 
 
-class BoatSonar:
-    """The extension's SonarHistory interface over the boat's logged sounding."""
+class BoatPing:
+    """What the boat's Ping publishes, as the extension's sampler sees it.
 
-    def __init__(self, track, tow_offset_m: float, bottom_depth_m: float | None = None):
-        boat = load_boat()
-        d = boat["DPTH"]
-        self.t = np.asarray(d["t"])
-        self.depth = np.asarray(d["Depth"], dtype=float)
+    Three sources: the 4 Nov boat log's RFND (replayed packet by packet:
+    each new value is a new packet, with its logged quality, so the
+    extension's own gate drops what it dropped in the field), or a
+    terrain model (towsim.terrain) seen through the Ping model, or a flat
+    bottom (the same Ping model over flat terrain).
+    """
+
+    def __init__(self, track, terrain=None, seed=0):
         self.track = track
-        self.tow_offset = tow_offset_m
-        self.bottom = bottom_depth_m
-        self.t_boat = 0.0
+        self.ping = None
+        if terrain is not None:
+            from .terrain import PingModel
+            self.ping = PingModel(terrain, seed=seed)
+        else:
+            from .logs import BOAT_BIN, read_bin
+            r = read_bin(BOAT_BIN, {"RFND": ["Dist", "Quality", "Stat"]})["RFND"]
+            t = np.asarray(r["t"])
+            d = np.asarray(r["Dist"], dtype=float)
+            new = np.r_[True, np.diff(d) != 0]
+            self.t = t[new]
+            self.d = d[new]
+            self.q = np.asarray(r["Quality"], dtype=float)[new]
+            self.stat = np.asarray(r["Stat"])[new]
 
-    def _valid(self, t):
-        if self.bottom is not None:
-            return float(self.bottom)
-        v = float(np.interp(t, self.t, self.depth))
-        return v if 0.3 < v < 100 else None
+    def snapshot(self, t_boat):
+        if self.ping is not None:
+            (n, e, _), _ = self.track.state(t_boat)
+            return self.ping.update(t_boat, n, e)
+        i = int(np.searchsorted(self.t, t_boat, side="right")) - 1
+        if i < 0:
+            return None
+        return {"distance_m": float(self.d[i]), "signal_quality": float(self.q[i]),
+                "in_range": int(self.stat[i]) == 4, "last_update": i}
 
-    def latest(self, max_age_s):
-        v = self._valid(self.t_boat)
-        return None if v is None else (v, 0.2)
-
-    def latest_speed_ms(self):
-        i = int(np.searchsorted(self.track.t, self.t_boat))
-        i = min(max(i, 0), len(self.track.t) - 1)
-        return float(self.track.speed[i])
-
-    def depth_at_tow_delay(self):
-        spd = max(0.15, self.latest_speed_ms())
-        delay = self.tow_offset / spd
-        v = self._valid(self.t_boat - delay)
-        return None if v is None else (v, delay, 0.0)
-
-    def last_update_id(self):
-        return int(self.t_boat * 2.8)
+    def speed(self, t_boat):
+        _, v = self.track.state(t_boat)
+        return float(math.hypot(v[0], v[1]))
 
 
 class BoatNav:
@@ -138,8 +144,8 @@ class BoatNav:
 class ExtensionBridge:
     def __init__(self, mav, track, *, jog_up_pwm=1800, jog_down_pwm=1300,
                  target_altitude_m=None, max_depth_m=None, tow_offset_m=7.0,
-                 tether_length_m=0.0, bottom_depth_m=None, ext_set=None,
-                 surftrack=True):
+                 tether_length_m=0.0, terrain=None, ext_set=None,
+                 surftrack=True, ping_seed=0):
         self.main = main = import_extension()
         self.mav = mav
         self.clock = _Clock(main.time)
@@ -152,7 +158,10 @@ class ExtensionBridge:
         self.vehicle: dict = {}
         self.servo: dict = {}
         self.track = track
-        self.sonar = BoatSonar(track, tow_offset_m, bottom_depth_m)
+        self.ping = BoatPing(track, terrain, seed=ping_seed)
+        self.sonar = main.SonarHistory()
+        self.next_sonar = None
+        self.packet = None
         self.nav = BoatNav(track)
         self.t_boat = 0.0
         main._get_towfish_depth_m = lambda: self.depth
@@ -162,6 +171,8 @@ class ExtensionBridge:
             "armed": self.vehicle.get("armed"), "custom_mode": self.vehicle.get("custom_mode")}
         main._servo_output_message = lambda: dict(self.servo)
         main._sonar_history = self.sonar
+        # The model-free tow delay (tow_position_mode "fixed") reads this.
+        main.tow_offset_m = tow_offset_m
         main._set_thrust_command = self._thrust
         main.get_default_writer = lambda: self
         main._persist_config = lambda: None
@@ -256,8 +267,12 @@ class ExtensionBridge:
             return
         self.next_tick = t_sim + self.main.SURF_TICK_S
         self.clock.now = t_sim
-        self.sonar.t_boat = t_boat
         self.t_boat = t_boat
+        # The extension's sampler thread, at its own period.
+        if self.next_sonar is None or t_sim >= self.next_sonar:
+            self.next_sonar = t_sim + self.main._SONAR_SAMPLE_PERIOD_S
+            self.packet = self.ping.snapshot(t_boat)
+            self.sonar.sample_once(self.packet, self.ping.speed(t_boat))
         m = self.mav
         if m.vfr_alt is not None:
             self.depth = round(-m.vfr_alt, 2) if m.vfr_alt < 0 else 0.0

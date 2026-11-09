@@ -1,0 +1,290 @@
+<title>Towfish Bottom Following</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; charts break out to a wider measure. Depth reads downward, like a sounder trace. */
+:root {
+  --bg: #f6f8f9; --panel: #ffffff; --fg: #17252b; --muted: #5a6b72; --rule: #d5dee2;
+  --water: #e7f1f5; --seabed: #c9b79a; --seabed-edge: #9c8664;
+  --base: #d9480f; --ship: #0a8aa8; --caps: #7048e8; --ideal: #17252b;
+  --good: #2b8a3e; --warn: #b35c00;
+  --f-display: "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+  --f-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #10181b; --panel: #172226; --fg: #e3ecef; --muted: #93a6ad; --rule: #2c3b41;
+  --water: #14262d; --seabed: #6b5a40; --seabed-edge: #9c8664;
+  --base: #e8590c; --ship: #1098ad; --caps: #845ef7; --ideal: #e3ecef;
+  --good: #51cf66; --warn: #ffa94d; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #10181b; --panel: #172226; --fg: #e3ecef; --muted: #93a6ad; --rule: #2c3b41;
+  --water: #14262d; --seabed: #6b5a40; --seabed-edge: #9c8664;
+  --base: #e8590c; --ship: #1098ad; --caps: #845ef7; --ideal: #e3ecef;
+  --good: #51cf66; --warn: #ffa94d; color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font: 16px/1.55 var(--f-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 32px 64px }
+main { max-width: 980px; margin: 0 auto; display: grid; gap: 40px }
+.prose { max-width: 68ch }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; letter-spacing: .005em }
+h1 { font-size: clamp(2rem, 5vw, 2.9rem); font-weight: 700; line-height: 1.05 }
+h2 { font-size: 1.55rem; font-weight: 600; margin-bottom: 8px }
+h3 { font-size: 1.15rem; font-weight: 600 }
+p { margin: 0 0 12px }
+.eyebrow { font: 500 .78rem var(--f-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted) }
+.lede { font-size: 1.12rem; max-width: 64ch }
+section { display: grid; gap: 14px; min-width: 0 }
+.answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px }
+.answer { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 18px; display: grid; gap: 6px; align-content: start }
+.answer .verdict { font: 600 1.25rem var(--f-display) }
+.answer p { margin: 0; color: var(--muted); font-size: .95rem }
+.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap }
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; background: var(--panel) }
+table { border-collapse: collapse; width: 100%; font-size: .9rem }
+th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top }
+th { font: 600 .74rem var(--f-mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: var(--bg) }
+td.r, th.r { text-align: right }
+tbody tr:last-child td { border-bottom: 0 }
+tr.ship td { background: color-mix(in srgb, var(--ship) 9%, transparent) }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: .9rem; color: var(--muted) }
+.legend span { display: inline-flex; align-items: center; gap: 7px }
+.sw { width: 22px; height: 0; border-top: 2.5px solid currentColor; display: inline-block }
+.sw.dash { border-top-style: dashed }
+.sw.dot { border-top: 2px dotted var(--ideal) }
+.sw.fill { height: 10px; border: 1px solid var(--seabed-edge); background: var(--seabed) }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 18px }
+@media (max-width: 480px) { .charts { grid-template-columns: 1fr } }
+figure { margin: 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 12px 10px; min-width: 0; position: relative }
+figcaption { font-size: .88rem; color: var(--muted); margin-top: 6px }
+figure h3 { margin-bottom: 4px }
+svg.chart { width: 100%; height: auto; display: block; touch-action: pan-y }
+svg text { font: 11px var(--f-mono); fill: var(--muted) }
+.tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; padding: 6px 8px; font: 12px/1.45 var(--f-mono); color: var(--fg); box-shadow: 0 4px 14px rgb(0 0 0 / .12); min-width: 150px }
+.tip b { font-weight: 500 }
+.tip i { font-style: normal; display: inline-block; width: 9px; height: 3px; margin-right: 6px; vertical-align: middle }
+.facts td:first-child { width: 34% }
+.old { color: var(--muted); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--warn) 70%, transparent) }
+.tag { display: inline-block; font: 500 .7rem var(--f-mono); letter-spacing: .04em; padding: 1px 6px; border-radius: 3px; border: 1px solid currentColor }
+.tag.on { color: var(--good) } .tag.ask { color: var(--warn) }
+code { font: .88em var(--f-mono); background: color-mix(in srgb, var(--rule) 45%, transparent); padding: 1px 4px; border-radius: 3px }
+ul { margin: 0; padding-left: 1.2em } li { margin-bottom: 6px }
+footer { color: var(--muted); font-size: .85rem }
+</style>
+
+<main>
+<header class="prose" style="display:grid;gap:10px">
+  <div class="eyebrow">SubReels towfish · SURF TRACK · simulator study 8 Nov 2026</div>
+  <h1>Towfish Bottom Following</h1>
+  <p class="lede">Does SURF TRACK keep the towfish 4 m above the seabed? Tested on a 6 → 3 → 6 m slope and over a coral head, on the 8 m and 25 m Kevlar tethers. The vertical rates come from the 4 Nov logs and the sim. Every run tows a straight line at 1 m/s through ArduSub SITL and the extension's own code.</p>
+</header>
+
+<section>
+  <div class="answers">
+    <div class="answer"><span class="eyebrow">Coral head, 3 m high</span><span class="verdict">Yes, it dodges</span><p>As shipped now: <span class="num" id="a-coral"></span> clear over the top. Without action the fish would clear it by about 1.2 m. It starts climbing 6 m before the head on the 8 m tether and 22 m before on the 25 m.</p></div>
+    <div class="answer"><span class="eyebrow">Slope 6 → 3 → 6 m</span><span class="verdict">Follows it and comes back down</span><p>Median altitude error <span class="num" id="a-slope"></span> where 4 m is possible. Over the 3 m patch it drives at about 0.6 m. Before the fixes it rode 0.55 m shallow and never got back to 2 m.</p></div>
+    <div class="answer"><span class="eyebrow">Roll</span><span class="verdict">Level throughout</span><p>Peak roll under 5.1° in every terrain run, no auto-righting rescues. Straight lines only; turns were the earlier studies.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>Seabed profiles</h2>
+  <p class="prose">Distance is along the boat's track from where the boat was at the start, so the fish meets each feature one layback after the boat. Depth reads downward. The dotted line is the ideal: seabed minus 4 m, kept between 0.5 m (SURF TRACK's surface limit) and its 5 m depth ceiling. Hover or touch a chart for values.</p>
+  <div class="legend" aria-label="Chart legend">
+    <span><i class="sw fill"></i>Seabed</span>
+    <span><i class="sw dot"></i>Ideal depth (4 m above)</span>
+    <span style="color:var(--base)"><i class="sw"></i><span style="color:var(--muted)">Before (4 Nov code)</span></span>
+    <span style="color:var(--ship)"><i class="sw"></i><span style="color:var(--muted)">As shipped now</span></span>
+    <span style="color:var(--caps)"><i class="sw dash"></i><span style="color:var(--muted)">Shipped + pilot speed caps 40/30</span></span>
+  </div>
+  <div class="charts" id="charts"></div>
+</section>
+
+<section>
+  <h2>What changed in SURF TRACK</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Change</th><th>Why (measured)</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Stick commands start at the edge of ArduSub's 100 µs dead zone (<code>surf_stick_skip_deadzone</code>)</td><td>SURF TRACK scaled the stick from 1500, so any error under about 1 m asked for 1400–1600 µs and ALT_HOLD ignored it. The fish rode a median 0.55 m shallow and stalled 0.5 m short of 2 m after the shallow patch.</td><td><span class="tag on">default on</span></td></tr>
+      <tr><td>Look-ahead uses the shallowest sounding between fish and boat (<code>surf_lookahead</code>)</td><td>With the newest sounding, the commanded depth heads back down once the <em>boat</em> has passed the head. On the 25 m tether that is 22 s before the fish gets there. With the stick fix alone, clearance fell to 1.6 m. With both: 3.4 m.</td><td><span class="tag on">default on</span></td></tr>
+      <tr><td>Dives back after SURF TRACK parked the fish at the surface (<code>surf_resume_from_surface</code>)</td><td>The <code>at_surface</code> hold had no exit. Whether the fish left the surface depended on ALT_HOLD drifting it below 0.5 m (12.6 s stuck in one run).</td><td><span class="tag on">default on</span></td></tr>
+      <tr><td>Jog up default 1600 → 1800</td><td>1600 is the dead-zone edge: no climb at all. Coral head on the 8 m tether at 1600: 1.44 m clearance against 2.23 m at 1800 (both with the 4 Nov code).</td><td><span class="tag on">default</span></td></tr>
+      <tr><td>Commanded-depth slew stays at 0.4 m/s up, 0.15 m/s down</td><td>Tried at the achieved rates (0.18 up / 0.09 down). The stick then reached full deflection later and clearance on the 8 m tether fell from 2.37 to 1.88 m. The commanded depth leading the fish is useful.</td><td><span class="tag on">kept</span></td></tr>
+      <tr><td><code>PILOT_SPEED_UP</code>/<code>DN</code> 25/20 → 40/30 cm/s</td><td>Climb and dive scale with the cap, not the wings. At 40/30: coral clearance on the 8 m tether 2.83 m (vs 2.37), no added roll in any run. It's a managed autopilot parameter, so it's your call.</td><td><span class="tag ask">recommend · not applied</span></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Vertical rates</h2>
+  <p class="prose">Measured, not assumed. Sim runs fly scripted stick steps in ALT_HOLD on the Kevlar tether with the weight under the tube. They show that ALT_HOLD's pilot-speed cap sets the rate. Boat speed (0.8–1.2 m/s) changes it by under 0.04 m/s. Negative is climb; m/s.</p>
+  <div class="tablewrap"><table id="rates"></table></div>
+  <p class="prose" style="font-size:.92rem;color:var(--muted)">4 Nov fish log, ALT_HOLD at about 1 m/s with caps 25/20: clean full-up climbs 0.16–0.25 m/s, full-down dives 0.04–0.15 m/s, matching the sim. The physical limit sits above the caps: dives at 0.2–0.49 m/s in STABILIZE, and ALT_HOLD at the 60/40 caps climbed about 0.6 m/s. The sim's STABILIZE climbs measured nothing, because the fish had floated to the surface before the up steps.</p>
+</section>
+
+<section>
+  <h2>Facts corrected</h2>
+  <div class="tablewrap"><table class="facts">
+    <thead><tr><th>Item</th><th>Was</th><th>Measured</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Ping update rate</td><td class="old">2.8 Hz</td><td>~5.2 Hz new values (median gap 0.14 s, p95 0.42 s, gaps to 4.5 s)</td><td>Boat log RFND; RNGFND1_TYPE 10 makes it the driver's own DISTANCE_SENSOR</td></tr>
+      <tr><td>Extension's Ping sampler (4 Hz)</td><td class="old">"never misses a publication"</td><td>Sees about 56% of packets. Harmless for control; comment corrected.</td><td>Ping model replaying the logged schedule</td></tr>
+      <tr><td>Low-quality soundings</td><td>sim replayed DPTH, garbage included</td><td>78–98 m garbage at quality &lt; 90. The extension's gate dropped all of it over an hour of replay (max accepted 13.6 m).</td><td>Bridge now feeds the real <code>SonarHistory</code> from RFND</td></tr>
+      <tr><td>Pilot speed caps flown</td><td class="old">100 / 0 (mission 241)</td><td>25 / 20 cm/s on 4 Nov</td><td>Fish log PARM</td></tr>
+      <tr><td>Achieved climb at jog 1800</td><td>assumed ≈ cap</td><td>~0.18 m/s (cap 0.25)</td><td>Sim rates study, log agrees</td></tr>
+      <tr><td>Boat RNGFND1_MAX</td><td class="old">10 m</td><td>50 m</td><td>Boat log PARM</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Every terrain run</h2>
+  <div class="tablewrap"><table id="runs"></table></div>
+  <p class="prose" style="font-size:.9rem;color:var(--muted)">Clearance is seabed minus fish depth at the fish's centre of gravity. Repeat runs with a different Ping packet schedule agreed to 0.02 m, so most variants ran once.</p>
+</section>
+
+<section class="prose">
+  <h2>Assumptions and limits</h2>
+  <ul>
+    <li>Straight tows at 1 m/s in still water. The slope and coral head sit on the track; a head off to one side is seen later or not at all.</li>
+    <li>Ping beam 30° (datasheet), first return, transducer at the boat's tow point. In the model the beam sees the head about 2 m before the boat is over its base.</li>
+    <li>Ping timing and dropouts replay the 4 Nov log packet by packet; good readings get 5 mm of noise.</li>
+    <li>Tow delay comes from the extension's drag position model with the tether length set. With the tether length at 0, the old fixed offset is used.</li>
+    <li>Clearance is measured at the fish's CG. The tow bar and wings extend about 0.15 m below it.</li>
+  </ul>
+</section>
+
+<footer>Runs: <code>Simulator/analysis/sweep.py rates | bottom</code> · scoring <code>analysis/bottom_follow.py</code> · log rates <code>analysis/rates_from_log.py</code> · terrain and Ping model <code>towsim/terrain.py</code></footer>
+</main>
+
+<script>
+const DATA = /*DATA*/null;
+const fmt = (v, d = 2) => v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(d);
+const pick = (t, L, v) => DATA.bottom.find(r => r.terrain === t && r.L === L && r.variant === v && r.rep === 1);
+
+document.getElementById("a-coral").textContent =
+  `${fmt(pick("coral", 8, "all").score.clearance_over_head_min_m, 1)} m (8 m tether) and ${fmt(pick("coral", 25, "all").score.clearance_over_head_min_m, 1)} m (25 m)`;
+document.getElementById("a-slope").textContent =
+  `${fmt(pick("slope", 8, "all").score.alt_err_med_m, 2)} m / ${fmt(pick("slope", 25, "all").score.alt_err_med_m, 2)} m`;
+
+// ---- charts -------------------------------------------------------------
+const SERIES = [
+  { v: "base", name: "Before", color: "var(--base)", dash: "" },
+  { v: "all", name: "Shipped", color: "var(--ship)", dash: "" },
+  { v: "all_ps40", name: "Caps 40/30", color: "var(--caps)", dash: "6 4" },
+];
+const CHARTS = [
+  { t: "slope", L: 8, x0: -10, x1: 320, y1: 6.5, title: "Slope, 8 m tether" },
+  { t: "slope", L: 25, x0: -25, x1: 320, y1: 6.5, title: "Slope, 25 m tether" },
+  { t: "coral", L: 8, x0: 110, x1: 200, y1: 7.5, title: "Coral head, 8 m tether" },
+  { t: "coral", L: 25, x0: 110, x1: 200, y1: 7.5, title: "Coral head, 25 m tether" },
+];
+const NS = "http://www.w3.org/2000/svg";
+const el = (n, a = {}) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+const ideal = b => Math.min(5, Math.max(0.5, b - 4));
+
+function chart(cfg) {
+  const W = 520, H = 280, m = { l: 40, r: 12, t: 10, b: 30 };
+  const X = s => m.l + (s - cfg.x0) / (cfg.x1 - cfg.x0) * (W - m.l - m.r);
+  const Y = z => m.t + z / cfg.y1 * (H - m.t - m.b);
+  const fig = document.createElement("figure");
+  const h = document.createElement("h3"); h.textContent = cfg.title; fig.append(h);
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img",
+    "aria-label": `${cfg.title}: seabed, ideal depth and fish depth against distance along the track` });
+  svg.append(el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "var(--water)" }));
+  // grid + axes
+  for (let z = 0; z <= cfg.y1; z += 1) {
+    svg.append(el("line", { x1: m.l, x2: W - m.r, y1: Y(z), y2: Y(z), stroke: "var(--rule)", "stroke-width": 1 }));
+    const tx = el("text", { x: m.l - 6, y: Y(z) + 4, "text-anchor": "end" }); tx.textContent = z; svg.append(tx);
+  }
+  const step = cfg.x1 - cfg.x0 > 150 ? 50 : 20;
+  for (let s = Math.ceil(cfg.x0 / step) * step; s <= cfg.x1; s += step) {
+    const tx = el("text", { x: X(s), y: H - m.b + 15, "text-anchor": "middle" }); tx.textContent = s; svg.append(tx);
+  }
+  const xl = el("text", { x: W - m.r, y: H - 3, "text-anchor": "end" }); xl.textContent = "metres along track"; svg.append(xl);
+  const yl = el("text", { x: 4, y: m.t + 9 }); yl.textContent = "m"; svg.append(yl);
+  // seabed
+  const T = DATA.terrain, bs = T[cfg.t];
+  const pts = []; const ip = [];
+  T.s.forEach((s, i) => { if (s >= cfg.x0 && s <= cfg.x1) { pts.push(`${X(s).toFixed(1)},${Y(bs[i]).toFixed(1)}`); ip.push(`${X(s).toFixed(1)},${Y(ideal(bs[i])).toFixed(1)}`); } });
+  svg.append(el("polygon", { points: `${X(cfg.x0)},${Y(cfg.y1)} ${pts.join(" ")} ${X(cfg.x1)},${Y(cfg.y1)}`, fill: "var(--seabed)", stroke: "var(--seabed-edge)", "stroke-width": 1.2 }));
+  svg.append(el("polyline", { points: ip.join(" "), fill: "none", stroke: "var(--ideal)", "stroke-width": 1.5, "stroke-dasharray": "1.5 3.5", opacity: .7 }));
+  // fish
+  const runs = SERIES.map(S => ({ S, r: pick(cfg.t, cfg.L, S.v) })).filter(o => o.r && o.r.profile);
+  for (const { S, r } of runs) {
+    const p = r.profile, P = [];
+    p.s.forEach((s, i) => { if (s >= cfg.x0 && s <= cfg.x1) P.push(`${X(s).toFixed(1)},${Y(p.depth[i]).toFixed(1)}`); });
+    svg.append(el("polyline", { points: P.join(" "), fill: "none", stroke: S.color, "stroke-width": 2, "stroke-dasharray": S.dash, "stroke-linejoin": "round" }));
+  }
+  // hover
+  const cross = el("line", { y1: m.t, y2: H - m.b, stroke: "var(--muted)", "stroke-width": 1, visibility: "hidden" });
+  svg.append(cross);
+  const hit = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" });
+  svg.append(hit);
+  fig.append(svg);
+  const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true; fig.append(tip);
+  const near = (arr, s) => { let lo = 0, hi = arr.length - 1; while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < s) lo = mid + 1; else hi = mid; } return lo; };
+  const move = ev => {
+    const r = svg.getBoundingClientRect();
+    const px = (ev.clientX - r.left) / r.width * W;
+    const s = cfg.x0 + (px - m.l) / (W - m.l - m.r) * (cfg.x1 - cfg.x0);
+    if (s < cfg.x0 || s > cfg.x1) return;
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    const b = bs[near(T.s, s)];
+    let html = `<b>${s.toFixed(0)} m</b> · seabed ${b.toFixed(1)} m<br><span style="color:var(--muted)">ideal ${ideal(b).toFixed(1)} m</span>`;
+    for (const { S, r: run } of runs) {
+      const i = near(run.profile.s, s);
+      html += `<br><i style="background:${S.color}"></i>${S.name} ${run.profile.depth[i].toFixed(2)} m · clear ${run.profile.alt[i].toFixed(1)}`;
+    }
+    tip.innerHTML = html; tip.hidden = false;
+    const fr = fig.getBoundingClientRect();
+    let left = ev.clientX - fr.left + 14; if (left > fr.width - 200) left = ev.clientX - fr.left - 210;
+    tip.style.left = Math.max(4, left) + "px"; tip.style.top = (ev.clientY - fr.top + 12) + "px";
+  };
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+  const cap = document.createElement("figcaption");
+  const sc = v => (pick(cfg.t, cfg.L, v) || {}).score || {};
+  cap.textContent = cfg.t === "coral"
+    ? `Clearance over the head: before ${fmt(sc("base").clearance_over_head_min_m, 2)} m, shipped ${fmt(sc("all").clearance_over_head_min_m, 2)} m, caps 40/30 ${fmt(sc("all_ps40").clearance_over_head_min_m, 2)} m.`
+    : `Median altitude error: before ${fmt(sc("base").alt_err_med_m)} m, shipped ${fmt(sc("all").alt_err_med_m)} m. Back to 2 m after the shallow patch: before ${sc("base").dive_back}, shipped ${sc("all").dive_back}.`;
+  fig.append(cap);
+  return fig;
+}
+const host = document.getElementById("charts");
+CHARTS.forEach(c => host.append(chart(c)));
+
+// ---- rates table --------------------------------------------------------
+(() => {
+  const sticks = [1700, 1800, 1900, 1300, 1200];
+  const rows = DATA.sim_rates.filter(r => r.mode === "alt_hold" && r.v === 1.0)
+    .sort((a, b) => a.cap.localeCompare(b.cap, undefined, { numeric: true }) || a.L - b.L);
+  let h = `<thead><tr><th>Caps up/down (cm/s)</th><th>Tether</th>${sticks.map(s => `<th class="r">stick ${s}</th>`).join("")}<th class="r">peak roll</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    const get = p => (r.score.steps.find(s => s.pwm === p) || {}).rate_mps;
+    const ship = r.cap === "25_20";
+    h += `<tr class="${ship ? "ship" : ""}"><td>${r.cap.replace("_", " / ")}${ship ? " (flown)" : ""}</td><td class="num">${r.L} m</td>${sticks.map(p => `<td class="r num">${fmt(get(p))}</td>`).join("")}<td class="r num">${fmt(r.score.roll_peak_deg, 0)}°</td></tr>`;
+  }
+  document.getElementById("rates").innerHTML = h + "</tbody>";
+})();
+
+// ---- runs table ---------------------------------------------------------
+(() => {
+  const NAMES = { base: "Before (4 Nov code)", jog1600: "Before, jog up 1600", look: "Look-ahead only", dz: "Stick fix only",
+    all: "As shipped (all three)", all_slew: "Shipped, slew at achieved rates", all_ps40: "Shipped + caps 40/30" };
+  const order = ["base", "jog1600", "look", "dz", "all", "all_slew", "all_ps40"];
+  const rows = DATA.bottom.filter(r => r.rep === 1).sort((a, b) =>
+    a.terrain.localeCompare(b.terrain) || a.L - b.L || order.indexOf(a.variant) - order.indexOf(b.variant));
+  let h = `<thead><tr><th>Terrain</th><th>Tether</th><th>Variant</th><th class="r">min clearance</th><th class="r">alt. error median</th><th class="r">p95</th><th>back to depth</th><th class="r">depth over head</th><th class="r">peak roll</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    const s = r.score, slope = r.terrain === "slope";
+    const back = slope ? (s.dive_back === "yes" ? `yes, ${fmt(s.dive_back_s, 0)} s` : "no")
+      : (s.depth_regained_s != null ? `${fmt(s.depth_regained_s, 0)} s` : "not within 0.3 m");
+    h += `<tr class="${r.variant === "all" ? "ship" : ""}"><td>${r.terrain}</td><td class="num">${r.L} m</td><td>${NAMES[r.variant] || r.variant}</td>
+      <td class="r num">${fmt(s.min_clearance_m)} m</td><td class="r num">${slope ? fmt(s.alt_err_med_m) + " m" : "–"}</td><td class="r num">${slope ? fmt(s.alt_err_p95_abs_m) + " m" : "–"}</td>
+      <td>${back}</td><td class="r num">${slope ? "–" : fmt(s.depth_over_head_max_m) + " m"}</td><td class="r num">${fmt(s.max_roll_deg, 1)}°</td></tr>`;
+  }
+  document.getElementById("runs").innerHTML = h + "</tbody>";
+})();
+</script>

@@ -917,10 +917,162 @@ def study_inx_turns(args) -> None:
     run_batch(jobs)
 
 
+# -- RATES: climb and dive the fish can actually do (owner, 8 Nov) --------
+# Straight tows with a scripted vertical stick, so the rate is measured
+# rather than assumed. STABILIZE shows the wing's own limit (the stick is
+# the collective); ALT_HOLD shows what the depth controller delivers at
+# each stick and pilot speed cap. Up and down steps alternate so the fish
+# stays inside the tether's depth range. No extension: nothing rescues.
+RATE_STEPS = {
+    "alt_hold": [(1500, 0), (1700, 40), (1500, 52), (1300, 70), (1500, 90),
+                 (1800, 110), (1500, 122), (1200, 140), (1500, 162), (1900, 182),
+                 (1500, 192), (1100, 210), (1500, 232), (2000, 252), (1500, 260),
+                 (1000, 278), (1500, 298)],
+    "stabilize": [(1500, 0), (1700, 30), (1500, 38), (1300, 56), (1500, 66),
+                  (1900, 84), (1500, 90), (1100, 108), (1500, 116), (1500, 134)],
+}
+RATE_CAPS = {"25_20": "params/scenarios/roll_p_1_5.parm",
+             "40_30": "params/scenarios/roll_p_1_5_ps40_30.parm",
+             "60_40": "params/scenarios/roll_p_1_5_ps60_40.parm",
+             "100_60": "params/scenarios/roll_p_1_5_ps100_60.parm"}
+RATE_INIT_DEPTH = {8: 3.0, 25: 5.0}
+
+
+def score_rates(run: Path) -> dict:
+    """One row per stick step: rate fitted after a 2 s settle (+ = deeper),
+    the fastest 3 s rate inside it, depth range and peak roll."""
+    rows = list(csv.DictReader(open(run / "truth.csv")))
+    rows = [r for r in rows if r.get("jig", "0") == "0"]
+    t = np.array([float(r["t_sim"]) for r in rows])
+    z = np.array([float(r["depth"]) for r in rows])
+    roll = np.array([float(r["roll"]) for r in rows])
+    rc3 = np.array([int(float(r["rc3"])) for r in rows])
+    s5 = np.array([float(r["servo5"]) for r in rows])
+    s6 = np.array([float(r["servo6"]) for r in rows])
+    coll = ((s5 - 1500) + (1500 - s6)) / 2
+    steps = []
+    i = 0
+    while i < len(t):
+        j = i
+        while j < len(t) and rc3[j] == rc3[i]:
+            j += 1
+        if rc3[i] != 1500 and t[j - 1] - t[i] >= 4:
+            m = slice(i, j)
+            tt, zz = t[m], z[m]
+            k = tt >= tt[0] + 2.0
+            rate = float(np.polyfit(tt[k], zz[k], 1)[0]) if k.sum() > 5 else float("nan")
+            peak = 0.0
+            for a in range(len(tt)):
+                b = np.searchsorted(tt, tt[a] + 3.0)
+                if b < len(tt):
+                    r = (zz[b] - zz[a]) / (tt[b] - tt[a])
+                    if abs(r) > abs(peak):
+                        peak = r
+            steps.append({"pwm": int(rc3[i]), "dur_s": round(float(tt[-1] - tt[0]), 1),
+                          "rate_mps": round(rate, 3), "peak3_mps": round(float(peak), 3),
+                          "depth_start": round(float(zz[0]), 2), "depth_end": round(float(zz[-1]), 2),
+                          "depth_min": round(float(zz.min()), 2), "depth_max": round(float(zz.max()), 2),
+                          "coll_med_us": round(float(np.median(coll[m])), 0),
+                          "coll_p95_us": round(float(np.percentile(np.abs(coll[m]), 95)), 0),
+                          "roll_peak_deg": round(float(np.abs(roll[m]).max()), 1)})
+        i = j
+    return {"steps": steps, "roll_peak_deg": round(float(np.abs(roll).max()), 1),
+            "depth_min": round(float(z.min()), 2), "depth_max": round(float(z.max()), 2)}
+
+
+def rates_job(L, v, mode, cap="25_20", depth=None, rep=1):
+    D = depth if depth is not None else RATE_INIT_DEPTH[L]
+    prog = RATE_STEPS[mode]
+    end_s = prog[-1][1] + 20
+    rid = f"sw_RT_{mode[:2]}_L{L:g}_V{v:g}_C{cap}_D{D:g}".replace(".", "p")
+    if rep > 1:
+        rid += f"_r{rep}"
+    seg = int(round(L))
+    sets, g = _geometry_sets(*RECIPES["under"])
+    end = 10 * 3600 + 31 * 60 + 30 + end_s
+    argv = ["--start", "10:31:30", "--end", f"{end // 3600}:{end % 3600 // 60:02d}:{end % 60:02d}",
+            "--straight", str(v),
+            "--init-depth", str(D), "--warmup", str(round(15 + D / 0.3 + 40)),
+            "--param-file", RATE_CAPS[cap],
+            "--stick-steps", ",".join(f"{p}@{s}" for p, s in prog), "--stick-mode", mode,
+            "--set", f"cable.length={L}", "--set", f"cable.segments={seg}",
+            "--set", "cable.model=inextensible", *sets]
+    return (rid, argv, score_rates, {"study": "rates", "L": L, "v": v, "mode": mode,
+                                     "cap": cap, "D": D, "rep": rep})
+
+
+def study_rates(args) -> None:
+    jobs = [rates_job(L, v, "stabilize") for L in (8, 25) for v in (0.8, 1.0, 1.2)]
+    jobs += [rates_job(L, v, "alt_hold", cap) for L in (8, 25) for v in (0.8, 1.0, 1.2)
+             for cap in (args.caps or ("25_20", "40_30", "60_40"))]
+    run_batch(jobs)
+
+
+# -- BOTTOM: does SURF TRACK follow the seabed? (owner, 8 Nov) ------------
+# Straight 1 m/s tows over towsim/terrain.py's slope (6 -> 3 -> 6 m) and
+# coral head (7 m bottom, 3 m high, 5 m across), Kevlar tether, weight
+# under the tube, the shipped extension with the tether length set so the
+# position model and its tow delay are live. Variants are --ext-set
+# overrides of app/main.py names, so a fix is tried before it is coded.
+BOTTOM = {"slope": {"init": 2.0, "dur": 360}, "coral": {"init": 3.0, "dur": 260}}
+
+
+def score_bottom(run: Path) -> dict:
+    from analysis.bottom_follow import score
+    return score(run)
+
+
+def bottom_job(terrain, L, variant="base", ext=(), rep=1):
+    b = BOTTOM[terrain]
+    seg = int(round(L))
+    sets, _ = _geometry_sets(*RECIPES["under"])
+    end = 10 * 3600 + 31 * 60 + 30 + b["dur"] + int(L)
+    rid = f"sw_BF_{terrain}_L{L:g}_{variant}" + (f"_r{rep}" if rep > 1 else "")
+    argv = ["--start", "10:31:30", "--end", f"{end // 3600}:{end % 3600 // 60:02d}:{end % 60:02d}",
+            "--straight", "1.0", "--terrain", terrain, "--ping-seed", str(rep),
+            "--init-depth", str(b["init"]), "--warmup", str(round(15 + b["init"] / 0.3 + 40)),
+            "--extension", *ROLL_P, "--log-cable",
+            "--set", f"cable.length={L}", "--set", f"cable.segments={seg}",
+            "--set", "cable.model=inextensible", *sets,
+            "--ext-set", f"tether_length_m={float(L)}"]
+    for kv in ext:
+        argv += ["--ext-set", kv]
+    if variant in BOTTOM_PARAMS:
+        argv[argv.index(ROLL_P[1])] = BOTTOM_PARAMS[variant]
+    return (rid, argv, score_bottom, {"study": "bottom", "terrain": terrain, "L": L,
+                                      "variant": variant, "ext": list(ext), "rep": rep})
+
+
+BOTTOM_VARIANTS = {
+    "base": (),
+    "look": ("surf_lookahead=shallowest",),
+    "resume": ("surf_resume_from_surface=true",),
+    "dz": ("surf_stick_skip_deadzone=true",),
+    "all": ("surf_lookahead=shallowest", "surf_resume_from_surface=true",
+            "surf_stick_skip_deadzone=true"),
+}
+# Commanded-depth slew matched to what the shipped caps achieve at the
+# jog PWMs (rates study: ~0.18 m/s up at 1800, ~0.09 m/s down at 1300).
+BOTTOM_VARIANTS["all_slew"] = BOTTOM_VARIANTS["all"] + (
+    "SURF_TARGET_SLEW_UP_MPS=0.18", "SURF_TARGET_SLEW_DOWN_MPS=0.09")
+# Variants flown with a different scenario .parm (pilot speed caps).
+BOTTOM_PARAMS = {"all_ps40": RATE_CAPS["40_30"]}
+BOTTOM_VARIANTS["all_ps40"] = BOTTOM_VARIANTS["all"]
+
+
+def study_bottom(args) -> None:
+    names = args.variants or ["base"]
+    jobs = [bottom_job(tr, L, n, BOTTOM_VARIANTS[n], r) for n in names
+            for tr in ("slope", "coral") for L in (8, 25) for r in range(1, args.reps + 1)]
+    if "base" in names:
+        jobs.append(bottom_job("coral", 8, "jog1600", ("jog_up_pwm=1600",)))
+    run_batch(jobs)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("study", choices=["righting", "early", "maxdepth", "fixed", "spacing", "grid", "rescore-grid", "steady", "dz0", "jog", "dt", "dzsel", "towpt", "ballast", "geometry", "recipe", "recipe-spacing", "inx-hold", "inx-turns", "rank"])
+    ap.add_argument("study", choices=["righting", "early", "maxdepth", "fixed", "spacing", "grid", "rescore-grid", "steady", "dz0", "jog", "dt", "dzsel", "towpt", "ballast", "geometry", "recipe", "recipe-spacing", "inx-hold", "inx-turns", "rates", "bottom", "rank"])
     ap.add_argument("--vertical-pwm", type=int, default=1900)
     ap.add_argument("--roll-min-depth", type=float, default=0.0)
     ap.add_argument("--descent-start", type=float, default=0.0)
@@ -928,13 +1080,15 @@ def main(argv=None) -> int:
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--recipes", nargs="*", help="recipe study: names from RECIPES")
     ap.add_argument("--recipe", default="today", help="recipe-spacing: which recipe")
+    ap.add_argument("--variants", nargs="*", help="bottom: names from BOTTOM_VARIANTS")
+    ap.add_argument("--caps", nargs="*", help="rates: pilot speed caps from RATE_CAPS")
     ap.add_argument("--reps", type=int, default=2, help="runs per recipe and track (righting)")
     args = ap.parse_args(argv)
     global WORKERS
     WORKERS = args.workers
     {"righting": study_righting, "early": study_early, "grid": study_grid, "rescore-grid": rescore_grid, "steady": study_steady, "dz0": study_dz0, "jog": study_jog, "dt": study_dt, "dzsel": study_dzsel, "towpt": study_towpt, "ballast": study_ballast, "geometry": study_geometry, "recipe": study_recipe,
      "recipe-spacing": study_recipe_spacing, "inx-hold": study_inx_hold,
-     "inx-turns": study_inx_turns, "fixed": study_fixed,
+     "inx-turns": study_inx_turns, "rates": study_rates, "bottom": study_bottom, "fixed": study_fixed,
      "maxdepth": study_maxdepth,
      "spacing": study_spacing, "rank": lambda a: print(rank_righting())}[args.study](args)
     return 0

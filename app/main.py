@@ -261,7 +261,11 @@ ALTITUDE_OFFSET_MAX_M = 5.0
 # authority for the automatic surf-track loop -- the arrows and the loop
 # would push the stick with different force. Persisting them here makes
 # one number govern both. Bounds match the widget's existing clampJog().
-DEFAULT_JOG_UP_PWM = Z_PWM_ASCEND
+# 1800, as flown on 4 Nov (RCIN), not Z_PWM_ASCEND (1600): 1600 is the
+# edge of the THR_DZ = 100 us deadzone, so a 1600 jog -- and every SURF
+# TRACK up command scaled toward it -- asked ALT_HOLD for no climb at all.
+# In simulation (8 Nov rates study) 1800 climbs ~0.18 m/s at 1 m/s tow.
+DEFAULT_JOG_UP_PWM = 1800
 # 1300, as flown on 4 Nov, not Z_PWM_DESCEND (1400): ArduSub ignores the
 # THR_DZ = 100 us either side of 1500, so a 1400 jog -- and every SURF
 # TRACK down command scaled toward it -- never left the deadzone.
@@ -277,8 +281,10 @@ JOG_DOWN_PWM_MAX = Z_PWM_NEUTRAL - 1  # 1499: never let "down" cross neutral
 # whenever the bottom slopes, so soundings are buffered and replayed at
 # the tow delay (layback / boat speed).
 _SONAR_HISTORY_S = 120.0        # ring buffer span
-# Sample at 4 Hz so we never miss a publication from the 2.8 Hz Ping1D
-# driver (period ~0.36 s). Duplicates are cheap after the ``last_update``
+# The Ping1D driver published ~5.2 new soundings a second on 4 Nov (boat
+# log RFND, RNGFND1_TYPE 10 = the driver's DISTANCE_SENSOR: median gap
+# 0.14 s, p95 0.42 s). Sampling at 4 Hz therefore misses some of them;
+# the dedup below makes a faster sampler cheap. Duplicates are cheap after the ``last_update``
 # dedup in :meth:`SonarHistory._classify_sample`; missing samples are
 # not, because a sub-Nyquist sampler on the terrain feed shows up as
 # stale sonar in the surf-track loop.
@@ -360,6 +366,14 @@ SURF_MIN_FRAC = 0.08
 # up-slew can be faster since recovering altitude is not authority-
 # bound. Both are per-second so the 10 Hz tick and any future
 # refactor to a different period produce the same trajectory.
+#
+# Measured (8 Nov): at PILOT_SPEED_UP/DN 25/20 the fish achieves ~0.18
+# m/s up at a 1800 jog and ~0.09 m/s down at 1300 (simulator rates
+# study; the 4 Nov log's ALT_HOLD climbs/dives agree at 0.16-0.25 up,
+# 0.04-0.15 down); at the 40/30 now managed, ~0.29 up and ~0.14 down. So the commanded depth deliberately runs ahead of the
+# fish -- 0.4 up lets the error, and with it the stick, reach full
+# deflection sooner. Slewing at the achievable rates instead cut the
+# clearance over a 3 m coral head on the 8 m tether from 2.4 to 1.9 m.
 SURF_TARGET_SLEW_DOWN_MPS = 0.15
 SURF_TARGET_SLEW_UP_MPS = 0.4
 # Legacy alias -- kept so existing tests / callers that referenced a
@@ -369,7 +383,7 @@ SURF_TARGET_SLEW_UP_MPS = 0.4
 SURF_TARGET_SLEW_MPS = SURF_TARGET_SLEW_DOWN_MPS
 # 10 Hz tick. Local sensors go faster than this on the fish
 # (``ATTITUDE`` 10 Hz, ``VFR_HUD`` 8 Hz) but the boat's sounding is only
-# ~2.8 Hz, so the terrain half of :meth:`SurfTrackController._tick` is
+# ~5 Hz (4 Nov boat log), so the terrain half of :meth:`SurfTrackController._tick` is
 # gated on a new DISTANCE_SENSOR arriving (via
 # :meth:`SonarHistory.last_update_id`) while the attitude/output half
 # runs every tick. That combination lets us react to a roll excursion
@@ -518,6 +532,41 @@ SURF_OPERATOR_COOLDOWN_S = 2.0
 # loop resumes writing. Debounces a flickering bottom lock so the
 # controller does not chatter on the edge of a bad sample.
 SURF_RESUME_DEBOUNCE_S = 2.0
+# Bottom following (simulator study, 8 Nov: Simulator/analysis/sweep.py
+# "bottom", a 6->3->6 m slope and a 3 m coral head on a 7 m bottom, 8 m
+# and 25 m Kevlar tethers). Each switch can be turned off to fly the
+# behaviour used up to 4 Nov; all three are on because the runs needed
+# all three together.
+#
+# Look-ahead: "newest" steers on the newest sounding (the bottom one
+# layback ahead of the fish). "shallowest" steers on the shallowest
+# sounding the boat took between the fish's position and its own -- the
+# newest one plus everything the fish has not reached yet -- so the fish
+# keeps clear of a coral head until it has actually passed it, instead
+# of heading back down as soon as the boat has. Coral head, 25 m tether:
+# 3.4 m clearance over the head with it, 1.6 m without it once the
+# stick reaches past the dead zone (below).
+surf_lookahead = "shallowest"
+# Extra seconds of history beyond the tow delay, covering the position
+# model's along-path error and the fish's own length.
+SURF_LOOKAHEAD_PAD_S = 2.0
+# Diving back from the surface: once SURF TRACK itself has climbed the
+# fish to the surface because the bottom was too shallow for the target
+# altitude, it resumes when the bottom ahead allows a commanded depth at
+# least this far below SURF_SURFACE_DEPTH_M. A fish that reached the
+# surface any other way still holds there for the operator. Without it
+# the fish left the surface after a shallow patch only if ALT_HOLD
+# happened to drift it below 0.5 m.
+surf_resume_from_surface = True
+SURF_SURFACE_RESUME_MARGIN_M = 0.3
+# Stick mapping: ArduSub ignores RC3 within THR_DZ of 1500 (managed at
+# 100 us), so a proportional command that starts at 1500 does nothing
+# until it clears 1600 / 1400. With this on, the proportional range
+# starts at the edge of that dead zone instead. Slope runs: the fish
+# rode a median 0.55 m shallow of its target without it, and never got
+# back down to 2 m after the shallow patch; ~0.2 m with it.
+surf_stick_skip_deadzone = True
+SURF_STICK_DEADZONE_US = 100
 
 # One-push white-balance loop that runs while the transect monitor is
 # enabled. The operator can flip this off from the widget for scenes
@@ -688,38 +737,43 @@ PARAM_SPECS = [
     # six thrusters that produce torque and thrust at zero forward speed,
     # roughly quadratic in PWM, capable of 1 m/s vertical. The towfish has
     # two wing servos whose lift is linear in deflection until it stalls,
-    # scales with tow speed, and tops out near 0.2 m/s vertical. The
+    # scales with tow speed. Mission 241 suggested it tops out near 0.2
+    # m/s vertical; the 8 Nov simulator rates study found that was the
+    # PILOT_SPEED cap talking, and the wings manage ~0.5-0.6 m/s. Most
     # values here are read off mission 241 rather than guessed -- see
     # tools/rate_envelope.py and tools/expo_check.py.
     {
         "name": "PILOT_SPEED_UP",
         "vehicle": "towfish",
-        "default": 25.0,
+        "default": 40.0,
         "unit": "cm/s",
         "decimals": 0,
         "min": 5.0,
         "max": 200.0,
-        "presets": [15.0, 20.0, 25.0, 40.0],
+        "presets": [25.0, 40.0, 60.0],
         "desc": "Fastest ascent the depth controller may ask for. Stock "
-                "ArduSub ships 100 cm/s, which is a BlueROV2 figure: it "
-                "makes the controller size every command for a vehicle "
-                "five times livelier than this one. Mission 241 sustained "
-                "about 20 cm/s up, and buoyancy helps in that direction.",
+                "ArduSub ships 100 cm/s, a BlueROV2 figure. The fish's "
+                "climb rate is set by this cap, not by its wings: at 25 "
+                "it managed ~0.18 m/s at a 1800 jog (4 Nov log and "
+                "simulator agree), at 40 ~0.29 m/s. 40 gave a coral head "
+                "more clearance in simulation with no added roll; the "
+                "wings could do ~0.6 m/s.",
     },
     {
         "name": "PILOT_SPEED_DN",
         "vehicle": "towfish",
-        "default": 20.0,
+        "default": 30.0,
         "unit": "cm/s",
         "decimals": 0,
         "min": 5.0,
         "max": 200.0,
-        "presets": [10.0, 15.0, 20.0, 30.0],
+        "presets": [20.0, 30.0, 40.0],
         "desc": "Fastest descent the depth controller may ask for. Leaving "
                 "this at 0 does not mean 'unset' -- ArduSub silently falls "
                 "back to PILOT_SPEED_UP, which is how mission 241 ended up "
-                "demanding 1 m/s down from a wing that can manage 0.2 and "
-                "stalls if pushed harder.",
+                "demanding 1 m/s down. At 30 the fish dives ~0.14 m/s at "
+                "a 1300 jog in simulation (0.09 at 20) with no added "
+                "roll.",
     },
     {
         "name": "MOT_THST_EXPO",
@@ -788,9 +842,9 @@ PARAM_SPECS = [
         "presets": [0.5, 1.0, 2.0, 3.0],
         "desc": "Converts depth error into a target vertical speed. The "
                 "stock 3.0 was chosen against a 1 m/s vehicle; paired with "
-                "a 20 cm/s limit it saturates on 7 cm of error, which is "
+                "a 20-30 cm/s limit it saturates on 7-10 cm of error, which is "
                 "bang-bang control on a sensor that sees more wave noise "
-                "than that. 1.0 gives a 20 cm proportional band.",
+                "than that. 1.0 gives a 30-40 cm proportional band.",
     },
     {
         "name": "PSC_JERK_D",
@@ -1437,8 +1491,8 @@ def _tow_mavlink_url(msg_name):
 
 # Sonar source discovery -- see ``_boat_sonar_ids`` below. Held apart
 # from the autopilot cache because the Ping1D publishes DISTANCE_SENSOR
-# faster than the autopilot's echo (2.8 Hz at 1/194 vs 0.97 Hz at 2/1
-# on this rig) and lives on a different (system, component) pair, so
+# faster than the autopilot's echo (~5 Hz of new values at 1/194 on 4 Nov
+# vs ~1 Hz at 2/1) and lives on a different (system, component) pair, so
 # tying them together would force the sonar loop to re-inspect the
 # vehicle tree whenever the autopilot cache expired.
 _SONAR_ID_TTL_S = 60.0  # rarely changes; component-id migrations are rare
@@ -1509,7 +1563,7 @@ def _boat_sonar_ids():
     Falls back to the autopilot's (system, component) when nothing on
     the boat publishes DISTANCE_SENSOR yet -- that path still reads a
     valid rangefinder echo through the autopilot, just at 1 Hz instead
-    of the Ping driver's 2.8 Hz.
+    of the Ping driver's ~5 Hz.
     """
     now = time.monotonic()
     with _sonar_ids_lock:
@@ -1564,12 +1618,12 @@ def _boat_sonar_ids():
 def _sonar_mavlink_url():
     """URL of the fastest DISTANCE_SENSOR publisher on the boat.
 
-    The Ping1D driver on this rig publishes DISTANCE_SENSOR at 2.8 Hz
+    The Ping1D driver on this rig publishes DISTANCE_SENSOR at ~5 Hz
     on ``1/194`` while the ArduRover autopilot echoes the same range at
     ~1 Hz on ``2/1``. Both carry identical ``current_distance`` numbers
     but different ``max_distance`` envelopes -- the raw driver reports
     the sensor's actual 12 m ceiling and the autopilot echo clips to
-    ``RNGFND1_MAX`` (10 m in this vehicle, and 7 m in the field before
+    ``RNGFND1_MAX`` (50 m in the 4 Nov boat log; 7 m in the field before
     that parameter was raised). Reading from the fast publisher stops
     the ring buffer from wasting slots on duplicate soundings and stops
     ``RNGFND1_MAX`` acting as a de facto filter -- the sample gate on
@@ -1752,38 +1806,44 @@ class SonarHistory:
         while not self._stop.is_set():
             t0 = time.monotonic()
             try:
-                snap = get_ping_sonar_snapshot()
-                speed = get_blueboat_speed()
-                now = time.monotonic()
-                accepted, reject = self._classify_sample(snap)
-                with self._lock:
-                    # NaN compares false against itself, which is how a
-                    # bad speed would otherwise slip past the guard and
-                    # poison every subsequent delay.
-                    if isinstance(speed, (int, float)) and speed == speed:
-                        self._speed_ms = float(speed)
-                    if accepted is not None:
-                        distance_m, update_id = accepted
-                        self._samples.append((now, distance_m))
-                        self._last_update_id = update_id
-                        self._rejects_since_ok = 0
-                        self._last_reject_reason = None
-                    elif reject is not None:
-                        # ``reject == "duplicate"`` just means the
-                        # publisher has not produced a new packet yet;
-                        # it is *not* a bottom-lock failure and should
-                        # not be counted against link health.
-                        if reject != "duplicate":
-                            self._rejects_since_ok += 1
-                            self._last_reject_reason = reject
-                    cutoff = now - _SONAR_HISTORY_S
-                    while self._samples and self._samples[0][0] < cutoff:
-                        self._samples.popleft()
+                self.sample_once(get_ping_sonar_snapshot(), get_blueboat_speed())
                 self._last_error = None
             except Exception as e:  # never let the sampler die
                 self._last_error = str(e)
                 logger.debug("Sonar history sample failed: %s", e)
             self._stop.wait(max(0.0, _SONAR_SAMPLE_PERIOD_S - (time.monotonic() - t0)))
+
+    def sample_once(self, snap, speed):
+        """One sampler pass: gate ``snap`` and buffer it, note ``speed``.
+
+        Split out of :meth:`_run` so the simulator can drive the same
+        gate and buffer on its own clock.
+        """
+        now = time.monotonic()
+        accepted, reject = self._classify_sample(snap)
+        with self._lock:
+            # NaN compares false against itself, which is how a
+            # bad speed would otherwise slip past the guard and
+            # poison every subsequent delay.
+            if isinstance(speed, (int, float)) and speed == speed:
+                self._speed_ms = float(speed)
+            if accepted is not None:
+                distance_m, update_id = accepted
+                self._samples.append((now, distance_m))
+                self._last_update_id = update_id
+                self._rejects_since_ok = 0
+                self._last_reject_reason = None
+            elif reject is not None:
+                # ``reject == "duplicate"`` just means the
+                # publisher has not produced a new packet yet;
+                # it is *not* a bottom-lock failure and should
+                # not be counted against link health.
+                if reject != "duplicate":
+                    self._rejects_since_ok += 1
+                    self._last_reject_reason = reject
+            cutoff = now - _SONAR_HISTORY_S
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
 
     def _classify_sample(self, snap):
         """Decide whether ``snap`` should join the ring buffer.
@@ -1897,6 +1957,19 @@ class SonarHistory:
         if age > max_age_s:
             return None
         return (depth, age)
+
+    def shallowest_ahead(self, pad_s=0.0):
+        """Shallowest sounding over the seabed between the fish and the
+        boat: every accepted sample from the last tow delay (+ ``pad_s``),
+        i.e. ground the boat has sounded and the fish has not passed yet.
+        ``None`` without a tow delay or samples."""
+        delay = self.tow_delay_s()
+        if delay is None:
+            return None
+        since = time.monotonic() - delay - pad_s
+        with self._lock:
+            ahead = [d for ts, d in self._samples if ts >= since]
+        return min(ahead) if ahead else None
 
     def latest_speed_ms(self):
         """Last observed boat groundspeed, or ``None`` before the first
@@ -7207,6 +7280,9 @@ class SurfTrackController:
         self._down_since: float | None = None
         # After a stall, down commands are refused until this time.
         self._down_holdoff_until: float | None = None
+        # True once SURF TRACK has climbed the fish to the surface
+        # because the terrain asked for less than SURF_SURFACE_DEPTH_M.
+        self._parked_at_surface = False
         # Which dive gate (if any) refused a down command this tick.
         self._last_down_gate_reason: str | None = None
         # NAMED_VALUE_FLOAT mirror into the fish BIN. Posted from a
@@ -7238,6 +7314,7 @@ class SurfTrackController:
             self._down_holdoff_until = None
             self._stall_track.clear()
             self._last_down_gate_reason = None
+            self._parked_at_surface = False
             self._note("enabled")
         # Open (or re-open) the trace file *before* starting the
         # thread so the very first tick has somewhere to log.
@@ -7281,6 +7358,7 @@ class SurfTrackController:
             self._down_holdoff_until = None
             self._stall_track.clear()
             self._last_down_gate_reason = None
+            self._parked_at_surface = False
             self._note("disabled")
             snap_for_log = self._snapshot_locked()
         self._queue_bin_values(snap_for_log, force=True)
@@ -7354,6 +7432,10 @@ class SurfTrackController:
         bottom_ahead: float | None = None
         if latest is not None:
             bottom_ahead = latest[0]
+            if surf_lookahead == "shallowest":
+                ahead = _sonar_history.shallowest_ahead(SURF_LOOKAHEAD_PAD_S)
+                if ahead is not None:
+                    bottom_ahead = min(bottom_ahead, ahead)
         delayed_bottom = delayed[0] if delayed else None
         reported_altitude: float | None = None
         if (delayed_bottom is not None and fish_depth is not None):
@@ -7370,7 +7452,8 @@ class SurfTrackController:
             reason = "autoright"
         elif fish_depth is None:
             reason = "no_depth"
-        elif fish_depth <= SURF_SURFACE_DEPTH_M:
+        elif (fish_depth <= SURF_SURFACE_DEPTH_M
+              and not self._may_leave_surface(bottom_ahead)):
             reason = "at_surface"
         elif armed is not True:
             reason = "disarmed"
@@ -7504,8 +7587,8 @@ class SurfTrackController:
         * *Terrain half* -- recomputes :data:`_raw_target_depth_m` from
           the sounding, altitude offset and target altitude. Gated on
           ``sounding_id`` differing from the last one we consumed, so
-          at 10 Hz on a 2.8 Hz sounding stream this only fires on
-          roughly one in four ticks.
+          at 10 Hz on a ~5 Hz sounding stream (4 Nov boat log) this
+          fires on roughly every other tick.
         * *Output half* -- slews :data:`_target_depth_m` toward the
           latest raw target at split up/down rates, computes the
           error against :data:`fish_depth`, and drives RC3. Runs
@@ -7551,6 +7634,10 @@ class SurfTrackController:
             self._last_ceiling_limited = clamped < raw_target
             self._raw_target_depth_m = clamped
             self._last_sounding_id = sounding_id
+            if raw_target <= SURF_SURFACE_DEPTH_M:
+                self._parked_at_surface = True
+            elif fish_depth > SURF_SURFACE_DEPTH_M + 1.0:
+                self._parked_at_surface = False
         elif self._raw_target_depth_m is None:
             # First tick after enable, before a sounding has been
             # consumed. Seed from the current sounding without stamping
@@ -7605,12 +7692,15 @@ class SurfTrackController:
         direction = "down" if error > 0 else "up"
         raw_frac = abs(error) / max(surf_full_scale_error_m, 1e-6)
         frac = max(SURF_MIN_FRAC, min(1.0, raw_frac))
+        # Proportional from 1500, or from the edge of ArduSub's stick
+        # dead zone (surf_stick_skip_deadzone), out to the jog PWM.
+        dz = SURF_STICK_DEADZONE_US if surf_stick_skip_deadzone else 0
         if direction == "up":
-            pwm = int(round(Z_PWM_NEUTRAL
-                            + (jog_up_pwm - Z_PWM_NEUTRAL) * frac))
+            span = max(0, jog_up_pwm - Z_PWM_NEUTRAL - dz)
+            pwm = int(round(Z_PWM_NEUTRAL + dz + span * frac))
         else:
-            pwm = int(round(Z_PWM_NEUTRAL
-                            - (Z_PWM_NEUTRAL - jog_down_pwm) * frac))
+            span = max(0, Z_PWM_NEUTRAL - jog_down_pwm - dz)
+            pwm = int(round(Z_PWM_NEUTRAL - dz - span * frac))
         pwm = max(Z_PWM_MIN, min(Z_PWM_MAX, pwm))
         cmd = {"direction": direction, "pwm": pwm,
                "frac": round(frac, 3)}
@@ -7631,6 +7721,16 @@ class SurfTrackController:
             self._down_since = None
             self._stall_track.clear()
         return False, cmd
+
+    def _may_leave_surface(self, bottom_ahead):
+        """True when SURF TRACK parked the fish at the surface itself and
+        the bottom ahead is deep enough again to track below it."""
+        if not (surf_resume_from_surface and self._parked_at_surface):
+            return False
+        if bottom_ahead is None:
+            return False
+        want = bottom_ahead - altitude_offset_m - surf_target_altitude_m
+        return want >= SURF_SURFACE_DEPTH_M + SURF_SURFACE_RESUME_MARGIN_M
 
     def _dive_gate(self, now, speed):
         """Return the reason a down command is refused right now, or None.

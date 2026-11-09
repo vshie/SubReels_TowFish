@@ -921,7 +921,7 @@
                 <button class="btn amber" id="thrustDownBtn">&#9660; DOWN</button>
             </div>
             <div class="jog-tune">
-                <label>UP &micro;s <input type="number" id="jogUpPwm" min="1501" max="1900" step="10" value="1600"></label>
+                <label>UP &micro;s <input type="number" id="jogUpPwm" min="1501" max="1900" step="10" value="1800"></label>
                 <label>DN &micro;s <input type="number" id="jogDownPwm" min="1100" max="1499" step="10" value="1300"></label>
             </div>
             <div class="roll-p-warn" id="rollPWarn"></div>
@@ -1413,7 +1413,7 @@ bindTiltStep($('tiltDnBtn'), 'down');
 // backend had no copy for the automatic loop to read).
 function clampJog(v, direction) {
     v = Math.round(Number(v));
-    if (!isFinite(v)) return direction === 'up' ? 1600 : 1300;
+    if (!isFinite(v)) return direction === 'up' ? 1800 : 1300;
     if (direction === 'up')   return Math.max(1501, Math.min(1900, v));
     return Math.min(1499, Math.max(1100, v));
 }
