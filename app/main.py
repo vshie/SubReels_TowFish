@@ -1770,7 +1770,8 @@ class SonarHistory:
     """
 
     def __init__(self):
-        self._samples = collections.deque()  # (monotonic_ts, depth_m)
+        # (monotonic_ts, depth_m, boat_lat, boat_lon); lat/lon None without a fix.
+        self._samples = collections.deque()
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
@@ -1806,15 +1807,20 @@ class SonarHistory:
         while not self._stop.is_set():
             t0 = time.monotonic()
             try:
-                self.sample_once(get_ping_sonar_snapshot(), get_blueboat_speed())
+                # One GLOBAL_POSITION_INT read gives the boat's position
+                # (where the sounding was taken) and its speed.
+                fix = get_blueboat_fix()
+                speed = fix["speed"] if fix else get_blueboat_speed()
+                self.sample_once(get_ping_sonar_snapshot(), speed, fix)
                 self._last_error = None
             except Exception as e:  # never let the sampler die
                 self._last_error = str(e)
                 logger.debug("Sonar history sample failed: %s", e)
             self._stop.wait(max(0.0, _SONAR_SAMPLE_PERIOD_S - (time.monotonic() - t0)))
 
-    def sample_once(self, snap, speed):
-        """One sampler pass: gate ``snap`` and buffer it, note ``speed``.
+    def sample_once(self, snap, speed, fix=None):
+        """One sampler pass: gate ``snap`` and buffer it with the boat's
+        position from ``fix`` (``{"lat", "lon"}`` or None), note ``speed``.
 
         Split out of :meth:`_run` so the simulator can drive the same
         gate and buffer on its own clock.
@@ -1829,7 +1835,9 @@ class SonarHistory:
                 self._speed_ms = float(speed)
             if accepted is not None:
                 distance_m, update_id = accepted
-                self._samples.append((now, distance_m))
+                lat = fix.get("lat") if fix else None
+                lon = fix.get("lon") if fix else None
+                self._samples.append((now, distance_m, lat, lon))
                 self._last_update_id = update_id
                 self._rejects_since_ok = 0
                 self._last_reject_reason = None
@@ -1908,7 +1916,7 @@ class SonarHistory:
         with self._lock:
             if not self._samples:
                 return None
-            ts, depth = self._samples[-1]
+            ts, depth = self._samples[-1][:2]
             return (ts, depth, self._last_update_id)
 
     def tow_delay_s(self):
@@ -1952,7 +1960,7 @@ class SonarHistory:
         with self._lock:
             if not self._samples:
                 return None
-            ts, depth = self._samples[-1]
+            ts, depth = self._samples[-1][:2]
         age = now - ts
         if age > max_age_s:
             return None
@@ -1968,7 +1976,7 @@ class SonarHistory:
             return None
         since = time.monotonic() - delay - pad_s
         with self._lock:
-            ahead = [d for ts, d in self._samples if ts >= since]
+            ahead = [s[1] for s in self._samples if s[0] >= since]
         return min(ahead) if ahead else None
 
     def latest_speed_ms(self):
@@ -1998,6 +2006,37 @@ class SonarHistory:
             return None
         return (best[1], delay, err)
 
+    def depth_at_position(self, lat, lon, max_dist_m):
+        """Seabed depth at (lat, lon) from the soundings the boat took
+        within ``max_dist_m`` of it, weighted by inverse distance -- so a
+        fish cutting inside a turn gets the depth between the legs the
+        boat drove rather than the one sounding nearest it.
+
+        ``(depth_m, nearest_m, age_s)`` (age of the nearest sounding), or
+        None when no positioned sounding lies that close: ground the boat
+        never sounded.
+        """
+        now = time.monotonic()
+        k_lat = math.pi / 180.0 * towed_position.EARTH_R
+        k_lon = k_lat * math.cos(math.radians(lat))
+        num = den = 0.0
+        nearest = None
+        with self._lock:
+            for ts, depth, slat, slon in self._samples:
+                if slat is None or slon is None:
+                    continue
+                d = math.hypot((slat - lat) * k_lat, (slon - lon) * k_lon)
+                if d > max_dist_m:
+                    continue
+                w = 1.0 / (d + 0.5) ** 2
+                num += w * depth
+                den += w
+                if nearest is None or d < nearest[0]:
+                    nearest = (d, now - ts)
+        if nearest is None:
+            return None
+        return (num / den, nearest[0], nearest[1])
+
     def snapshot(self):
         with self._lock:
             n = len(self._samples)
@@ -2012,37 +2051,92 @@ class SonarHistory:
 _sonar_history = SonarHistory()
 
 
+# Which sounding describes the seabed under the fish. "position" (default)
+# takes the sounding the boat took nearest the towfish position model's
+# estimate, which follows the fish inside a turn; "delay" replays the
+# sounding from one tow delay ago, which is only the right patch of
+# ground while the fish follows the boat's own track. Position falls back
+# to the delay whenever the model has no fresh estimate.
+altitude_lookup = "position"
+# How far from the fish's estimated position soundings still count as the
+# seabed under it: twice the model's own uncertainty (~1.7 m p95 in a
+# turn), never tighter than this. A fish cutting inside a hairpin sits
+# ~2 m inside the boat's turning circle, over ground no sounding hit.
+ALTITUDE_MATCH_MIN_M = 2.0
+ALTITUDE_MATCH_UNCERTAINTY_K = 2.0
+
+
 def compute_towfish_altitude(depth_m):
     """Height of the towfish above the seabed, in metres.
 
     ``altitude = boat_sonar_depth - towfish_depth - altitude_offset_m``,
-    where the sonar reading is replayed at the tow delay so both numbers
-    describe the same patch of ground.
+    where the sonar reading is the one the boat took where the fish is
+    now: nearest the position model's estimate of the fish (straight
+    line or turn), else replayed at the tow delay.
 
     Returns ``(altitude_m, detail)``. ``altitude_m`` is ``None`` whenever
     any input is missing or the result is non-physical (the fish cannot
-    be below the bottom); ``detail`` always reports what was used so the
-    CSV can record why an altitude is absent.
+    be below the bottom); ``detail`` always reports what was used --
+    ``source`` "position" or "delay", ``match_m`` (distance from the fish
+    to the sounding) -- and ``reason`` when there is no altitude.
     """
     detail = {"sonar_depth_m": None, "tow_delay_s": None,
-              "sonar_age_err_s": None, "altitude_m": None}
+              "sonar_age_err_s": None, "altitude_m": None,
+              "source": None, "match_m": None, "reason": None}
     if depth_m is None:
+        detail["reason"] = "no towfish depth"
         return (None, detail)
-    hit = _sonar_history.depth_at_tow_delay()
-    if hit is None:
-        return (None, detail)
-    sonar_depth, delay, err = hit
+    est = (_towfish_position.estimate()
+           if altitude_lookup == "position" and tow_position_mode == "model"
+           else None)
+    hit = None
+    if est is not None:
+        fish = est[3]
+        radius = max(ALTITUDE_MATCH_MIN_M,
+                     ALTITUDE_MATCH_UNCERTAINTY_K * (fish.get("uncertainty_m") or 0.0))
+        hit = _sonar_history.depth_at_position(fish["lat"], fish["lon"], radius)
+    if hit is not None:
+        sonar_depth, dist, age = hit
+        detail.update(source="position", match_m=round(dist, 2),
+                      sonar_age_err_s=None)
+        delay = _sonar_history.tow_delay_s()
+        detail["tow_delay_s"] = round(delay, 1) if delay is not None else None
+    else:
+        # No model estimate, or the fish is over ground the boat never
+        # sounded (inside a wide hairpin, or in the first layback after a
+        # start): the sounding one tow delay ago, flagged as such.
+        hit = _sonar_history.depth_at_tow_delay()
+        if hit is None:
+            detail["reason"] = ("no sounding near the towfish or at the tow delay"
+                                if est is not None else "no sounding at the tow delay")
+            return (None, detail)
+        sonar_depth, delay, err = hit
+        detail.update(source="delay", tow_delay_s=round(delay, 1),
+                      sonar_age_err_s=round(err, 2))
     detail["sonar_depth_m"] = round(sonar_depth, 2)
-    detail["tow_delay_s"] = round(delay, 1)
-    detail["sonar_age_err_s"] = round(err, 2)
     alt = sonar_depth - depth_m - altitude_offset_m
     # A negative altitude means the geometry disagrees with itself
     # (bad lock, wrong offset, fish deeper than the sounding). Publishing
     # it would put a physically impossible camera Z into the EXIF.
     if alt < 0:
+        detail["reason"] = "sounding shallower than the towfish"
         return (None, detail)
     detail["altitude_m"] = round(alt, 2)
     return (alt, detail)
+
+
+def towfish_altitude_snapshot():
+    """``/status`` block: the towfish's altitude and how it was found."""
+    try:
+        depth = _get_towfish_depth_m()
+        alt, detail = compute_towfish_altitude(depth)
+    except Exception as e:
+        return {"altitude_m": None, "reason": f"error: {e}"}
+    return {"altitude_m": round(alt, 2) if alt is not None else None,
+            "fish_depth_m": round(depth, 2) if depth is not None else None,
+            "sonar_depth_m": detail["sonar_depth_m"], "source": detail["source"],
+            "match_m": detail["match_m"], "tow_delay_s": detail["tow_delay_s"],
+            "reason": detail["reason"]}
 
 
 def _decode_statustext(msg):
@@ -7413,11 +7507,11 @@ class SurfTrackController:
         # the tick only recomputes when a new packet has actually
         # arrived; the attitude/output half still runs every tick.
         sounding_id = _sonar_history.last_update_id()
-        # The delayed sounding is only read here for the *reported*
-        # altitude; the control loop itself uses ``latest`` above so it
-        # gets a one-layback lookahead instead of the fish's present
-        # altitude.
-        delayed = _sonar_history.depth_at_tow_delay()
+        # The seabed under the fish is only read here for the *reported*
+        # altitude (the same lookup EXIF and the widget use); the control
+        # loop itself steers on ``latest`` above, a look-ahead, not on
+        # the fish's present altitude.
+        reported_altitude, alt_detail = compute_towfish_altitude(fish_depth)
         speed = _sonar_history.latest_speed_ms()
         # Reuse ``fish_depth`` and let the snapshot reuse a cached
         # HEARTBEAT: the tick runs up to 10 Hz but HEARTBEAT is 1 Hz and
@@ -7436,12 +7530,7 @@ class SurfTrackController:
                 ahead = _sonar_history.shallowest_ahead(SURF_LOOKAHEAD_PAD_S)
                 if ahead is not None:
                     bottom_ahead = min(bottom_ahead, ahead)
-        delayed_bottom = delayed[0] if delayed else None
-        reported_altitude: float | None = None
-        if (delayed_bottom is not None and fish_depth is not None):
-            candidate = delayed_bottom - fish_depth - altitude_offset_m
-            if candidate >= 0:
-                reported_altitude = candidate
+        delayed_bottom = alt_detail["sonar_depth_m"]
 
         # Which hold conditions are currently satisfied? Order matters
         # only for the reason string -- the earliest match wins so the
@@ -7557,8 +7646,7 @@ class SurfTrackController:
         self._queue_bin_values(snap)
         try:
             extras = {
-                "tow_delay_s": (delayed[1]
-                                if delayed is not None else None),
+                "tow_delay_s": alt_detail["tow_delay_s"],
                 "rc3_pwm": last_cmd.get('pwm'),
                 "rc3_frac": last_cmd.get('frac'),
                 "rc3_source": ("surftrack" if last_cmd else
@@ -9208,6 +9296,9 @@ def get_status():
             # (populated by the module singleton) so the widget can
             # render the state machine without null checks.
             "surftrack": _surftrack.snapshot(),
+            # Height above the seabed at the fish's estimated position,
+            # whether or not SURF TRACK is on.
+            "towfish_altitude": towfish_altitude_snapshot(),
             # Auto-righting: independent of SURF TRACK, plus the tether
             # twist count.
             "autoright": _autoright.snapshot(),

@@ -78,7 +78,7 @@ now = 1000.0
 main._sonar_history._samples.clear()
 for i in range(200):
     t = now - 100.0 + i * 0.5
-    main._sonar_history._samples.append((t, 20.0 - 0.5 * (t - (now - 100.0))))
+    main._sonar_history._samples.append((t, 20.0 - 0.5 * (t - (now - 100.0)), None, None))
 
 with mock.patch.object(main.time, "monotonic", return_value=now):
     hit = main._sonar_history.depth_at_tow_delay()
@@ -96,7 +96,7 @@ if hit:
 
 print("\nstale buffer is refused, not extrapolated")
 main._sonar_history._samples.clear()
-main._sonar_history._samples.append((now - 90.0, 12.0))
+main._sonar_history._samples.append((now - 90.0, 12.0, None, None))
 with mock.patch.object(main.time, "monotonic", return_value=now):
     check("a sounding 84 s off target is rejected",
           main._sonar_history.depth_at_tow_delay() is None)
@@ -108,7 +108,7 @@ with mock.patch.object(main.time, "monotonic", return_value=now):
 
 print("\naltitude arithmetic")
 main._sonar_history._samples.clear()
-main._sonar_history._samples.append((now - delay, 11.75))
+main._sonar_history._samples.append((now - delay, 11.75, None, None))
 with mock.patch.object(main.time, "monotonic", return_value=now):
     main.altitude_offset_m = 0.0
     alt, detail = main.compute_towfish_altitude(3.5)
@@ -129,6 +129,97 @@ with mock.patch.object(main.time, "monotonic", return_value=now):
     # than publishing nothing.
     bad, _ = main.compute_towfish_altitude(15.0)
     check("a non-physical altitude is withheld", bad is None)
+
+
+print("\naltitude at the fish's position (straight line or turn)")
+import math  # noqa: E402
+
+LAT0, LON0 = 21.3, -157.8
+K_LAT = math.pi / 180.0 * main.towed_position.EARTH_R
+K_LON = K_LAT * math.cos(math.radians(LAT0))
+
+
+def ll(n, e):
+    return (LAT0 + n / K_LAT, LON0 + e / K_LON)
+
+
+def bed(n, e):
+    return 10.0 + 0.5 * e          # seabed deepens 0.5 m per metre east
+
+
+# A hairpin at 1 m/s: north up the line at e = 0, a half circle of radius 4
+# m, back south at e = 8. One sounding every 0.5 s, stamped with where the
+# boat was.
+pts = [(n, 0.0) for n in [i * 0.5 for i in range(41)]]
+pts += [(20.0 + 4.0 * math.sin(a), 4.0 - 4.0 * math.cos(a))
+        for a in [k * math.pi / 25 for k in range(1, 26)]]
+pts += [(20.0 - i * 0.5, 8.0) for i in range(1, 21)]
+now = 2000.0
+main._sonar_history._samples.clear()
+for i, (n, e) in enumerate(pts):
+    la, lo = ll(n, e)
+    main._sonar_history._samples.append((now - (len(pts) - i) * 0.5, bed(n, e), la, lo))
+
+hit = None
+la, lo = ll(19.0, 0.2)                       # on the first leg
+with mock.patch.object(main.time, "monotonic", return_value=now):
+    hit = main._sonar_history.depth_at_position(la, lo, 2.0)
+check("soundings near the point are used", hit is not None and abs(hit[0] - bed(19.0, 0.0)) < 0.05,
+      f"got {hit}")
+la, lo = ll(10.0, 30.0)
+with mock.patch.object(main.time, "monotonic", return_value=now):
+    check("nothing within range gives no sounding",
+          main._sonar_history.depth_at_position(la, lo, 2.0) is None)
+
+# The fish cutting inside the turn, 8 m behind the boat along the path:
+# the model puts it near (21, 3); the time delay would replay the boat's
+# own track 8 m back.
+fish_n, fish_e = 21.5, 3.0
+fla, flo = ll(fish_n, fish_e)
+est = (now, 0.0, 0.0, {"lat": fla, "lon": flo, "uncertainty_m": 1.7})
+main.tow_position_mode = "model"
+main.tow_offset_m = 8.0
+main.altitude_offset_m = 0.0
+main._sonar_history._speed_ms = 1.0
+with mock.patch.object(main.time, "monotonic", return_value=now), \
+        mock.patch.object(main._towfish_position, "estimate", return_value=est), \
+        mock.patch.object(main._towfish_position, "along_path_m", return_value=8.0):
+    alt, detail = main.compute_towfish_altitude(3.0)
+    main.altitude_lookup = "delay"
+    alt_d, detail_d = main.compute_towfish_altitude(3.0)
+    main.altitude_lookup = "position"
+truth = bed(fish_n, fish_e) - 3.0
+check("in the turn: source is the position model", detail["source"] == "position", f"got {detail}")
+check("in the turn: within 0.8 m of the seabed under the fish (0.5 m/m cross-slope)",
+      alt is not None and abs(alt - truth) < 0.8, f"got {alt} truth {truth:.2f}")
+check("the time delay reads the boat's track instead",
+      detail_d["source"] == "delay" and abs(alt_d - truth) > abs(alt - truth),
+      f"delay {alt_d} position {alt} truth {truth:.2f}")
+check("match distance reported", detail["match_m"] is not None and detail["match_m"] <= 3.4,
+      f"got {detail['match_m']}")
+with mock.patch.object(main.time, "monotonic", return_value=now), \
+        mock.patch.object(main._towfish_position, "estimate", return_value=None):
+    _, detail_n = main.compute_towfish_altitude(3.0)
+check("no model estimate falls back to the delay", detail_n["source"] == "delay", f"got {detail_n}")
+far = (now, 0.0, 0.0, {"lat": ll(60.0, 60.0)[0], "lon": ll(60.0, 60.0)[1], "uncertainty_m": 1.7})
+with mock.patch.object(main.time, "monotonic", return_value=now), \
+        mock.patch.object(main._towfish_position, "estimate", return_value=far):
+    a_far, detail_f = main.compute_towfish_altitude(3.0)
+check("fish over unsounded ground: the tow-delay sounding, flagged DELAY",
+      a_far is not None and detail_f["source"] == "delay", f"got {detail_f}")
+main._sonar_history._samples.clear()
+with mock.patch.object(main.time, "monotonic", return_value=now), \
+        mock.patch.object(main._towfish_position, "estimate", return_value=far):
+    a_none, detail_none = main.compute_towfish_altitude(3.0)
+check("nothing anywhere: no altitude, with a reason",
+      a_none is None and "no sounding" in detail_none["reason"], f"got {detail_none}")
+
+fix = {"lat": LAT0, "lon": LON0}
+h = main.SonarHistory()
+with mock.patch.object(main.time, "monotonic", return_value=now):
+    h.sample_once({"distance_m": 6.0, "in_range": True, "signal_quality": 100, "last_update": 1}, 1.0, fix)
+check("sampler stores the boat position with the sounding",
+      list(h._samples) == [(now, 6.0, LAT0, LON0)], f"got {list(h._samples)}")
 
 
 print("\naccuracy priors reach the shared model")

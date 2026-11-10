@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import subprocess
 import sys
 import threading
@@ -1069,10 +1070,71 @@ def study_bottom(args) -> None:
     run_batch(jobs)
 
 
+# -- ALTITUDE: seabed under the fish, straight and through a turn (9 Nov) --
+# The extension now reads the towfish's altitude from the boat's soundings
+# at the position model's estimate of the fish, falling back to the
+# sounding one tow delay ago. Each run logs both (alt_pos, alt_delay)
+# against the truth (alt_true) over a seabed that slopes across the lanes
+# of a hairpin, so the inside of the turn is on different ground from the
+# boat's track. Shipped settings: 40/30 caps, SURF TRACK fixes on.
+# Deepening toward the second lane (the logged hairpin turns left), so the
+# fish has water under it on both legs.
+ALT_PLANE = "plane:8:0.15:270"
+ALT_SPACING = {8: 8, 25: 35}
+
+
+def score_altitude(run: Path) -> dict:
+    rows = [r for r in csv.DictReader(open(run / "truth.csv"))
+            if r.get("jig", "0") == "0" and r.get("alt_true")]
+    tb = np.array([float(r["t_boat"]) for r in rows])
+    true = np.array([float(r["alt_true"]) for r in rows])
+    num = lambda k: np.array([float(r[k]) if r.get(k) else np.nan for r in rows])  # noqa: E731
+    pos, dly = num("alt_pos"), num("alt_delay")
+    src = np.array([r.get("alt_pos_src", "") for r in rows])
+    meta = json.loads((run / "meta.json").read_text())
+    if meta["args"].get("spacing") not in (None, "None"):
+        ts = turn_start(run)
+        L = float(re.search(r"_L(\d+)", run.name).group(1))
+        windows = {"straight": tb < ts - 5, "turn": (tb >= ts) & (tb <= ts + 40 + L)}
+    else:
+        windows = {"straight": tb >= tb[0] + 30}
+    out = {}
+    for name, m in windows.items():
+        for key, a in (("pos", pos), ("delay", dly)):
+            ok = m & np.isfinite(a)
+            err = np.abs(a[ok] - true[ok])
+            out[f"{name}_{key}_p50"] = round(float(np.median(err)), 2) if ok.any() else None
+            out[f"{name}_{key}_p95"] = round(float(np.percentile(err, 95)), 2) if ok.any() else None
+            out[f"{name}_{key}_coverage"] = round(float(ok.sum() / max(1, m.sum())), 2)
+        out[f"{name}_pos_from_model"] = round(float(np.mean(src[m] == "position")), 2) if m.any() else None
+    return out
+
+
+def altitude_jobs():
+    jobs = []
+    for L in (8, 25):
+        rid, argv, _, info = _inx(steady_job(L, 4.0, ALT_SPACING[L]), L, "sw_AL_", "altitude")
+        argv = list(argv)
+        i = argv.index("--bottom-depth")
+        argv[i:i + 2] = ["--terrain", ALT_PLANE]
+        argv[argv.index(ROLL_P[1])] = RATE_CAPS["40_30"]
+        jobs.append((rid + "_p270", argv, score_altitude, {**info, "study": "altitude", "case": "hairpin"}))
+        rid, argv, _, info = bottom_job("slope", L, "alt")
+        argv = list(argv)
+        argv[argv.index(ROLL_P[1])] = RATE_CAPS["40_30"]
+        jobs.append((rid.replace("sw_BF_", "sw_AL_"), argv, score_altitude,
+                     {**info, "study": "altitude", "case": "slope"}))
+    return jobs
+
+
+def study_altitude(args) -> None:
+    run_batch(altitude_jobs())
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("study", choices=["righting", "early", "maxdepth", "fixed", "spacing", "grid", "rescore-grid", "steady", "dz0", "jog", "dt", "dzsel", "towpt", "ballast", "geometry", "recipe", "recipe-spacing", "inx-hold", "inx-turns", "rates", "bottom", "rank"])
+    ap.add_argument("study", choices=["righting", "early", "maxdepth", "fixed", "spacing", "grid", "rescore-grid", "steady", "dz0", "jog", "dt", "dzsel", "towpt", "ballast", "geometry", "recipe", "recipe-spacing", "inx-hold", "inx-turns", "rates", "bottom", "altitude", "rank"])
     ap.add_argument("--vertical-pwm", type=int, default=1900)
     ap.add_argument("--roll-min-depth", type=float, default=0.0)
     ap.add_argument("--descent-start", type=float, default=0.0)
@@ -1088,7 +1150,7 @@ def main(argv=None) -> int:
     WORKERS = args.workers
     {"righting": study_righting, "early": study_early, "grid": study_grid, "rescore-grid": rescore_grid, "steady": study_steady, "dz0": study_dz0, "jog": study_jog, "dt": study_dt, "dzsel": study_dzsel, "towpt": study_towpt, "ballast": study_ballast, "geometry": study_geometry, "recipe": study_recipe,
      "recipe-spacing": study_recipe_spacing, "inx-hold": study_inx_hold,
-     "inx-turns": study_inx_turns, "rates": study_rates, "bottom": study_bottom, "fixed": study_fixed,
+     "inx-turns": study_inx_turns, "rates": study_rates, "bottom": study_bottom, "altitude": study_altitude, "fixed": study_fixed,
      "maxdepth": study_maxdepth,
      "spacing": study_spacing, "rank": lambda a: print(rank_righting())}[args.study](args)
     return 0

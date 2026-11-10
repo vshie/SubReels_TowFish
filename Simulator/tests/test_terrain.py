@@ -27,6 +27,11 @@ ter = T.Terrain.from_spec("coral", [10.0, 20.0], math.radians(90))   # heading e
 check("along-track distance runs along the heading", abs(ter.along_cross(10.0, 170.0)[0] - 150) < 1e-9)
 check("depth_at follows the track", ter.depth_at(10.0, 170.0) == 4.0 and ter.depth_at(10.0, 100.0) == 7.0)
 check("flat:<d>", T.Terrain.from_spec("flat:8.5", [0, 0], 0.0).depth_at(3, 4) == 8.5)
+pl = T.Terrain.from_spec("plane:8:0.15:90", [0, 0], 0.0)           # first leg heads north
+check("plane: start depth", pl.depth_at(0, 0) == 8.0)
+check("plane: level along the first leg", pl.depth_at(20, 0) == 8.0)
+check("plane: deepens 0.15 m/m to the right", abs(pl.depth_at(0, 8) - 9.2) < 1e-9
+      and abs(pl.depth_at(0, -8) - 6.8) < 1e-9)
 
 print("\nPing beam (first return)")
 ter = T.Terrain.from_spec("coral", [0.0, 0.0], 0.0)

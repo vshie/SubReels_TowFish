@@ -8,6 +8,11 @@ Terrain specs (``--terrain``):
                150 m: 3 m high (top at 4 m), 5 m across the top, sides
                tapering to the bottom over 1 m
   flat:<d>     flat bottom at d metres
+  plane:<d>:<grade>:<dir_deg>
+               a seabed sloping everywhere: d metres at the start, deepening
+               by <grade> (m per m) toward <dir_deg> measured from the track
+               heading (90 = to the right of the first leg, across the lanes
+               of a hairpin)
 
 Distance is measured along the boat's track from where the boat is at
 ``--start`` (s = 0), so the fish meets each feature one layback after
@@ -40,13 +45,18 @@ class Terrain:
     origin: np.ndarray           # boat N, E at s = 0
     heading: np.ndarray          # unit N, E along the track
     flat_depth: float = 6.0
+    grade: float = 0.0
+    grade_dir: float = 0.0          # rad from the track heading
 
     @classmethod
     def from_spec(cls, spec: str, origin, heading_rad: float) -> "Terrain":
         kind, _, arg = spec.partition(":")
-        if kind not in ("slope", "coral", "flat"):
+        if kind not in ("slope", "coral", "flat", "plane"):
             raise ValueError(f"unknown terrain {spec!r}")
         h = np.array([math.cos(heading_rad), math.sin(heading_rad)])
+        if kind == "plane":
+            d, g, a = (float(x) for x in arg.split(":"))
+            return cls(kind, np.asarray(origin[:2], dtype=float), h, d, g, math.radians(a))
         return cls(kind, np.asarray(origin[:2], dtype=float), h,
                    float(arg) if kind == "flat" else 6.0)
 
@@ -59,6 +69,9 @@ class Terrain:
     def depth_sc(self, s: float, c: float = 0.0) -> float:
         if self.kind == "flat":
             return self.flat_depth
+        if self.kind == "plane":
+            return self.flat_depth + self.grade * (s * math.cos(self.grade_dir)
+                                                   + c * math.sin(self.grade_dir))
         if self.kind == "slope":
             return slope_profile(s)
         return coral_profile(s, c)

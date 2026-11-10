@@ -653,10 +653,11 @@
         .surf-target-unit  { font-size: 11px; color: var(--ink-dim); letter-spacing: 0.06em; }
         .surf-readout {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 6px;
             margin-top: 6px;
         }
+        @media (max-width: 300px) { .surf-readout { grid-template-columns: repeat(2, 1fr); } }
         .surf-cell {
             display: flex;
             flex-direction: column;
@@ -672,6 +673,9 @@
         .surf-value { font-family: var(--display); font-weight: 700; font-size: 15px; color: var(--phosphor); text-shadow: 0 0 4px var(--phosphor-glow); min-width: 2ch; text-align: center; }
         .surf-value.dim { color: var(--ink-dim); text-shadow: none; }
         .surf-unit  { font-size: 10.5px; color: var(--ink-dim); letter-spacing: 0.06em; }
+        /* Where ALT's sounding came from: AT FISH (position model) or DELAY. */
+        .surf-src   { font-size: 9px; font-weight: 700; letter-spacing: 0.08em; color: var(--ink-dim); }
+        .surf-src.pos { color: var(--sky); }
 
         /* SURF TRACK state pill styles kept because the poller writes them. */
         #surfState { padding: 1px 6px; border-radius: 2px; border: 1px solid transparent; }
@@ -912,7 +916,7 @@
     <section class="panel active" id="panel-fly">
         <!-- DEPTH JOG sits at the top: the immediate manual RC3 override
              (UP/DOWN thrust + µs tuning) and the SURF TRACK setpoint jog
-             (± 0.5 m target altitude + ALT/CMD/ERR readouts) are the
+             (± 0.5 m target altitude + ALT/DEPTH CMD/ERR/STICK readouts) are the
              two ways the pilot changes depth, so they share one card. -->
         <div class="section">
             <div class="section-title">DEPTH JOG <span class="aux off" id="jogState">RC3 NEUTRAL &middot; 1500</span></div>
@@ -939,19 +943,24 @@
                 <button class="btn small" data-surf-target="0.5">&#9650; 0.5</button>
             </div>
             <div class="surf-readout">
-                <div class="surf-cell">
+                <div class="surf-cell" id="surfAltCell" title="Towfish height above the seabed">
                     <span class="surf-label">ALT</span>
                     <span class="surf-value dim" id="surfAlt">--</span>
+                    <span class="surf-src" id="surfAltSrc">m</span>
+                </div>
+                <div class="surf-cell" title="Depth SURF TRACK is commanding">
+                    <span class="surf-label">DEPTH CMD</span>
+                    <span class="surf-value dim" id="surfDepthCmd">--</span>
                     <span class="surf-unit">m</span>
                 </div>
-                <div class="surf-cell">
-                    <span class="surf-label">CMD</span>
-                    <span class="surf-value dim" id="surfCmd">--</span>
-                </div>
-                <div class="surf-cell">
+                <div class="surf-cell" title="Commanded depth minus fish depth (+ = go deeper)">
                     <span class="surf-label">ERR</span>
                     <span class="surf-value dim" id="surfErr">--</span>
                     <span class="surf-unit">m</span>
+                </div>
+                <div class="surf-cell" title="SURF TRACK's vertical stick (RC3) command">
+                    <span class="surf-label">STICK</span>
+                    <span class="surf-value dim" id="surfCmd">--</span>
                 </div>
             </div>
             <!-- Mode-aware jog hint was dropped to reclaim vertical space;
@@ -1947,14 +1956,38 @@ async function pollStatus() {
         } else {
             surfStateEl.textContent = surf.state ? surf.state.toUpperCase() : '--';
         }
-        // ALT readout: true present altitude (delayed sounding), not
-        // the lookahead the loop is chasing.
-        if (typeof surf.altitude_m === 'number') {
-            surfAltEl.textContent = surf.altitude_m.toFixed(1);
+        // ALT readout: the towfish's present height above the seabed, live
+        // whether or not SURF TRACK is on -- the boat's sounding nearest
+        // the fish's estimated position (AT FISH, follows it through a
+        // turn), else the sounding one tow delay ago (DELAY). Not the
+        // look-ahead the loop steers on.
+        const talt = data.towfish_altitude || {};
+        const srcEl = $('surfAltSrc');
+        const altCell = $('surfAltCell');
+        if (typeof talt.altitude_m === 'number') {
+            surfAltEl.textContent = talt.altitude_m.toFixed(1);
             surfAltEl.classList.remove('dim');
+            const pos = talt.source === 'position';
+            srcEl.textContent = pos ? 'AT FISH' : 'DELAY';
+            srcEl.classList.toggle('pos', pos);
+            altCell.title = pos
+                ? `Seabed from the boat's soundings at the fish's estimated position (nearest ${Number(talt.match_m).toFixed(1)} m away)`
+                : `Seabed from the boat's sounding one tow delay ago (${talt.tow_delay_s ?? '--'} s); set the tether length to follow the fish through turns`;
         } else {
             surfAltEl.textContent = '--';
             surfAltEl.classList.add('dim');
+            srcEl.textContent = 'm';
+            srcEl.classList.remove('pos');
+            altCell.title = talt.reason ? `No altitude: ${talt.reason}` : 'Towfish height above the seabed';
+        }
+        // DEPTH CMD readout: the depth SURF TRACK is asking ALT_HOLD for.
+        const depthCmdEl = $('surfDepthCmd');
+        if (surf.enabled && surf.state === 'tracking' && typeof surf.commanded_depth_m === 'number') {
+            depthCmdEl.textContent = surf.commanded_depth_m.toFixed(1);
+            depthCmdEl.classList.remove('dim');
+        } else {
+            depthCmdEl.textContent = '--';
+            depthCmdEl.classList.add('dim');
         }
         // CMD readout: the loop's current RC3 command, or -- when
         // inside the deadband and ALT_HOLD is holding on its own.

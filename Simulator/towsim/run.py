@@ -154,8 +154,10 @@ def spawn_sitl(args, run_dir: Path, track, scenario_parm: Path | None) -> subpro
 
 def terrain_cols(terrain, pos, top, ext):
     """bottom_fish, alt_true, sonar_depth, sonar_q, surf_target, surf_raw,
-    s_fish, s_boat (distance along the terrain)."""
-    out = ["", "", "", "", "", "", "", ""]
+    s_fish, s_boat (distance along the terrain), and the altitude the
+    extension reports by position lookup (with the source it fell back
+    to) and by time delay."""
+    out = ["", "", "", "", "", "", "", "", "", "", ""]
     if terrain is not None:
         b = terrain.depth_at(pos[0], pos[1])
         out[0], out[1] = f"{b:.3f}", f"{b - pos[2]:.3f}"
@@ -171,6 +173,10 @@ def terrain_cols(terrain, pos, top, ext):
             out[4] = f"{c._target_depth_m:.3f}"
         if c._raw_target_depth_m is not None:
             out[5] = f"{c._raw_target_depth_m:.3f}"
+        (ap, src), (ad, _) = ext.altitudes()
+        out[8] = f"{ap:.3f}" if ap is not None else ""
+        out[9] = src or ""
+        out[10] = f"{ad:.3f}" if ad is not None else ""
     return out
 
 
@@ -368,7 +374,7 @@ def main(argv=None) -> int:
                  "layback_m", "sitl_mode", "armed", "rc3", "jig", "surf", "rc2", "ar_twist",
                  "est_n", "est_e", "est_unc",
                  "bottom_fish", "alt_true", "sonar_depth", "sonar_q", "surf_target", "surf_raw",
-                 "s_fish", "s_boat"])
+                 "s_fish", "s_boat", "alt_pos", "alt_pos_src", "alt_delay"])
 
     t_sim = 0.0
     next_truth = 0.0

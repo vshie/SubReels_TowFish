@@ -1,0 +1,335 @@
+<title>Bottom Following Replay</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a sounder-style side view that follows the tow, a whole-track strip under it to seek, readouts beside. Depth reads downward. */
+:root {
+  --bg: #f3f6f7; --panel: #ffffff; --fg: #17252b; --muted: #5a6b72; --rule: #d3dde1;
+  --water-top: #dcecf2; --water-deep: #b7d3df; --sky: #f3f6f7;
+  --seabed: #c9b79a; --seabed-edge: #8f7a58; --tether: #2f3b40; --beam: #0a8aa8;
+  --ship: #0a8aa8; --base: #d9480f; --fish: #f2c230; --ideal: #17252b; --warn: #b35c00;
+  --f-display: "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+  --f-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e1619; --panel: #152024; --fg: #e3ecef; --muted: #93a6ad; --rule: #2a3a40;
+  --water-top: #12313d; --water-deep: #0a1c24; --sky: #0e1619;
+  --seabed: #6b5a40; --seabed-edge: #a08a63; --tether: #d0dade; --beam: #3cc4d0;
+  --ship: #1098ad; --base: #e8590c; --fish: #f2c230; --ideal: #e3ecef; --warn: #ffa94d; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0e1619; --panel: #152024; --fg: #e3ecef; --muted: #93a6ad; --rule: #2a3a40;
+  --water-top: #12313d; --water-deep: #0a1c24; --sky: #0e1619;
+  --seabed: #6b5a40; --seabed-edge: #a08a63; --tether: #d0dade; --beam: #3cc4d0;
+  --ship: #1098ad; --base: #e8590c; --fish: #f2c230; --ideal: #e3ecef; --warn: #ffa94d; color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font: 15px/1.5 var(--f-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 24px 48px }
+main { max-width: 1180px; margin: 0 auto; display: grid; gap: 16px }
+header { display: grid; gap: 4px }
+h1 { font: 700 clamp(1.7rem, 4vw, 2.4rem)/1.05 var(--f-display); margin: 0; text-wrap: balance }
+.eyebrow { font: 500 .75rem var(--f-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted) }
+.sub { color: var(--muted); max-width: 72ch; margin: 0 }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px }
+.tabs button { font: 600 .95rem var(--f-display); letter-spacing: .02em; padding: 7px 14px; border-radius: 4px; border: 1px solid var(--rule); background: var(--panel); color: var(--fg); cursor: pointer }
+.tabs button[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg) }
+.tabs button:focus-visible, .ctrl button:focus-visible, .ctrl select:focus-visible, input:focus-visible { outline: 2px solid var(--ship); outline-offset: 2px }
+.stage { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 14px; align-items: start }
+@media (max-width: 820px) { .stage { grid-template-columns: 1fr } }
+.view { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 8px; display: grid; gap: 8px; min-width: 0 }
+canvas { width: 100%; display: block; border-radius: 3px; touch-action: pan-y }
+#main { aspect-ratio: 16 / 7.2 }
+#strip { aspect-ratio: 16 / 1.9; cursor: pointer }
+.ctrl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px }
+.ctrl button { font: 600 .9rem var(--f-body); padding: 6px 12px; border-radius: 4px; border: 1px solid var(--rule); background: var(--bg); color: var(--fg); cursor: pointer; min-width: 74px }
+.ctrl select { font: .88rem var(--f-body); padding: 5px 6px; border-radius: 4px; border: 1px solid var(--rule); background: var(--bg); color: var(--fg) }
+.ctrl label { font-size: .88rem; color: var(--muted); display: inline-flex; align-items: center; gap: 6px }
+#scrub { flex: 1 1 200px; min-width: 0; accent-color: var(--ship) }
+.time { font: 500 .9rem var(--f-mono); font-variant-numeric: tabular-nums; color: var(--muted); min-width: 64px; text-align: right }
+aside { display: grid; gap: 10px; min-width: 0 }
+.readout { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; display: grid; gap: 7px }
+.kv { display: flex; justify-content: space-between; gap: 10px; align-items: baseline }
+.kv span:first-child { font: 500 .72rem var(--f-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted) }
+.kv b { font: 500 1.05rem var(--f-mono); font-variant-numeric: tabular-nums }
+.kv b.big { font-size: 1.6rem }
+.state { font: 600 .82rem var(--f-mono); padding: 3px 7px; border-radius: 3px; border: 1px solid currentColor; color: var(--ship); justify-self: start }
+.state.hold { color: var(--warn) }
+.legend { display: grid; gap: 5px; font-size: .86rem; color: var(--muted) }
+.legend span { display: flex; align-items: center; gap: 8px }
+.sw { width: 20px; height: 0; border-top: 2.5px solid; display: inline-block; flex: none }
+.sw.dash { border-top-style: dashed } .sw.dot { border-top: 2px dotted var(--ideal) }
+.box { width: 14px; height: 10px; display: inline-block; flex: none; border: 1px solid var(--seabed-edge); background: var(--seabed) }
+.result { font-size: .9rem; color: var(--muted); margin: 0 }
+.result b { color: var(--fg); font-weight: 600 }
+footer { font-size: .82rem; color: var(--muted) }
+code { font: .86em var(--f-mono) }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">SubReels towfish · SURF TRACK · ArduSub SITL + towed-body physics</div>
+    <h1>Bottom Following Replay</h1>
+    <p class="sub">Side view of four simulated tows at 1 m/s on the Kevlar tether, flown with the settings now on main (pilot speed caps 40/30, the three SURF TRACK fixes). The Ping on the boat sounds the seabed, SURF TRACK steers the fish to 4 m above it, and the dashed line is the same tow with the 4 Nov code.</p>
+  </header>
+
+  <div class="tabs" role="group" aria-label="Scenario" id="tabs"></div>
+
+  <div class="stage">
+    <div class="view">
+      <canvas id="main" role="img" aria-label="Side view: boat at the surface, tether, towfish and seabed, following the tow"></canvas>
+      <canvas id="strip" role="img" aria-label="Whole track: seabed, the fish's path so far, and the part shown above. Click to jump."></canvas>
+      <div class="ctrl">
+        <button id="play" type="button">Pause</button>
+        <label>Speed <select id="speed"><option value="1">1×</option><option value="4">4×</option><option value="8" selected>8×</option><option value="20">20×</option></select></label>
+        <label><input type="checkbox" id="showBase" checked> 4 Nov code</label>
+        <input type="range" id="scrub" min="0" max="1" step="1" value="0" aria-label="Time">
+        <span class="time" id="time">0 s</span>
+      </div>
+    </div>
+    <aside>
+      <div class="readout">
+        <div class="kv"><span>Clearance</span><b class="big" id="r-clear">–</b></div>
+        <div class="kv"><span>Fish depth</span><b id="r-depth">–</b></div>
+        <div class="kv"><span>Commanded</span><b id="r-cmd">–</b></div>
+        <div class="kv"><span>Seabed under fish</span><b id="r-bed">–</b></div>
+        <div class="kv"><span>Boat sounding</span><b id="r-ping">–</b></div>
+        <div class="kv"><span>Fish behind boat</span><b id="r-lay">–</b></div>
+        <div class="kv"><span>Roll / pitch</span><b id="r-att">–</b></div>
+        <span class="state" id="r-state">–</span>
+      </div>
+      <p class="result" id="result"></p>
+      <div class="legend">
+        <span><i class="sw" style="color:var(--ship)"></i>Fish path, as shipped</span>
+        <span><i class="sw dash" style="color:var(--base)"></i>Fish path, 4 Nov code</span>
+        <span><i class="sw dot"></i>Ideal: 4 m above seabed</span>
+        <span><i class="sw" style="color:var(--tether)"></i>Tether (simulated nodes)</span>
+        <span><i class="box"></i>Seabed</span>
+      </div>
+    </aside>
+  </div>
+  <footer>Frames every 0.5 s from <code>runs/sw_BF_*_all_ps40</code> (shipped) and <code>sw_BF_*_base</code> (4 Nov code). Distance is along the boat's track from where the boat was at the start. The side view exaggerates depth; the factor is printed in its corner. Clearance is seabed minus fish depth at the fish's centre of gravity.</footer>
+</main>
+
+<script>
+const DATA = /*DATA*/null;
+const CASES = DATA.cases;
+const TITLES = { slope: "Slope 6 → 3 → 6 m", coral: "Coral head 3 m high" };
+const RESULT = {
+  "slope-8": "Climbs ahead of the slope, drives at about 0.6 m over the 3 m patch, and dives back afterwards. The 4 Nov code rode about 0.55 m shallow and stayed at 1.5 m.",
+  "slope-25": "Same profile on 25 m. It parks at the surface over the shallow patch, then dives back once the boat finds deeper water.",
+  "coral-8": "With only ~7 m of layback the warning is short: the climb starts 6 m before the head. Clearance over the top <b>2.8 m</b> (4 Nov code: 2.2 m).",
+  "coral-25": "The boat passes the head ~24 s before the fish does. The look-ahead keeps the fish up until it has passed: clearance <b>3.3 m</b> (4 Nov code: 2.2 m).",
+};
+let ci = 0, fi = 0, playing = true, acc = 0, lastTs = null;
+const $ = id => document.getElementById(id);
+const tabs = $("tabs");
+CASES.forEach((c, i) => {
+  const b = document.createElement("button");
+  b.type = "button"; b.textContent = `${TITLES[c.terrain]} · ${c.L} m tether`;
+  b.addEventListener("click", () => select(i));
+  tabs.append(b);
+});
+
+function startFrame(c) {
+  if (c.terrain !== "coral") return 0;
+  const i = c.frames.findIndex(f => f[2] >= 120);   // fish 30 m short of the head
+  return Math.max(0, i);
+}
+function select(i) {
+  ci = i; const c = CASES[i];
+  [...tabs.children].forEach((b, j) => b.setAttribute("aria-pressed", String(j === i)));
+  $("scrub").max = c.frames.length - 1;
+  fi = startFrame(c); acc = 0;
+  $("result").innerHTML = RESULT[`${c.terrain}-${c.L}`];
+  try { localStorage.setItem("bf-case", String(i)); } catch (e) {}
+  draw();
+}
+
+// ---- colours from the theme -------------------------------------------
+let C = {};
+function readColors() {
+  const cs = getComputedStyle(document.documentElement);
+  for (const k of ["water-top", "water-deep", "sky", "seabed", "seabed-edge", "tether", "beam", "ship", "base", "fish", "ideal", "muted", "rule", "fg", "panel", "warn"])
+    C[k] = cs.getPropertyValue("--" + k).trim();
+}
+readColors();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); draw(); });
+new MutationObserver(() => { readColors(); draw(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+const bedAt = (terrain, s) => {
+  const T = DATA.terrain, i = Math.round((s - T.s[0]) / 0.25);
+  return T[terrain][Math.min(T.s.length - 1, Math.max(0, i))];
+};
+const ideal = b => Math.min(5, Math.max(0.5, b - 4));
+
+function sizeCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1, r = cv.getBoundingClientRect();
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, r.width, r.height];
+}
+
+function drawMain() {
+  const c = CASES[ci], f = c.frames[fi];
+  const [ctx, W, H] = sizeCanvas($("main"));
+  const [t, sb, sf, zf, roll, pitch, tgt, ping, , nodes] = f;
+  const span = Math.max(36, c.L + 22), zmax = 8, top = 22;
+  const centre = (sb + sf) / 2;
+  const s0 = centre - span / 2, s1 = centre + span / 2;
+  const X = s => (s - s0) / span * W;
+  const Y = z => top + z / zmax * (H - top - 6);
+  // sky + water
+  ctx.fillStyle = C.sky; ctx.fillRect(0, 0, W, Y(0));
+  const g = ctx.createLinearGradient(0, Y(0), 0, H); g.addColorStop(0, C["water-top"]); g.addColorStop(1, C["water-deep"]);
+  ctx.fillStyle = g; ctx.fillRect(0, Y(0), W, H - Y(0));
+  // depth grid
+  ctx.font = "11px 'JetBrains Mono', monospace"; ctx.textBaseline = "middle";
+  for (let z = 1; z <= 7; z++) {
+    ctx.strokeStyle = C.rule; ctx.globalAlpha = .55; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, Y(z)); ctx.lineTo(W, Y(z)); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = C.muted; ctx.fillText(`${z} m`, 6, Y(z) - 7);
+  }
+  // seabed
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let px = 0; px <= W; px += 2) ctx.lineTo(px, Y(bedAt(c.terrain, s0 + px / W * span)));
+  ctx.lineTo(W, H); ctx.closePath(); ctx.fillStyle = C.seabed; ctx.fill();
+  ctx.strokeStyle = C["seabed-edge"]; ctx.lineWidth = 1.5; ctx.beginPath();
+  for (let px = 0; px <= W; px += 2) { const y = Y(bedAt(c.terrain, s0 + px / W * span)); px ? ctx.lineTo(px, y) : ctx.moveTo(px, y); }
+  ctx.stroke();
+  // ideal line
+  ctx.setLineDash([2, 5]); ctx.strokeStyle = C.ideal; ctx.globalAlpha = .6; ctx.lineWidth = 1.5; ctx.beginPath();
+  for (let px = 0; px <= W; px += 3) { const y = Y(ideal(bedAt(c.terrain, s0 + px / W * span))); px ? ctx.lineTo(px, y) : ctx.moveTo(px, y); }
+  ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+  // Ping beam (15 deg half angle) from the boat to the seabed
+  const bz = bedAt(c.terrain, sb), half = Math.tan(15 * Math.PI / 180) * bz;
+  ctx.fillStyle = C.beam; ctx.globalAlpha = .13; ctx.beginPath();
+  ctx.moveTo(X(sb), Y(0.15)); ctx.lineTo(X(sb - half), Y(bz)); ctx.lineTo(X(sb + half), Y(bz)); ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+  if (ping != null) { ctx.strokeStyle = C.beam; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(sb) - 9, Y(ping)); ctx.lineTo(X(sb) + 9, Y(ping)); ctx.stroke(); }
+  // 4 Nov code path
+  if ($("showBase").checked) {
+    ctx.setLineDash([7, 5]); ctx.strokeStyle = C.base; ctx.lineWidth = 2; ctx.beginPath();
+    let on = false;
+    for (let i = 0; i < c.base.length; i += 2) {
+      const s = c.base[i]; if (s < s0 - 2 || s > s1 + 2) { on = false; continue; }
+      const x = X(s), y = Y(c.base[i + 1]); on ? ctx.lineTo(x, y) : ctx.moveTo(x, y); on = true;
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  // shipped trail so far
+  ctx.strokeStyle = C.ship; ctx.lineWidth = 2.5; ctx.beginPath();
+  let on = false;
+  for (let i = 0; i <= fi; i++) {
+    const q = c.frames[i]; if (q[2] < s0 - 2) continue;
+    const x = X(q[2]), y = Y(q[3]); on ? ctx.lineTo(x, y) : ctx.moveTo(x, y); on = true;
+  }
+  ctx.stroke();
+  // commanded depth tick
+  if (tgt != null) {
+    ctx.strokeStyle = C.ship; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(X(sf) - 16, Y(tgt)); ctx.lineTo(X(sf) + 16, Y(tgt)); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // clearance
+  const bed = bedAt(c.terrain, sf);
+  ctx.strokeStyle = C.fg; ctx.globalAlpha = .55; ctx.lineWidth = 1; ctx.beginPath();
+  ctx.moveTo(X(sf), Y(zf) + 6); ctx.lineTo(X(sf), Y(bed)); ctx.stroke(); ctx.globalAlpha = 1;
+  ctx.fillStyle = C.fg; ctx.textBaseline = "middle";
+  ctx.fillText(`${(bed - zf).toFixed(1)} m`, X(sf) + 6, (Y(zf) + Y(bed)) / 2);
+  // tether
+  if (nodes.length) {
+    ctx.strokeStyle = C.tether; ctx.lineWidth = 1.6; ctx.beginPath();
+    for (let i = 0; i < nodes.length; i += 2) { const x = X(nodes[i]), y = Y(nodes[i + 1]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke();
+  }
+  // boat
+  const bx = X(sb), wy = Y(0);
+  ctx.fillStyle = C.fg; ctx.beginPath();
+  ctx.moveTo(bx - 16, wy - 7); ctx.lineTo(bx + 18, wy - 7); ctx.lineTo(bx + 11, wy + 3); ctx.lineTo(bx - 14, wy + 3); ctx.closePath(); ctx.fill();
+  ctx.font = "600 11px 'Source Sans 3', sans-serif"; ctx.textBaseline = "bottom"; ctx.fillStyle = C.muted;
+  ctx.fillText("boat + Ping", bx - 22, wy - 9);
+  // fish: body pitched (side view), drawn at true scale x2 for visibility
+  ctx.save(); ctx.translate(X(sf), Y(zf)); ctx.rotate(-pitch * Math.PI / 180);   // nose up = counter-clockwise, canvas y points down
+  const k = W / span * 2;           // px per metre, doubled
+  ctx.fillStyle = C.fish; ctx.strokeStyle = C.fg; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.ellipse(0, 0, 0.27 * k, 0.07 * k, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-0.15 * k, 0); ctx.lineTo(-0.62 * k, 0); ctx.stroke();      // tow bar to tail
+  ctx.beginPath(); ctx.moveTo(-0.62 * k, 0); ctx.lineTo(-0.7 * k, -0.1 * k); ctx.lineTo(-0.56 * k, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
+  // exaggeration note
+  const vx = ((H - top - 6) / zmax) / (W / span);
+  ctx.font = "11px 'JetBrains Mono', monospace"; ctx.textBaseline = "top"; ctx.fillStyle = C.muted; ctx.textAlign = "right";
+  ctx.fillText(`depth ×${vx.toFixed(1)} · fish ×2`, W - 8, 4); ctx.textAlign = "left";
+}
+
+function drawStrip() {
+  const c = CASES[ci], f = c.frames[fi];
+  const [ctx, W, H] = sizeCanvas($("strip"));
+  const s0 = -c.L - 5, s1 = Math.max(...c.frames.map(q => q[1])) + 2, zmax = 8;
+  const X = s => (s - s0) / (s1 - s0) * W, Y = z => 4 + z / zmax * (H - 8);
+  ctx.fillStyle = C["water-top"]; ctx.fillRect(0, 0, W, H);
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let px = 0; px <= W; px += 2) ctx.lineTo(px, Y(bedAt(c.terrain, s0 + px / W * (s1 - s0))));
+  ctx.lineTo(W, H); ctx.closePath(); ctx.fillStyle = C.seabed; ctx.fill();
+  if ($("showBase").checked) {
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = C.base; ctx.lineWidth = 1.2; ctx.beginPath();
+    for (let i = 0; i < c.base.length; i += 2) { const x = X(c.base[i]), y = Y(c.base[i + 1]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  ctx.strokeStyle = C.ship; ctx.lineWidth = 1.8; ctx.beginPath();
+  for (let i = 0; i <= fi; i++) { const q = c.frames[i], x = X(q[2]), y = Y(q[3]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.stroke();
+  const span = Math.max(36, c.L + 22), centre = (f[1] + f[2]) / 2;
+  ctx.strokeStyle = C.fg; ctx.lineWidth = 1.2; ctx.strokeRect(X(centre - span / 2), 1, X(centre + span / 2) - X(centre - span / 2), H - 2);
+  ctx.font = "10px 'JetBrains Mono', monospace"; ctx.fillStyle = C.muted; ctx.textBaseline = "top";
+  ctx.fillText("whole track · click to jump", 6, 4);
+}
+
+function readouts() {
+  const c = CASES[ci], f = c.frames[fi];
+  const [t, sb, sf, zf, roll, pitch, tgt, ping, surf] = f;
+  const bed = bedAt(c.terrain, sf);
+  $("r-clear").textContent = `${(bed - zf).toFixed(2)} m`;
+  $("r-depth").textContent = `${zf.toFixed(2)} m`;
+  $("r-cmd").textContent = tgt == null ? "–" : `${tgt.toFixed(2)} m`;
+  $("r-bed").textContent = `${bed.toFixed(1)} m`;
+  $("r-ping").textContent = ping == null ? "–" : `${ping.toFixed(2)} m`;
+  $("r-lay").textContent = `${(sb - sf).toFixed(1)} m`;
+  $("r-att").textContent = `${roll.toFixed(0)}° / ${pitch.toFixed(0)}°`;
+  const st = surf || "–", hold = st.startsWith("holding");
+  $("r-state").textContent = st.replace("holding/", "holding: ").replace("tracking/", "tracking: ").toUpperCase();
+  $("r-state").classList.toggle("hold", hold);
+  $("time").textContent = `${t.toFixed(0)} s`;
+  $("scrub").value = fi;
+}
+function draw() { drawMain(); drawStrip(); readouts(); }
+
+function loop(ts) {
+  if (lastTs != null && playing) {
+    acc += (ts - lastTs) / 1000 * Number($("speed").value);
+    const c = CASES[ci];
+    while (acc >= 0.5) { acc -= 0.5; fi++; if (fi >= c.frames.length) { fi = startFrame(c); } }
+    draw();
+  }
+  lastTs = ts; requestAnimationFrame(loop);
+}
+$("play").addEventListener("click", () => { playing = !playing; $("play").textContent = playing ? "Pause" : "Play"; });
+$("scrub").addEventListener("input", e => { fi = Number(e.target.value); acc = 0; draw(); });
+$("showBase").addEventListener("change", draw);
+$("strip").addEventListener("click", e => {
+  const c = CASES[ci], r = e.currentTarget.getBoundingClientRect();
+  const s0 = -c.L - 5, s1 = Math.max(...c.frames.map(q => q[1])) + 2;
+  const s = s0 + (e.clientX - r.left) / r.width * (s1 - s0);
+  let best = 0; c.frames.forEach((q, i) => { if (Math.abs(q[2] - s) < Math.abs(c.frames[best][2] - s)) best = i; });
+  fi = best; acc = 0; draw();
+});
+window.addEventListener("resize", draw);
+if (matchMedia("(prefers-reduced-motion: reduce)").matches) { playing = false; $("play").textContent = "Play"; }
+let first = 2;
+try { const v = Number(localStorage.getItem("bf-case")); if (v >= 0 && v < CASES.length) first = v; } catch (e) {}
+select(first);
+if (CASES[first].terrain === "coral" && !playing) {
+  const c = CASES[first]; const i = c.frames.findIndex(q => q[2] >= 148); if (i > 0) { fi = i; draw(); }
+}
+requestAnimationFrame(loop);
+</script>

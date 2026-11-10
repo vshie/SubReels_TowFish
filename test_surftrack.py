@@ -791,10 +791,12 @@ with mock.patch.object(main.time, "monotonic", return_value=110.0), \
         mock.patch.object(hist, "tow_delay_s", return_value=8.0):
     got = hist.shallowest_ahead(pad_s=2.0)         # window from 100 s
 check("and includes a coral head the fish has not passed", got == 4.0, f"got {got}")
-hist.sample_once({"distance_m": 85.0, "in_range": True, "signal_quality": 40,
-                  "last_update": 4}, 1.0)
+with mock.patch.object(main.time, "monotonic", return_value=111.0):
+    hist.sample_once({"distance_m": 85.0, "in_range": True, "signal_quality": 40,
+                      "last_update": 4}, 1.0)
 check("low-quality packets never reach the buffer",
-      all(d < 30 for _, d in hist._samples), f"got {list(hist._samples)}")
+      len(hist._samples) == 3 and all(s[1] < 30 for s in hist._samples),
+      f"got {list(hist._samples)}")
 
 print("\nstick mapping past the dead zone")
 for skip, up_want, dn_want in ((False, 1650, 1400), (True, 1700, 1350)):

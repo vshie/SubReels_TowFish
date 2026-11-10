@@ -272,7 +272,7 @@ class ExtensionBridge:
         if self.next_sonar is None or t_sim >= self.next_sonar:
             self.next_sonar = t_sim + self.main._SONAR_SAMPLE_PERIOD_S
             self.packet = self.ping.snapshot(t_boat)
-            self.sonar.sample_once(self.packet, self.ping.speed(t_boat))
+            self.sonar.sample_once(self.packet, self.ping.speed(t_boat), self._boat_fix())
         m = self.mav
         if m.vfr_alt is not None:
             self.depth = round(-m.vfr_alt, 2) if m.vfr_alt < 0 else 0.0
@@ -300,6 +300,21 @@ class ExtensionBridge:
             except queue.Empty:
                 break
             self.named_value_float(name, value)
+
+    def altitudes(self):
+        """(position-based, time-delay) altitude the extension would report
+        now, each as (altitude or None, source)."""
+        m = self.main
+        out = []
+        saved = m.altitude_lookup
+        try:
+            for mode in ("position", "delay"):
+                m.altitude_lookup = mode
+                alt, det = m.compute_towfish_altitude(self.depth)
+                out.append((alt, det["source"]))
+        finally:
+            m.altitude_lookup = saved
+        return out
 
     def label(self) -> str:
         """truth.csv `surf` column: 'rescue/<phase>[/gate]' while the
