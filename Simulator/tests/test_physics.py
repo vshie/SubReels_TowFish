@@ -46,7 +46,11 @@ check("flat plate drag ~cd90 at 90 deg", math.isclose(cd[4], 1.98 + 0.02, rel_to
 
 phys = TowfishPhysics(cfg)
 s = phys.strips
-check("12 wing strips + 12 tail strips", len(s.c) == 24, str(len(s.c)))
+check("12 wing strips + 6 tail strips (two V panels)", len(s.c) == 18, str(len(s.c)))
+tail = s.group == hydro.GROUP_FIXED
+check("V tail: 270 cm2, panels 48 deg below horizontal",
+      abs(float(s.area[tail].sum()) - 2 * 0.155 * 0.087) < 1e-6
+      and np.allclose(np.abs(s.span[tail][:, 2]), math.sin(math.radians(48))), f"{s.area[tail].sum():.4f} m2")
 wing = s.group != hydro.GROUP_FIXED
 area = float(s.area[wing].sum())
 check("wing planform area ~666 cm^2 (report 4.1)", abs(area * 1e4 - 666) < 40, f"{area * 1e4:.0f}")
@@ -168,7 +172,11 @@ check("the snap does not stretch the tether (< 0.5 %)", st_i < 5e-3, f"{st_i * 1
 
 
 def _straight_tow(segments, dt, seconds=40.0):
-    sc = Config(overrides={"cable.length": 8.0, "cable.segments": segments})
+    # Cable numerics only: the rigid tow point keeps this open-loop fish
+    # upright (with the bridle and no autopilot it rolls over, which is
+    # physics, not numerics).
+    sc = Config(overrides={"cable.length": 8.0, "cable.segments": segments,
+                           "tow_point.mode": "rigid"})
     f = TowfishPhysics(sc)
     top = np.array([0.0, 0.0, -0.1])
     f.place([-7.0, 0.0, 3.5], quat_from_euler(0, 0, 0), np.array([1.0, 0.0, 0.0]))
@@ -190,9 +198,36 @@ lay3, z3, ok3 = _straight_tow(8, 0.0025)
 check("2.5 ms physics step matches 1 ms (layback within 0.1 m)", ok3 and abs(lay3 - lay1) < 0.1,
       f"{lay3:.2f} vs {lay1:.2f}")
 
+print("\nbridle")
+from towsim.fish import Bridle  # noqa: E402
+bcfg = Config()
+br = Bridle(bcfg, phys.cg_mm)
+apex0 = br.apex_body(None)
+check("legs reach the apex at rest", abs(np.linalg.norm(apex0 - br.p1) - 0.4191) < 1e-6
+      and abs(np.linalg.norm(apex0 - br.p2) - 0.7747) < 1e-6)
+rail_h = -br.p1[2]                                         # rail line height above the CG (body z up = -z)
+check("apex 274 mm above the rail, 380 mm from the channel tip",
+      abs((-apex0[2]) - rail_h - 0.2743) < 1e-3 and abs((br.p1[0] - apex0[0]) - (0.3804 - 0.0635)) < 1e-3,
+      f"{-apex0[2] - rail_h:.4f} m up")
+d_side = np.array([0.6, 0.6, -0.3]); d_side /= np.linalg.norm(d_side)
+ap = br.apex_body(d_side)
+mom_hinge = float(np.cross(ap - br.p1, d_side) @ br.u)
+check("a sideways pull has no moment about the hinge (rail) axis", abs(mom_hinge) < 1e-9, f"{mom_hinge:.2e}")
+angs = np.radians(np.linspace(1, 179, 357))
+pts = [br.apex_body(np.array([math.cos(a), 0.0, -math.sin(a)])) for a in angs]
+jump = max(float(np.linalg.norm(pts[i + 1] - pts[i])) for i in range(len(pts) - 1))
+check("tow point moves continuously through both slack changes", jump < 0.02, f"max step {jump * 1000:.1f} mm")
+br.apex_body(np.array([math.cos(math.radians(10)), 0.0, -math.sin(math.radians(10))]))
+check("tether within 20.7 deg of the rail: front leg slack, hangs from the rear leg", br.state == "rear")
+br.apex_body(np.array([math.cos(math.radians(40)), 0.0, -math.sin(math.radians(40))]))
+check("tether at 40 deg: both legs taut", br.state == "both")
+rig = TowfishPhysics(Config(overrides={"tow_point.mode": "rigid"}))
+check("rigid mode keeps the configured point",
+      np.allclose(rig.r_tow, step_to_body(np.array(bcfg["tow_point.pos"], dtype=float), rig.cg_mm)))
+
 print("\nrigid body")
 check("total mass matches owner weighing", math.isclose(phys.mass, 3.2205))
-check("CG height computed (contents on axis) ~3.9 mm", abs(phys.cg_mm[0] - 3.92) < 0.1)
+check("CG height computed (contents on axis) ~3.7 mm", abs(phys.cg_mm[0] - 3.69) < 0.1, f"{phys.cg_mm[0]:.2f}")
 check("added mass dominates roll inertia", phys.M[3, 3] > 5 * phys.J[0, 0])
 f = TowfishPhysics(cfg)
 f.place([0, 0, 5.0], quat_from_euler(0, 0, 0), np.zeros(3))

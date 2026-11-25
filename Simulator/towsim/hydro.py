@@ -1,6 +1,6 @@
 """Strip-theory hydrodynamics for the towfish.
 
-Every lifting surface (both servo wings, the cruciform tail) is cut into
+Every lifting surface (both servo wings, the tail panels) is cut into
 spanwise strips. Each strip sees the local water velocity including the
 body's rotation, so roll/pitch/yaw damping and sideslip effects come out of
 the geometry instead of being assigned. Bluff parts (housing, top bar, tube
@@ -84,26 +84,23 @@ def build_geometry(cfg: Config, cg_mm: np.ndarray) -> tuple[Strips, Elements]:
             rows.append(([x_w, yq, side * zm], y_axis, x_axis, chord_mm / 1000,
                          (b - a) / 1000, ar_w, group, inc))
 
-    # Tail: horizontal halves on the tube axis height (ASSUMED x = 0, the
-    # report gives only the cruciform's overall extents), vertical above and
-    # below.
+    # Tail: flat panels from a root on the spine, each at its own angle in
+    # the cross-section (0 = horizontal to starboard, 90 = straight up,
+    # -48 = down and out to starboard), all sharing one chord and leading
+    # edge station. A V is two panels, a cross four.
     tc = float(cfg["tail.chord"])
     yq = float(cfg["tail.y_le"]) + 0.25 * tc
-    hs = float(cfg["tail.half_span_h"])
     k = int(cfg["tail.strips"])
-    ar_h = float(cfg["foil.ar_tail_h"])
-    ar_v = float(cfg["foil.ar_tail_v"])
-    for side in (1.0, -1.0):
-        e = np.linspace(0.0, hs, k + 1)
-        for a, b in zip(e[:-1], e[1:]):
-            rows.append(([0.0, yq, side * 0.5 * (a + b)], y_axis, x_axis,
-                         tc / 1000, (b - a) / 1000, ar_h, GROUP_FIXED, 0.0))
-    for lo, hi in ((0.0, float(cfg["tail.v_top"])), (float(cfg["tail.v_bottom"]), 0.0)):
-        e = np.linspace(lo, hi, k + 1)
-        for a, b in zip(e[:-1], e[1:]):
-            # Vertical surface: span along body z (down).
-            rows.append(([0.5 * (a + b), yq, 0.0], z_axis, x_axis,
-                         tc / 1000, abs(b - a) / 1000, ar_v, GROUP_FIXED, 0.0))
+    for pnl in cfg["tail.panels"]:
+        a = math.radians(float(pnl["angle_deg"]))
+        sx, sz = math.sin(a), math.cos(a)                 # STEP up, starboard
+        span_body = np.array([0.0, sz, -sx])              # FRD: starboard, down
+        e = np.linspace(0.0, float(pnl["span"]), k + 1)
+        for r0, r1 in zip(e[:-1], e[1:]):
+            rm = 0.5 * (r0 + r1)
+            rows.append(([float(pnl["root_x"]) + rm * sx, yq, float(pnl.get("root_z", 0.0)) + rm * sz],
+                         span_body, x_axis, tc / 1000, (r1 - r0) / 1000,
+                         float(pnl["ar"]), GROUP_FIXED, 0.0))
 
     pos = step_to_body(np.array([r[0] for r in rows]), cg_mm)
     strips = Strips(

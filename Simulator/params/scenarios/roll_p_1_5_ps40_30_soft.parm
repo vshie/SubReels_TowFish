@@ -1,0 +1,6 @@
+# 40/30 caps plus a softer vertical (depth) controller (pitch study, 25 Nov).
+ATC_ANG_RLL_P,1.5
+PILOT_SPEED_UP,40
+PILOT_SPEED_DN,30
+PSC_D_VEL_P,4
+PSC_D_ACC_P,0.03

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -349,10 +350,14 @@ def main() -> int:
         "axis_z": r4(step_to_body([0, 0, 0], cg)[2]),
         "bar": [r4(step_to_body([0, y, 0], cg)[0]) for y in (-479.6, 739.6)]
                + [r4(step_to_body([x, 0, 0], cg)[2]) for x in (65.3, 78.1)],
-        "tail_x": [r4(step_to_body([0, y, 0], cg)[0]) for y in (584.8, 674.8)],
-        "tail_h": float(cfg["tail.half_span_h"]) / 1000,
-        "tail_v": [r4(step_to_body([x, 0, 0], cg)[2])
-                   for x in (float(cfg["tail.v_top"]), float(cfg["tail.v_bottom"]))],
+        "tail_x": [r4(step_to_body([0, y, 0], cg)[0])
+                   for y in (float(cfg["tail.y_le"]), float(cfg["tail.y_le"]) + float(cfg["tail.chord"]))],
+        # Extents of the tail panels (the viewer draws a box-outline fin).
+        "tail_h": max(abs(p.get("root_z", 0.0) + p["span"] * math.cos(math.radians(p["angle_deg"])))
+                      for p in cfg["tail.panels"]) / 1000,
+        "tail_v": [r4(step_to_body([x, 0, 0], cg)[2]) for x in (
+            max(p["root_x"] + max(0.0, p["span"] * math.sin(math.radians(p["angle_deg"]))) for p in cfg["tail.panels"]),
+            min(p["root_x"] + min(0.0, p["span"] * math.sin(math.radians(p["angle_deg"]))) for p in cfg["tail.panels"]))],
     }
     payload = {
         "hst0": args.t_from, "t0_utc": t_a + off,

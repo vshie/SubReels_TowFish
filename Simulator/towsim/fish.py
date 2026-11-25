@@ -46,6 +46,59 @@ def _cg_and_inertia(cfg: Config):
     return cg, J, total
 
 
+class Bridle:
+    """Two-leg bridle tied to a fixed point on the line, legs attached on the
+    rail's centreline.
+
+    The legs and the rail make a triangle that swings freely about the line
+    through the two attachments (a hinge), so it always turns to contain
+    the tether. While the tether's angle from the rail, in that plane, lies
+    between the rear leg's angle and 180 deg minus the front leg's, both
+    legs are taut and the tow point is the triangle's apex. Pulled flatter
+    than that, the front leg goes slack and the fish hangs from the rear
+    attachment with the rear leg in line with the tether; pulled further
+    aft, the reverse. The tow point is continuous across both changes.
+    """
+
+    def __init__(self, cfg: Config, cg_mm):
+        b = cfg["tow_point.bridle"]
+        self.p1 = step_to_body(np.array(b["front"], dtype=float), cg_mm)   # front attachment
+        self.p2 = step_to_body(np.array(b["rear"], dtype=float), cg_mm)    # rear attachment
+        self.a = float(b["front_leg"]) / 1000.0
+        self.b = float(b["rear_leg"]) / 1000.0
+        c = float(np.linalg.norm(self.p1 - self.p2))
+        self.u = (self.p1 - self.p2) / c                                    # hinge axis, forward
+        self.xa = (self.a ** 2 - self.b ** 2 + c ** 2) / (2 * c)            # apex aft of p1
+        self.h = math.sqrt(max(0.0, self.a ** 2 - self.xa ** 2))
+        self.foot = self.p1 - self.xa * self.u
+        self.psi_rear = math.atan2(self.h, c - self.xa)                     # rear leg's angle
+        self.psi_front = math.pi - math.atan2(self.h, self.xa)              # 180 - front leg's
+        up = np.array([0.0, 0.0, -1.0])
+        self.n = up - (up @ self.u) * self.u
+        self.n /= np.linalg.norm(self.n)
+        self.state = "both"
+
+    def apex_body(self, d):
+        """Tow point (body FRD, m) for a tether direction ``d`` (body unit
+        vector from the tow point toward the boat); None = at rest, up."""
+        if d is None:
+            return self.foot + self.h * self.n
+        along = float(d @ self.u)
+        perp = d - along * self.u
+        pn = float(np.linalg.norm(perp))
+        if pn > 1e-6:
+            self.n = perp / pn
+        psi = math.atan2(pn, along)
+        if psi < self.psi_rear:
+            self.state = "rear"
+            return self.p2 + self.b * d
+        if psi > self.psi_front:
+            self.state = "front"
+            return self.p1 + self.a * d
+        self.state = "both"
+        return self.foot + self.h * self.n
+
+
 class TowfishPhysics:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -54,6 +107,13 @@ class TowfishPhysics:
         self.cg_mm, self.J, self.mass = _cg_and_inertia(cfg)
         self.r_cb = step_to_body(np.array(cfg["buoyancy.cb"], dtype=float), self.cg_mm)
         self.r_tow = step_to_body(np.array(cfg["tow_point.pos"], dtype=float), self.cg_mm)
+        try:
+            self.tow_mode = str(cfg["tow_point.mode"])
+        except KeyError:
+            self.tow_mode = "rigid"
+        if self.tow_mode == "bridle":
+            self.bridle = Bridle(cfg, self.cg_mm)
+            self.r_tow = self.bridle.apex_body(None)
         self.volume = (float(cfg["buoyancy.volume"]) + float(cfg["buoyancy.extra_volume"])) * 1e-6
         self.r_axial = step_to_body(np.array([0.0, float(cfg["body.axial_center_y"]), 0.0]), self.cg_mm)
         self.axial_cda = float(cfg["body.axial_cda"])
@@ -68,12 +128,7 @@ class TowfishPhysics:
         M[3:, 3:] = self.J
         self.M = M + A
         self.Minv = np.linalg.inv(self.M)
-        # Effective inverse mass at the tow point (body frame): how the tow
-        # point's velocity answers an impulse there, rotation included.
-        r = self.r_tow
-        skew = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]])
-        Jt = np.hstack([np.eye(3), -skew])
-        self.K_tow_body = Jt @ self.Minv @ Jt.T
+        self._set_tow_point(self.r_tow)
 
         self.k_defl = math.radians(float(cfg["wings.deflection_per_us"]))
         self.defl_lim = math.radians(float(cfg["wings.deflection_limit"]))
@@ -96,6 +151,24 @@ class TowfishPhysics:
         self.last_tow_force = np.zeros(3)
         self.last_alpha = np.zeros(len(self.strips.c))
         self.jig = False
+
+    def _set_tow_point(self, r):
+        """Tow point (body FRD, m) and its effective inverse mass: how the
+        tow point's velocity answers an impulse there, rotation included."""
+        self.r_tow = r
+        skew = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]])
+        Jt = np.hstack([np.eye(3), -skew])
+        self.K_tow_body = Jt @ self.Minv @ Jt.T
+
+    def _update_bridle(self, R):
+        """Re-seat the bridle apex on the tether's current direction."""
+        if self.tow_mode != "bridle":
+            return
+        d = self.cable.x[-2] - self.cable.x[-1]          # NED, apex toward the boat
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            return
+        self._set_tow_point(self.bridle.apex_body(R.T @ (d / n)))
 
     # -- inputs ---------------------------------------------------------
     def set_servos(self, pwm: list[int] | np.ndarray):
@@ -151,6 +224,7 @@ class TowfishPhysics:
         if self.cable.model != "spring":
             return self._step_inextensible(dt, top_pos, top_vel)
         R = quat_to_dcm(self.q)
+        self._update_bridle(R)
         tow_pos = self.pos + R @ self.r_tow
         tow_vel = R @ (self.v + np.cross(self.w, self.r_tow))
         tow_force = self.cable.step(dt, top_pos, top_vel, tow_pos, tow_vel, self.current)
@@ -181,6 +255,7 @@ class TowfishPhysics:
         """Predict the fish without the tether, solve the tether's link
         tensions against the fish's effective mass, apply the impulse."""
         R = quat_to_dcm(self.q)
+        self._update_bridle(R)
         tow_pos = self.pos + R @ self.r_tow
         tow_vel = R @ (self.v + np.cross(self.w, self.r_tow))
         drag_end = self.cable.predict(dt, top_pos, top_vel, tow_pos, tow_vel, self.current)

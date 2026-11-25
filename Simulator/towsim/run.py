@@ -222,6 +222,9 @@ def main(argv=None) -> int:
     ap.add_argument("--bottom-depth", type=float,
                     help="with --extension: a flat bottom at this depth instead of the logged "
                          "sounding")
+    ap.add_argument("--speed-wobble", type=float, default=0.0, metavar="STD",
+                    help="with --straight: random boat speed changes of this standard "
+                         "deviation (m/s), seeded; 4 Nov straight legs were ~0.05")
     ap.add_argument("--terrain", metavar="SPEC",
                     help="seabed along the tow, seen by a Ping model (towsim/terrain.py): "
                          "slope, coral or flat:<depth>; distance is measured from the boat "
@@ -264,7 +267,8 @@ def main(argv=None) -> int:
                                      turn_speed_hold_s=args.turn_speed_hold)
     if args.straight:
         from towsim.boat_track import synthetic_straight_track
-        track = synthetic_straight_track(track, t_start - args.warmup - 5, args.straight)
+        track = synthetic_straight_track(track, t_start - args.warmup - 5, args.straight,
+                                         wobble_std=args.speed_wobble)
     if args.autoright_only:
         args.extension = True
     if args.extension:

@@ -834,7 +834,7 @@ PARAM_SPECS = [
     {
         "name": "PSC_D_POS_P",
         "vehicle": "towfish",
-        "default": 1.0,
+        "default": 0.5,
         "unit": "",
         "decimals": 2,
         "min": 0.1,
@@ -842,9 +842,46 @@ PARAM_SPECS = [
         "presets": [0.5, 1.0, 2.0, 3.0],
         "desc": "Converts depth error into a target vertical speed. The "
                 "stock 3.0 was chosen against a 1 m/s vehicle; paired with "
-                "a 20-30 cm/s limit it saturates on 7-10 cm of error, which is "
+                "a 30-40 cm/s limit it saturates on ~10 cm of error, which is "
                 "bang-bang control on a sensor that sees more wave noise "
-                "than that. 1.0 gives a 30-40 cm proportional band.",
+                "than that. 0.5 gives a 60-80 cm proportional band. With "
+                "PSC_D_VEL_P 4 and PSC_D_ACC_P 0.03 it cut the fish's "
+                "straight-line pitching from +-1.5 to +-0.4 deg in simulation "
+                "(25 Nov) and halved its depth wobble, with hairpins, dives "
+                "and the coral dodge no worse.",
+    },
+    # The depth hold's inner loops. Every correction they make moves the
+    # wings, and the wings' lift sits ~108 mm ahead of the CG, so it also
+    # pitches the fish -- which disturbs depth and calls for the next
+    # correction. At 8 / 0.05 (flown 4 Nov) that loop kept the fish
+    # oscillating ~+-1.5 deg in pitch every ~9 s behind a perfectly steady
+    # boat in simulation; halving them calmed it (Simulator/analysis/
+    # sweep.py "pitch" and "pitchfix").
+    {
+        "name": "PSC_D_VEL_P",
+        "vehicle": "towfish",
+        "default": 4.0,
+        "unit": "",
+        "decimals": 1,
+        "min": 0.5,
+        "max": 20.0,
+        "presets": [2.0, 4.0, 8.0],
+        "desc": "Vertical speed error to acceleration demand. Flown at 8 on "
+                "4 Nov. Lower means the depth hold reacts more gently, so its "
+                "wing corrections stop rocking the fish in pitch.",
+    },
+    {
+        "name": "PSC_D_ACC_P",
+        "vehicle": "towfish",
+        "default": 0.03,
+        "unit": "",
+        "decimals": 3,
+        "min": 0.005,
+        "max": 0.5,
+        "presets": [0.02, 0.03, 0.05],
+        "desc": "Vertical acceleration error to wing collective. Flown at "
+                "0.05 on 4 Nov. Lower means smaller, smoother wing moves for "
+                "the same depth correction.",
     },
     {
         "name": "PSC_JERK_D",
@@ -924,6 +961,8 @@ PARAM_AS_FLOWN = {
     "PILOT_SPEED_DN": 0.0,
     "MOT_THST_EXPO": 0.65,
     "PSC_D_POS_P": 3.0,
+    "PSC_D_VEL_P": 8.0,
+    "PSC_D_ACC_P": 0.05,
     "PSC_JERK_D": 50.0,
     "ATC_RAT_RLL_IMAX": 0.444,
     "ATC_RATE_R_MAX": 0.0,

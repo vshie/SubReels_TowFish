@@ -31,7 +31,7 @@ mass:
     value:
       - {name: wing_stbd,  mass: 0.15657, pos: [-9.2, 67.2,  165.8], shape: point}
       - {name: wing_port,  mass: 0.15657, pos: [-9.2, 67.2, -165.8], shape: point}
-      - {name: tail_fin,   mass: 0.0444,  pos: [30.6, 630.2, 0.0],   shape: point}
+      - {name: tail_fin,   mass: 0.0444,  pos: [14.1, 721.5, 0.0],   shape: point}
       - {name: bar,        mass: 0.1972,  pos: [71.7, 130.0, 0.0],   shape: rod_y, length: 1219.2}
       - {name: housing,    mass: 2.6658,  pos: [0.0, 105.8, 0.0],    shape: cylinder_y, radius: 56.0, length: 267.3}
     units: kg, mm
@@ -56,12 +56,23 @@ buoyancy:
   cb:             {value: [2.44, 94.7, -0.08], units: mm, status: estimate, source: "geometry report 2.2"}
 
 tow_point:
-  # Top of the "top rod" 508 mm forward of the end-cap face. The rod height above
-  # the bar is unknown; 100 mm is a placeholder (open item 2).
+  # How the tether attaches. "bridle" (the fish as built): a line tied at a
+  # fixed point, legs to two attachments on the rail -- see towsim/fish.py
+  # Bridle. "rigid": a fixed point at `pos` (a clamp on a spine).
+  mode:           {value: bridle, status: owner, source: "owner 19 Nov: the tow point has always been a bridle"}
+  bridle:
+    # Owner 19 Nov: 16.5 in nose leg, 30.5 in tail leg; attachments 2.5 in behind
+    # the 48 in channel's tip and 4.5 in from its stern, on the rail top. The
+    # apex sits 380.4 mm from the tip, 274.3 mm above the rail.
+    value: {front: [78.1, -416.1, 0.0], rear: [78.1, 625.3, 0.0], front_leg: 419.1, rear_leg: 774.7}
+    units: mm
+    status: owner
+    source: "owner 19 Nov 2026 bridle measurements"
+  # Superseded rod model (top of a "top rod" 153.6 mm from the tip, 100 mm up);
+  # used only in mode rigid.
   pos:            {value: [178.1, -326.0, 0.0], units: mm, status: ASSUMED,
                    bounds_x: [78.1, 300.0],
-                   source: "y owner (geometry report 2.4); x = bar top 78.1 + ASSUMED 100 mm rod"}
-  rod:            {value: rigid, status: ASSUMED, source: "rigid vs pivoting unknown; open item 2"}
+                   source: "rigid mode only; was the rod model up to 18 Nov"}
 
 wings:
   # Spanwise stations of ONE wing (mirror at -Z). |z| in mm, LE/TE y in mm.
@@ -98,14 +109,23 @@ wings:
                    source: "typical submersible servo, ~0.2 s/60 deg"}
 
 tail:
-  # Cruciform fin: y 584.8..674.8 (90 mm chord); horizontal |z| <= 107.3,
-  # vertical x -45.0..+78.2. Fixed surfaces.
-  chord:          {value: 90.0, units: mm, status: measured, source: "geometry report 3 (bar and tail)"}
-  y_le:           {value: 584.8, units: mm, status: measured, source: "geometry report 3"}
-  half_span_h:    {value: 107.3, units: mm, status: measured, source: "geometry report 3"}
-  v_top:          {value: 78.2, units: mm, status: measured, source: "geometry report 3"}
-  v_bottom:       {value: -45.0, units: mm, status: measured, source: "geometry report 3"}
-  strips:         {value: 3, status: literature, source: "strips per tail surface half"}
+  # The fish as built (owner 20 Nov): an underslung V, two flat 155 x 87 mm
+  # panels 84 deg apart (48 deg below horizontal), rooted at the back of the
+  # spine. The geometry report's "cruciform" (|z| <= 107.3, x -45..78.2) was
+  # this V's bounding box: 155 cos 48 = 104 out, 155 sin 48 = 115 down.
+  chord:          {value: 87.0, units: mm, status: owner, source: "owner 20 Nov 2026"}
+  # Trailing edge 1 in past the 48 in channel (owner 19 Nov): 1244.6 mm from
+  # the channel tip, y 765.0.
+  y_le:           {value: 678.0, units: mm, status: owner, source: "owner 19-20 Nov 2026 (CAD 584.8)"}
+  panels:
+    # root_x/root_z: STEP mm (up, starboard); angle in the cross-section, 0 =
+    # horizontal to starboard, 90 = up. ar: the pair's span / chord.
+    value:
+      - {root_x: 71.7, root_z: 0.0, angle_deg: -48.0, span: 155.0, ar: 3.56}
+      - {root_x: 71.7, root_z: 0.0, angle_deg: -132.0, span: 155.0, ar: 3.56}
+    status: owner
+    source: "owner 20 Nov 2026; root on the channel centreline"
+  strips:         {value: 3, status: literature, source: "strips per tail panel"}
 
 foil:
   stall_alpha:    {value: 12.0, units: deg, status: literature, bounds: [9.0, 16.0],
@@ -116,8 +136,6 @@ foil:
   stall_blend:    {value: 0.035, units: rad, status: literature, source: "width of attached->separated blend"}
   # Effective aspect ratios for the finite-span lift slope a = 2*pi*AR/(AR+2).
   ar_wing:        {value: 3.8, status: estimate, source: "503 mm tip-to-tip span^2 / 666 cm^2 area"}
-  ar_tail_h:      {value: 2.4, status: estimate, source: "214.6 mm span / 90 mm chord"}
-  ar_tail_v:      {value: 1.4, status: estimate, source: "123 mm height / 90 mm chord, hull-blocked"}
 
 body:
   # Slender elements for cross-flow drag (and axial drag split evenly). Each is a

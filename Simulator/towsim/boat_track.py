@@ -186,21 +186,31 @@ def synthetic_turn_track(real: BoatTrack, t_from: float, t_turn: float, turn_sig
                      wp_times=wps)
 
 
-def synthetic_straight_track(real: BoatTrack, t_from: float, speed: float) -> BoatTrack:
-    """A straight tow at a constant speed on the logged heading at `t_from`.
+def synthetic_straight_track(real: BoatTrack, t_from: float, speed: float,
+                             wobble_std: float = 0.0, seed: int = 0) -> BoatTrack:
+    """A straight tow on the logged heading at `t_from`.
 
     For steady-state checks (e.g. the deepest the fish can fly on a given
-    tether): no turns, no speed changes.
+    tether): no turns. Constant speed unless `wobble_std` > 0, which adds
+    slow random speed changes of that standard deviation (m/s): 1 Hz noise
+    smoothed over 5 s, seeded so every design sees the same wobble. The
+    4 Nov straight legs varied by ~0.04-0.08 m/s.
     """
     i0 = int(np.searchsorted(real.t, t_from))
     j = min(len(real.t) - 1, i0 + 200)
     hdg = math.atan2(real.e[j] - real.e[i0], real.n[j] - real.n[i0])
     t = real.t[i0:].copy()
-    s = speed * (t - t[0])
+    v = np.full(len(t), float(speed))
+    if wobble_std > 0:
+        rng = np.random.default_rng(seed)
+        tk = np.arange(t[0], t[-1] + 1.0, 1.0)
+        raw = np.convolve(rng.normal(0.0, 1.0, len(tk) + 4), np.ones(5) / 5, mode="valid")[:len(tk)]
+        v = v + np.interp(t, tk, raw / raw.std() * wobble_std)
+    s = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * np.diff(t))])
     n = real.n[i0] + s * math.cos(hdg)
     e = real.e[i0] + s * math.sin(hdg)
-    vn = np.full(len(t), speed * math.cos(hdg))
-    ve = np.full(len(t), speed * math.sin(hdg))
+    vn = v * math.cos(hdg)
+    ve = v * math.sin(hdg)
     return BoatTrack(t=t, n=n, e=e, vn=vn, ve=ve, speed=np.hypot(vn, ve),
                      lat0=real.lat0, lon0=real.lon0,
                      heading0_deg=math.degrees(hdg) % 360,

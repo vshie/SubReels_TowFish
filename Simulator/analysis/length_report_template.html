@@ -1,0 +1,185 @@
+<title>How Short Can the Towfish Be</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a findings sheet. Answer first, silhouettes to scale, the stability map, then the evidence. */
+:root {
+  --bg: #eef2f3; --sheet: #fbfcfc; --ink: #17242b; --ink-2: #4f5f67; --ink-3: #8a989f; --rule: #d3dcdf;
+  --carbon: #22292d; --hull: #b9c7ce; --fin: #7e98a5; --accent: #e8590c;
+  --pass: #2b7a3d; --pass-bg: #dcefe0; --marg: #a8650a; --marg-bg: #f8ead2; --fail: #b4232b; --fail-bg: #f7dcdd;
+  --display: "Barlow Condensed", "Arial Narrow", Arial, sans-serif;
+  --body: "Source Sans 3", "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e1417; --sheet: #141d21; --ink: #dde7ea; --ink-2: #a2b2b9; --ink-3: #6f8088; --rule: #263339;
+  --carbon: #c8d3d7; --hull: #4f6670; --fin: #6f8c99; --accent: #ff8a4c;
+  --pass: #6fcf86; --pass-bg: #17301f; --marg: #f2b35c; --marg-bg: #3a2c14; --fail: #ff8a8f; --fail-bg: #3b1a1d; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0e1417; --sheet: #141d21; --ink: #dde7ea; --ink-2: #a2b2b9; --ink-3: #6f8088; --rule: #263339;
+  --carbon: #c8d3d7; --hull: #4f6670; --fin: #6f8c99; --accent: #ff8a4c;
+  --pass: #6fcf86; --pass-bg: #17301f; --marg: #f2b35c; --marg-bg: #3a2c14; --fail: #ff8a8f; --fail-bg: #3b1a1d; color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--ink); font: 400 16px/1.55 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 1120px; margin: 0 auto; padding-block: 28px 56px; display: grid; gap: 26px; }
+.eyebrow { font: 600 .75rem var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+h1 { font: 700 clamp(2rem, 5vw, 3rem)/1 var(--display); margin: 6px 0 10px; text-wrap: balance; }
+h2 { font: 600 1.35rem/1.2 var(--display); margin: 0 0 10px; letter-spacing: .02em; }
+.lede { margin: 0; color: var(--ink-2); max-width: 76ch; font-size: 1.08rem; }
+.answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.ans { background: var(--sheet); border: 1px solid var(--rule); border-radius: 4px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; }
+.ans b { font: 700 1.6rem/1.05 var(--display); }
+.ans span { color: var(--ink-2); font-size: .93rem; }
+figure { margin: 0; background: var(--sheet); border: 1px solid var(--rule); border-radius: 4px; padding: 12px; min-width: 0; }
+figcaption { font-size: .9rem; color: var(--ink-2); padding-top: 6px; max-width: 80ch; }
+.scroll { overflow-x: auto; }
+svg.sil { display: block; width: 100%; min-width: 640px; height: auto; }
+svg.sil text { font: 12px var(--mono); fill: var(--ink-2); }
+svg.sil .lab { font: 600 14px var(--display); fill: var(--ink); }
+.map { border-collapse: separate; border-spacing: 6px; width: 100%; }
+.map th { font: 600 .78rem var(--display); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); text-align: left; padding: 4px 6px; }
+.map td { border-radius: 4px; padding: 9px 10px; vertical-align: top; font-size: .88rem; min-width: 140px; }
+.map td.rowh { background: none; font: 600 1rem var(--mono); white-space: nowrap; }
+.map td.rowh small { display: block; font: 400 .75rem var(--body); color: var(--ink-2); }
+.st { font: 700 .74rem var(--mono); letter-spacing: .06em; text-transform: uppercase; display: block; margin-bottom: 2px; }
+.pass { background: var(--pass-bg); } .pass .st { color: var(--pass); }
+.marginal { background: var(--marg-bg); } .marginal .st { color: var(--marg); }
+.fail { background: var(--fail-bg); } .fail .st { color: var(--fail); }
+.none { background: none; border: 1px dashed var(--rule); color: var(--ink-3); }
+.tablewrap { overflow-x: auto; background: var(--sheet); border: 1px solid var(--rule); border-radius: 4px; }
+table.t { border-collapse: collapse; width: 100%; font-size: .9rem; }
+table.t th, table.t td { padding: 7px 10px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+table.t th { font: 600 .76rem/1.2 var(--display); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
+table.t td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+table.t tr:last-child td { border-bottom: 0; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+@media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+.panel { background: var(--sheet); border: 1px solid var(--rule); border-radius: 4px; padding: 14px 16px; }
+ul { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
+.note { font-size: .88rem; color: var(--ink-2); max-width: 82ch; margin: 0; }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">SubReels towfish · simulator study · 24–25 Nov 2026</div>
+    <h1>How short can the towfish be?</h1>
+    <p class="lede">The 50 mm twin-tube spine with an upright V tail, shortened from 1000 mm in steps, at 1×, 1.5× and 2× tail area, plus two layouts with no spine at all. Every layout had to hold a straight line, fly the hairpins without a roll past 45°, and change depth from 1 m to the tether's limit and back.</p>
+  </header>
+
+  <div class="answers">
+    <div class="ans"><b>~680 mm spine</b><span>with today's tail (two 155 × 87 mm panels) is the shortest with real margin in the hairpins (worst roll 34°). That's about a third shorter than 1 m. Its one flag: 12° of pitch wander when towed at 0.8 m/s on the 25 m tether, right at the limit.</span></div>
+    <div class="ans"><b>~630 mm is the edge</b><span>632 mm with today's tail passed every test, but rolled 42° in the tight 25 m hairpin, 3° from failing. A 1.5× tail (two 190 × 107 mm panels) at that length flew the hairpins best of all (worst 28°).</span></div>
+    <div class="ans"><b>A spine is needed</b><span>Towed from a hoop on the tube with no tail, the fish rolls over in a straight line. A V on the end cap needs 3× the area just to fly straight, and it still wanders.</span></div>
+  </div>
+
+  <figure>
+    <div class="scroll"><svg class="sil" id="sil" viewBox="0 0 760 400" role="img" aria-label="Side silhouettes to the same scale: the 1000 mm spine, the 682 mm spine that passes, and the pressure tube alone with a hoop, which rolls over."></svg></div>
+    <figcaption>To scale, nose left. The pressure tube, wings and 200 g weight are the same in all three. Only the spine length and where the tail sits change.</figcaption>
+  </figure>
+
+  <section>
+    <h2>Stability map</h2>
+    <div class="scroll"><table class="map" id="map"></table></div>
+    <p class="note">Spine length from the front tip to the end; the tail arm is from today's CG to the tail's quarter chord. Each cell shows the verdict and the worst peak roll across the hairpins. <b>Marginal</b> passes every main test but wanders in pitch on the 25 m tether at 0.8 m/s. Cells marked boundary-tested also flew the wider 25 m hairpin and holds at 0.8 and 1.2 m/s.</p>
+  </section>
+
+  <div class="two">
+    <section>
+      <h2>Without a spine</h2>
+      <div class="tablewrap"><table class="t" id="other"></table></div>
+      <p class="note" style="margin-top:8px">The hoop-over-the-CG runs didn't settle normally (the 8 m run sat at a fixed 2.04 m and needed auto-righting), so read them only as a failure, not a measurement. A tail right behind the end cap is only about 90 mm behind the CG, against 350–670 mm on a spine. It needs roughly as much area times arm as the spine tails, which is why 3× barely flies straight.</p>
+    </section>
+    <section>
+      <h2>Recommended short layout: 682 mm, today's tail</h2>
+      <div class="tablewrap"><table class="t">
+        <tr><th>Station from spine tip</th><th>mm</th></tr>
+        <tr><td>Tow clamp, top of upper tube</td><td class="n">25</td></tr>
+        <tr><td>Dome tip</td><td class="n">38.7</td></tr>
+        <tr><td>200 g weight under the tube</td><td class="n">64</td></tr>
+        <tr><td>Collar coupler, wing pivot</td><td class="n">154</td></tr>
+        <tr><td>Balance point (CG)</td><td class="n">~254</td></tr>
+        <tr><td>End cap</td><td class="n">306</td></tr>
+        <tr><td>Mid coupler</td><td class="n">372</td></tr>
+        <tr><td>Upright V tail, leading to trailing edge</td><td class="n">590–677</td></tr>
+        <tr><td>Tail coupler</td><td class="n">633.5</td></tr>
+        <tr><td>Spine end</td><td class="n">682</td></tr>
+      </table></div>
+      <p class="note" style="margin-top:8px">The same 50 mm tube spacing and clamp position as the 1 m layout; only the tail moves forward. Same tail: two 155 × 87 mm panels, 48° above horizontal on the top tube.</p>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>What else the runs showed</h2>
+    <ul>
+      <li><b>Depth changes don't depend on length.</b> Every spine length dived and climbed at the same rate: about 0.08 m/s down and 0.12 m/s up on the 8 m tether, and 0.17 m/s down and 0.23 m/s up on the 25 m. Roll stayed under 6° in transit.</li>
+      <li><b>Holding a straight line is easy for any spine.</b> All 15 spine layouts held within ±0.3 m and under 10° of roll. Shorter ones wobble a little more: up to 2.4° of heading wander settling down at 582 mm, against 0.1° at 1 m.</li>
+      <li><b>The one weakness of a short fish is slow towing on the long tether.</b> At 0.8 m/s holding 8 m on the 25 m tether, pitch ranged 12–14° on the 582–682 mm layouts and 9° on the 1 m.</li>
+      <li><b>Tail area and arm trade off.</b> The 582 mm spine failed with today's tail (a 45° roll in the tight 25 m hairpin) but passed with 1.5× area. As a rule of thumb, keep tail area × arm above about 8,500 cm³: today's 270 cm² at 32 cm or more behind the CG.</li>
+      <li><b>At the surface without auto-righting, every layout rolled.</b> That was the depth-change test overshooting to the surface, and the extension's auto-righting covers it in service. It isn't a length effect.</li>
+    </ul>
+  </section>
+
+  <p class="note">Simulation: ArduSub SITL with the towed-body physics; Kevlar tether, 40/30 pilot speed caps, the shipped extension in the holds and hairpins. The tail is modelled as printed: 3 mm PETG, 3 perimeters, 10% gyroid, flooded core, about 47 g for today's V. The fish's mass is otherwise unchanged and the CG moves with the tail. The model still differs from the 4 Nov log by about 4° of straight-line pitch, so treat the boundary as approximate and confirm the short layout in the water before cutting tubes for good.</p>
+</main>
+
+<script>
+const DATA = /*DATA*/null;
+const KS = ["1× · 270 cm²", "1.5× · 405 cm²", "2× · 540 cm²"];
+// stability map
+const map = document.getElementById("map");
+let h = "<tr><th>Spine</th>" + KS.map(k => `<th>Tail ${k}</th>`).join("") + "</tr>";
+for (const r of DATA.cells) {
+  h += `<tr><td class="rowh">${Math.round(r.spine)} mm<small>arm ${r.arm} mm</small></td>`;
+  for (const c of r.row) {
+    if (!c) { h += `<td class="none">not flown</td>`; continue; }
+    const label = { pass: "Pass", marginal: "Marginal", fail: "Fail", none: "—" }[c.state];
+    h += `<td class="${c.state}"><span class="st">${label}</span>${c.worst != null ? `worst hairpin roll ${Math.round(c.worst)}°` : ""}${c.note ? `<br>${c.note}` : ""}</td>`;
+  }
+  h += "</tr>";
+}
+map.innerHTML = h;
+// no-spine table
+document.getElementById("other").innerHTML = "<tr><th>Layout</th><th>Straight-line hold</th></tr>" +
+  DATA.other.map(o => `<tr><td>${o.name}</td><td>${o.result}</td></tr>`).join("");
+// silhouettes, 0.62 px/mm, stations from the spine tip
+const S = 0.62, X0 = 40;
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("sil");
+const el = (n, a, txt) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt) e.textContent = txt; svg.append(e); return e; };
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function fish(y, spine, tailLe, label, sub, hoopX) {
+  const X = st => X0 + st * S, Y = h => y - h * S;
+  el("text", { x: X0, y: y - 120, class: "lab" }, label);
+  el("text", { x: X0, y: y - 104 }, sub);
+  // pressure tube with dome
+  el("path", { d: `M${X(94.7)},${Y(56)} L${X(306)},${Y(56)} L${X(306)},${Y(-56)} L${X(94.7)},${Y(-56)} A${56 * S},${56 * S} 0 0 1 ${X(94.7)},${Y(56)} z`, fill: css("--hull"), stroke: css("--ink"), "stroke-width": 1 });
+  el("rect", { x: X(103), y: Y(2), width: 200 * S, height: 6 * S, fill: css("--fin") });          // wing
+  el("rect", { x: X(44), y: Y(-56), width: 40 * S, height: 20 * S, fill: css("--accent") });     // weight
+  if (spine) {
+    for (const hgt of [71.7, 121.7]) el("rect", { x: X(0), y: Y(hgt + 3), width: spine * S, height: 6.1 * S, fill: css("--carbon") });
+    el("path", { d: `M${X(tailLe)},${Y(124.8)} L${X(tailLe + 87)},${Y(124.8)} L${X(tailLe + 87)},${Y(240)} L${X(tailLe + 30)},${Y(240)} z`, fill: css("--fin"), stroke: css("--ink"), "stroke-width": .8 });
+    el("circle", { cx: X(25), cy: Y(124.8), r: 4, fill: css("--ink") });
+    el("line", { x1: X0, y1: y + 70, x2: X(spine), y2: y + 70, stroke: css("--ink-2") });
+    el("text", { x: X(spine) + 8, y: y + 74 }, `${spine} mm`);
+  } else {
+    el("circle", { cx: X(hoopX), cy: Y(71), r: 4, fill: css("--ink") });
+    el("line", { x1: X(38.7), y1: y + 70, x2: X(306), y2: y + 70, stroke: css("--ink-2") });
+    el("text", { x: X(306) + 8, y: y + 74 }, "~270 mm tube only");
+  }
+}
+function draw() {
+  svg.innerHTML = "";
+  fish(150, 1000, 908, "1000 mm spine", "today's build · passes everything");
+  fish(285, 682, 590, "682 mm spine", "same tail, moved forward · passes, slight pitch wander at 0.8 m/s", 0);
+  el("text", { x: 470, y: 330, class: "lab" }, "Tube + hoop, no tail");
+  el("text", { x: 470, y: 346 }, "rolls over in a straight line");
+  const X = st => 470 + (st - 30) * S;
+  const y = 390;
+  el("path", { d: `M${X(94.7)},${y - 56 * S} L${X(306)},${y - 56 * S} L${X(306)},${y + 56 * S} L${X(94.7)},${y + 56 * S} A${56 * S},${56 * S} 0 0 1 ${X(94.7)},${y - 56 * S} z`, fill: css("--hull"), stroke: css("--ink"), "stroke-width": 1, transform: "translate(0,-35)" });
+  el("circle", { cx: X(84), cy: y - 35 - 71 * S, r: 4, fill: css("--ink") });
+}
+draw();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+</script>
